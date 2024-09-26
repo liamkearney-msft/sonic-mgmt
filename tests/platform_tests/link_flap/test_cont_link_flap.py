@@ -32,10 +32,12 @@ class TestContLinkFlap(object):
     """
 
     def get_frr_daemon_memory_usage(self, duthost, daemon):
-        frr_daemon_memory_output = duthost.shell(f'vtysh -c "show memory {daemon}"')["stdout"]
-        logging.info(f"{daemon} memory status: \n%s", frr_daemon_memory_output)
-        frr_daemon_memory = duthost.shell(
-            f'vtysh -c "show memory {daemon}" | grep "Used ordinary blocks"')["stdout"].split()[-2]
+        frr_daemon_memory = {}
+        for asic in duthost.asics:
+            frr_daemon_memory_output = asic.run_vtysh(f'-c "show memory {daemon}"')["stdout"]
+            logging.info(f"{daemon} memory status: \n%s", frr_daemon_memory_output)
+            frr_daemon_memory[asic.asic_index] = asic.run_vtysh(
+                f'-c "show memory {daemon}" | grep "Used ordinary blocks"')["stdout"].split()[-2]
         return frr_daemon_memory
 
     def test_cont_link_flap(self, request, duthosts, nbrhosts, enum_rand_one_per_hwsku_frontend_hostname,
@@ -84,7 +86,9 @@ class TestContLinkFlap(object):
         start_time_frr_daemon_memory = {}
         for daemon in frr_demons_to_check:
             start_time_frr_daemon_memory[daemon] = self.get_frr_daemon_memory_usage(duthost, daemon)
-            logging.info(f"{daemon} memory usage at start: \n%s", start_time_frr_daemon_memory[daemon])
+            for asic_num in start_time_frr_daemon_memory[daemon]:
+                logging.info(f"{daemon} on asic {asic_num} memory usage at start: \n%s",
+                             start_time_frr_daemon_memory[daemon][asic_num])
 
         # Make Sure Orch CPU < orch_cpu_threshold before starting test.
         logging.info("Make Sure orchagent CPU utilization is less that %d before link flap", orch_cpu_threshold)
@@ -152,30 +156,36 @@ class TestContLinkFlap(object):
         end_time_frr_daemon_memory = {}
         incr_frr_daemon_memory_threshold = {}
         for daemon in frr_demons_to_check:
-            incr_frr_daemon_memory_threshold[daemon] = 10 if tbinfo["topo"]["type"] in ["m0", "mx"] else 5
-            min_threshold_percent = 1 / float(start_time_frr_daemon_memory[daemon]) * 100
-            if min_threshold_percent > incr_frr_daemon_memory_threshold[daemon]:
-                incr_frr_daemon_memory_threshold[daemon] = math.ceil(min_threshold_percent)
-            logging.info(f"The memory increment threshold for frr daemon {daemon} "
-                         f"is {incr_frr_daemon_memory_threshold[daemon]}%")
+            incr_frr_daemon_memory_threshold[daemon] = {}
+            for asic_num in start_time_frr_daemon_memory[daemon]:
+                incr_frr_daemon_memory_threshold[daemon][asic_num] = 10 if tbinfo["topo"]["type"] in ["m0", "mx"] else 5
+                min_threshold_percent = 1 / float(start_time_frr_daemon_memory[daemon][asic_num]) * 100
+                if min_threshold_percent > incr_frr_daemon_memory_threshold[daemon][asic_num]:
+                    incr_frr_daemon_memory_threshold[daemon][asic_num] = math.ceil(min_threshold_percent)
+                logging.info(f"The memory increment threshold for frr daemon {daemon} asic {asic_num} "
+                             f"is {incr_frr_daemon_memory_threshold[daemon][asic_num]}%")
         for daemon in frr_demons_to_check:
             # Record FRR daemon memory status at end
             end_time_frr_daemon_memory[daemon] = self.get_frr_daemon_memory_usage(duthost, daemon)
-            logging.info(f"{daemon} memory usage at end: \n%s", end_time_frr_daemon_memory[daemon])
+            for asic_num in end_time_frr_daemon_memory[daemon]:
+                logging.info(f"{daemon} asic {asic_num} memory usage at end: \n%s",
+                             end_time_frr_daemon_memory[daemon][asic_num])
 
-            # Calculate diff in FRR daemon memory
-            incr_frr_daemon_memory = \
-                float(end_time_frr_daemon_memory[daemon]) - float(start_time_frr_daemon_memory[daemon])
-            logging.info(f"{daemon} absolute difference: %d", incr_frr_daemon_memory)
+                # Calculate diff in FRR daemon memory
+                incr_frr_daemon_memory = \
+                    float(end_time_frr_daemon_memory[daemon][asic_num]) - \
+                    float(start_time_frr_daemon_memory[daemon][asic_num])
+                logging.info(f"{daemon} asic {asic_num} absolute difference: %d", incr_frr_daemon_memory)
 
-            # Check FRR daemon memory only if it is increased else default to pass
-            if incr_frr_daemon_memory > 0:
-                percent_incr_frr_daemon_memory = \
-                    (incr_frr_daemon_memory / float(start_time_frr_daemon_memory[daemon])) * 100
-                logging.info(f"{daemon} memory percentage increase: %d", percent_incr_frr_daemon_memory)
-                pytest_assert(percent_incr_frr_daemon_memory < incr_frr_daemon_memory_threshold[daemon],
-                              f"{daemon} memory increase more than expected: "
-                              f"{incr_frr_daemon_memory_threshold[daemon]}%")
+                # Check FRR daemon memory only if it is increased else default to pass
+                if incr_frr_daemon_memory > 0:
+                    percent_incr_frr_daemon_memory = \
+                        (incr_frr_daemon_memory / float(start_time_frr_daemon_memory[daemon][asic_num])) * 100
+                    logging.info(f"{daemon} asic {asic_num} memory percentage increase: %d",
+                                 percent_incr_frr_daemon_memory)
+                    pytest_assert(percent_incr_frr_daemon_memory < incr_frr_daemon_memory_threshold[daemon][asic_num],
+                                  f"{daemon} asic {asic_num} memory increase more than expected: "
+                                  f"{incr_frr_daemon_memory_threshold[daemon][asic_num]}%")
 
         # Record orchagent CPU utilization at end
         orch_cpu = duthost.shell(
