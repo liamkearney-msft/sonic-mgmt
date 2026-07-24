@@ -16,12 +16,14 @@ __all__ = [
     'cleanup_macsec_configuration',
     'set_macsec_profile',
     'delete_macsec_profile',
+    'update_macsec_profile_fields',
     'enable_macsec_port',
     'disable_macsec_port',
     'get_macsec_enable_status',
     'get_macsec_profile',
     'wait_for_macsec_cleanup',
     'generate_macsec_profile',
+    'generate_macsec_fallback_keys',
     'setup_macsec_multi_profile_configuration',
     'cleanup_macsec_multi_profile_configuration',
 ]
@@ -42,7 +44,8 @@ def get_macsec_profile(host):
 
 
 def set_macsec_profile(host, profile_name, priority, cipher_suite,
-                       primary_cak, primary_ckn, policy, send_sci, rekey_period=0):
+                       primary_cak, primary_ckn, policy, send_sci, rekey_period=0,
+                       fallback_cak=None, fallback_ckn=None):
     if isinstance(host, EosHost):
         eos_cipher_suite = {
             "GCM-AES-128": "aes128-gcm",
@@ -73,6 +76,12 @@ def set_macsec_profile(host, profile_name, priority, cipher_suite,
         "send_sci" if send_sci == "true" else "no_send_sci": "",
         "rekey_period": rekey_period,
     }
+
+    # Fallback CAK/CKN bring up a standby MKA participant alongside the primary.
+    # They are optional; only emit them when both are provided.
+    if fallback_cak and fallback_ckn:
+        macsec_profile["fallback_cak"] = fallback_cak
+        macsec_profile["fallback_ckn"] = fallback_ckn
 
     opts = ""
     for k, v in list(macsec_profile.items()):
@@ -140,6 +149,44 @@ def delete_macsec_profile(host, profile_name):
     else:
         cmd = ("config macsec profile del {}".format(profile_name))
         host.command(cmd, module_ignore_errors=True)
+
+
+def update_macsec_profile_fields(host, profile_name, **fields):
+    """Mutate fields of an existing ``MACSEC_PROFILE`` row directly in CONFIG_DB.
+
+    This is the production trigger for fallback add/remove and CAK rotation:
+    macsecmgrd watches ``MACSEC_PROFILE`` and, on an update, drives the
+    corresponding ``wpa_cli`` sequence (add a standby CA, or run the hitless
+    rotation) itself -- see the buildimage/macsecmgrd HLD sections 4 and 5.
+    ``config macsec profile add`` cannot edit a profile that is already applied
+    to a port, so tests exercising the CONFIG_DB path HSET the fields instead.
+
+    A field whose value is ``None`` is removed with ``HDEL`` (used to clear the
+    optional ``fallback_cak``/``fallback_ckn`` fields); all other values are
+    written with ``HSET``.
+
+    Args:
+        host: SONiC host object (EOS is not supported -- CONFIG_DB path only).
+        profile_name: The ``MACSEC_PROFILE`` key to mutate.
+        **fields: Field name -> value (``None`` deletes the field).
+    """
+    if isinstance(host, EosHost):
+        raise ValueError("update_macsec_profile_fields is CONFIG_DB-only; "
+                         "EOS hosts are not supported")
+
+    key = "MACSEC_PROFILE|{}".format(profile_name)
+    to_set = {k: v for k, v in fields.items() if v is not None}
+    to_del = [k for k, v in fields.items() if v is None]
+
+    namespaces = host.get_asic_namespace_list() if host.is_multi_asic else [None]
+    for ns in namespaces:
+        prefix = "-n {}".format(ns) if ns is not None else ""
+        if to_set:
+            pairs = " ".join("{} {}".format(k, v) for k, v in to_set.items())
+            host.command("sonic-db-cli {} CONFIG_DB HSET '{}' {}".format(prefix, key, pairs))
+        for k in to_del:
+            host.command("sonic-db-cli {} CONFIG_DB HDEL '{}' {}".format(prefix, key, k),
+                         module_ignore_errors=True)
 
 
 def enable_macsec_port(host, port, profile_name):
@@ -259,13 +306,14 @@ def cleanup_macsec_configuration(duthost, ctrl_links, profile_name):
 
 
 def setup_macsec_configuration(duthost, ctrl_links, profile_name, default_priority,
-                               cipher_suite, primary_cak, primary_ckn, policy, send_sci, rekey_period, tbinfo):
+                               cipher_suite, primary_cak, primary_ckn, policy, send_sci, rekey_period, tbinfo,
+                               fallback_cak=None, fallback_ckn=None):
     logger.info("Setup macsec configuration step1: set macsec profile")
     # 1. Set macsec profile. The profile is host-wide (no port arg), so the
     # DUT-side set runs once outside the per-link loop.
     submit_async_task(set_macsec_profile, (duthost, profile_name, default_priority,
                       cipher_suite, primary_cak, primary_ckn, policy,
-                      send_sci, rekey_period))
+                      send_sci, rekey_period, fallback_cak, fallback_ckn))
     i = 0
     for dut_port, nbr in ctrl_links.items():
         if i % 2 == 0:
@@ -274,7 +322,8 @@ def setup_macsec_configuration(duthost, ctrl_links, profile_name, default_priori
             priority = default_priority + 1
         submit_async_task(set_macsec_profile,
                           (nbr["host"], profile_name, priority,
-                           cipher_suite, primary_cak, primary_ckn, policy, send_sci, rekey_period))
+                           cipher_suite, primary_cak, primary_ckn, policy, send_sci, rekey_period,
+                           fallback_cak, fallback_ckn))
         i += 1
     wait_all_complete(timeout=180)
 
@@ -349,6 +398,31 @@ def generate_macsec_profile(port_name, cipher_suite="GCM-AES-128", priority=64,
         "send_sci": send_sci,
         "rekey_period": rekey_period,
     }
+
+
+def generate_macsec_fallback_keys(cipher_suite="GCM-AES-128", exclude_ckn=None):
+    """Generate a fallback CAK/CKN pair for the given cipher suite.
+
+    Thin wrapper over :func:`generate_macsec_profile` so the CAK/CKN key
+    lengths and cisco_type7 encoding stay defined in exactly one place. The
+    fallback CKN must differ from the primary CKN, so pass the primary CKN as
+    ``exclude_ckn`` to guarantee a distinct value.
+
+    Args:
+        cipher_suite: Cipher suite string. Determines key lengths.
+        exclude_ckn: A CKN the generated value must not collide with
+            (typically the primary CKN).
+
+    Returns:
+        tuple: ``(fallback_cak, fallback_ckn)`` where ``fallback_cak`` is
+        cisco_type7 encoded (as stored in CONFIG_DB) and ``fallback_ckn`` is
+        plain hex.
+    """
+    exclude = (exclude_ckn or "").lower()
+    while True:
+        profile = generate_macsec_profile("fallback", cipher_suite=cipher_suite)
+        if profile["primary_ckn"].lower() != exclude:
+            return profile["primary_cak"], profile["primary_ckn"]
 
 
 def setup_macsec_multi_profile_configuration(duthost, ctrl_links, port_profiles, tbinfo):

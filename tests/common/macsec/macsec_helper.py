@@ -14,9 +14,9 @@ import ptf.testutils as testutils
 import scapy.all as scapy
 import scapy.contrib.macsec as scapy_macsec
 
-from tests.common.macsec.macsec_platform_helper import sonic_db_cli
+from tests.common.macsec.macsec_platform_helper import sonic_db_cli, get_macsec_ifname
 from tests.common.devices.eos import EosHost
-from tests.common.utilities import convert_scapy_packet_to_bytes
+from tests.common.utilities import convert_scapy_packet_to_bytes, wait_until
 
 __all__ = [
     'check_wpa_supplicant_process',
@@ -33,6 +33,15 @@ __all__ = [
     'get_sci',
     'getns_prefix',
     'get_ipnetns_prefix',
+    'run_wpa_cli',
+    'get_mka_participants',
+    'get_participant_by_ckn',
+    'get_principal_ckn',
+    'wait_for_ckn_live',
+    'macsec_add_mka',
+    'macsec_del_mka',
+    'macsec_rekey',
+    'get_rx_sc_count',
 ]
 
 logger = logging.getLogger(__name__)
@@ -103,6 +112,138 @@ def get_ipnetns_prefix(host, intf):
         ns_prefix = "sudo ip netns exec {}".format(ns)
 
     return ns_prefix
+
+
+def get_macsec_container(host, port):
+    '''
+    Return the docker container that runs wpa_supplicant/macsecmgrd for the
+    given port. Single-asic uses "macsec"; multi-asic uses a per-namespace
+    container named "macsec<asic_index>".
+    '''
+    if host.is_multi_asic:
+        asic = host.get_port_asic_instance(port)
+        return "macsec{}".format(asic.asic_index)
+    return "macsec"
+
+
+def run_wpa_cli(host, port, *args, **kwargs):
+    '''
+    Run a wpa_cli command against the per-port wpa_supplicant control socket.
+
+    macsecmgrd starts one wpa_supplicant per MACsec port with a global control
+    socket at /var/run/<port> inside the macsec docker. Mirror the exact
+    invocation macsecmgrd uses:
+        wpa_cli -g /var/run/<port> IFNAME=<port> <args>
+    '''
+    module_ignore_errors = kwargs.get("module_ignore_errors", False)
+    container = get_macsec_container(host, port)
+    cmd = "docker exec {container} wpa_cli -g /var/run/{port} IFNAME={port} {args}".format(
+        container=container, port=port,
+        args=" ".join(str(a) for a in args))
+    return host.command(cmd, module_ignore_errors=module_ignore_errors)
+
+
+def _mka_bool(value):
+    return str(value).strip().lower() == "yes"
+
+
+def get_mka_participants(host, port):
+    '''
+    Parse `macsec_mka_list` into a list of participant dicts.
+
+    Output is a flat sequence of key=value lines. Top-level keys
+    (actor_sci, key_server_sci) precede the participant blocks; each
+    participant block begins with a `participant_idx=` line. Booleans are
+    emitted as the literal strings "yes"/"no".
+    '''
+    output = run_wpa_cli(host, port, "macsec_mka_list")["stdout"]
+    participants = []
+    current = None
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key == "participant_idx":
+            current = {}
+            participants.append(current)
+            continue
+        if current is not None:
+            current[key] = value
+    return participants
+
+
+def get_participant_by_ckn(host, port, ckn):
+    '''Return the participant dict whose CKN matches (case-insensitive), or None.'''
+    ckn = ckn.lower()
+    for participant in get_mka_participants(host, port):
+        if participant.get("ckn", "").lower() == ckn:
+            return participant
+    return None
+
+
+def get_principal_ckn(host, port):
+    '''Return the CKN (lowercase) of the principal participant, or None.'''
+    for participant in get_mka_participants(host, port):
+        if _mka_bool(participant.get("is_principal")):
+            return participant.get("ckn", "").lower()
+    return None
+
+
+def wait_for_ckn_live(host, port, ckn, timeout=60, interval=2):
+    '''
+    Wait until the participant identified by ckn has at least one live peer.
+    Returns True on success, False on timeout.
+    '''
+    def _is_live():
+        participant = get_participant_by_ckn(host, port, ckn)
+        if participant is None:
+            return False
+        try:
+            return int(participant.get("live_peers", 0)) >= 1
+        except ValueError:
+            return False
+
+    return wait_until(timeout, interval, 0, _is_live)
+
+
+def macsec_add_mka(host, port, ckn, cak, fallback=False, module_ignore_errors=False):
+    '''Add an MKA participant at runtime. fallback=True marks it as standby.'''
+    args = ["macsec_add_mka", "ckn={}".format(ckn), "cak={}".format(cak)]
+    if fallback:
+        args.append("fallback=1")
+    return run_wpa_cli(host, port, *args, module_ignore_errors=module_ignore_errors)
+
+
+def macsec_del_mka(host, port, ckn, module_ignore_errors=False):
+    '''Remove an MKA participant. Hitless failover to the survivor if it owned the CP.'''
+    return run_wpa_cli(host, port, "macsec_del_mka", "ckn={}".format(ckn),
+                       module_ignore_errors=module_ignore_errors)
+
+
+def macsec_rekey(host, port, module_ignore_errors=False):
+    '''Force a SAK rekey under the current principal CKN (SAK refresh, not CAK change).'''
+    return run_wpa_cli(host, port, "macsec_rekey", module_ignore_errors=module_ignore_errors)
+
+
+def get_rx_sc_count(host, port):
+    '''
+    Return the number of ingress (receive) SCs on the SecY for the port.
+
+    Uses `ip macsec show` via get_mka_session, which is only available on
+    virtual switch (VS) testbeds. Returns None when the datapath view is not
+    available (e.g. physical platforms), so callers can guard SC-refcount
+    assertions to VS.
+    '''
+    ifname = get_macsec_ifname(host, port)
+    if ifname is None:
+        return None
+    sessions = get_mka_session(host)
+    if ifname not in sessions:
+        return None
+    return len(sessions[ifname].get("ingress_scs", {}))
 
 
 def get_dict_macsec_counters(duthost, port):  # noqa: F811
