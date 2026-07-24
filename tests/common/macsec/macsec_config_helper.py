@@ -184,9 +184,13 @@ def update_macsec_profile_fields(host, profile_name, **fields):
         if to_set:
             pairs = " ".join("{} {}".format(k, v) for k, v in to_set.items())
             host.command("sonic-db-cli {} CONFIG_DB HSET '{}' {}".format(prefix, key, pairs))
-        for k in to_del:
-            host.command("sonic-db-cli {} CONFIG_DB HDEL '{}' {}".format(prefix, key, k),
-                         module_ignore_errors=True)
+        if to_del:
+            # Delete all requested fields in a single HDEL so macsecmgrd sees one
+            # clean profile transition (e.g. fallback_cak + fallback_ckn removed
+            # together) rather than a transient half-cleared profile that would
+            # briefly have a CKN with no CAK.
+            host.command("sonic-db-cli {} CONFIG_DB HDEL '{}' {}".format(
+                prefix, key, " ".join(to_del)), module_ignore_errors=True)
 
 
 def enable_macsec_port(host, port, profile_name):

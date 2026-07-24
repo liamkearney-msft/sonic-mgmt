@@ -192,6 +192,22 @@ def get_principal_ckn(host, port):
     return None
 
 
+def is_key_server(host, port, ckn=None):
+    '''Return True if the local participant is the elected MKA key server on port.
+
+    Only the elected key server distributes SAKs, so operations that trigger a
+    SAK distribution (e.g. ``macsec_rekey``) are a no-op on a follower. Checks
+    the participant identified by ``ckn`` when given, otherwise the principal.
+    '''
+    if ckn is not None:
+        participant = get_participant_by_ckn(host, port, ckn)
+        participants = [participant] if participant is not None else []
+    else:
+        participants = [p for p in get_mka_participants(host, port)
+                        if _mka_bool(p.get("is_principal"))]
+    return any(_mka_bool(p.get("is_key_server")) for p in participants)
+
+
 def wait_for_ckn_live(host, port, ckn, timeout=60, interval=2):
     '''
     Wait until the participant identified by ckn has at least one live peer.
