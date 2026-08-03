@@ -16,7 +16,6 @@ __all__ = [
     'cleanup_macsec_configuration',
     'set_macsec_profile',
     'delete_macsec_profile',
-    'update_macsec_profile_fields',
     'enable_macsec_port',
     'disable_macsec_port',
     'get_macsec_enable_status',
@@ -151,46 +150,52 @@ def delete_macsec_profile(host, profile_name):
         host.command(cmd, module_ignore_errors=True)
 
 
-def update_macsec_profile_fields(host, profile_name, **fields):
-    """Mutate fields of an existing ``MACSEC_PROFILE`` row directly in CONFIG_DB.
+def update_macsec_profile(host, profile_name, primary_cak=None, primary_ckn=None,
+                          fallback_cak=None, fallback_ckn=None, remove_fallback=False):
+    """Update an applied ``MACSEC_PROFILE`` in place via the sanctioned
+    ``config macsec profile update`` CLI (buildimage macsec-fallback-cak).
 
-    This is the production trigger for fallback add/remove and CAK rotation:
-    macsecmgrd watches ``MACSEC_PROFILE`` and, on an update, drives the
-    corresponding ``wpa_cli`` sequence (add a standby CA, or run the hitless
-    rotation) itself -- see the buildimage/macsecmgrd HLD sections 4 and 5.
-    ``config macsec profile add`` cannot edit a profile that is already applied
-    to a port, so tests exercising the CONFIG_DB path HSET the fields instead.
-
-    A field whose value is ``None`` is removed with ``HDEL`` (used to clear the
-    optional ``fallback_cak``/``fallback_ckn`` fields); all other values are
-    written with ``HSET``.
+    This is the production path for rotating the primary CAK/CKN and for
+    adding/changing/removing the fallback CA on a profile that is already bound
+    to a port -- ``config macsec profile add`` cannot edit an applied profile.
+    The CLI writes ``MACSEC_PROFILE`` in CONFIG_DB, so macsecmgrd drives the same
+    wpa_supplicant sequence as a raw profile edit, but with the redesign's
+    guardrails enforced (notably: an in-place primary rotation is refused unless
+    a fallback CA is already established/live -- a fallback added in the *same*
+    command does not count).
 
     Args:
-        host: SONiC host object (EOS is not supported -- CONFIG_DB path only).
-        profile_name: The ``MACSEC_PROFILE`` key to mutate.
-        **fields: Field name -> value (``None`` deletes the field).
+        host: SONiC host object (EOS is not supported -- SONiC CLI path only).
+        profile_name: The ``MACSEC_PROFILE`` to update.
+        primary_cak, primary_ckn: New primary key pair (rotate the primary CAK).
+        fallback_cak, fallback_ckn: Add or change the fallback (standby) CA.
+        remove_fallback: Remove the fallback CA (sanctioned replacement for the
+            fallback_cak/fallback_ckn HDEL).
     """
     if isinstance(host, EosHost):
-        raise ValueError("update_macsec_profile_fields is CONFIG_DB-only; "
+        raise ValueError("update_macsec_profile is SONiC-CLI-only; "
                          "EOS hosts are not supported")
 
-    key = "MACSEC_PROFILE|{}".format(profile_name)
-    to_set = {k: v for k, v in fields.items() if v is not None}
-    to_del = [k for k, v in fields.items() if v is None]
+    opts = ""
+    if primary_cak is not None:
+        opts += " --primary_cak {}".format(primary_cak)
+    if primary_ckn is not None:
+        opts += " --primary_ckn {}".format(primary_ckn)
+    if fallback_cak is not None:
+        opts += " --fallback_cak {}".format(fallback_cak)
+    if fallback_ckn is not None:
+        opts += " --fallback_ckn {}".format(fallback_ckn)
+    if remove_fallback:
+        opts += " --remove_fallback"
+    if not opts:
+        raise ValueError("update_macsec_profile called with nothing to update")
 
-    namespaces = host.get_asic_namespace_list() if host.is_multi_asic else [None]
-    for ns in namespaces:
-        prefix = "-n {}".format(ns) if ns is not None else ""
-        if to_set:
-            pairs = " ".join("{} {}".format(k, v) for k, v in to_set.items())
-            host.command("sonic-db-cli {} CONFIG_DB HSET '{}' {}".format(prefix, key, pairs))
-        if to_del:
-            # Delete all requested fields in a single HDEL so macsecmgrd sees one
-            # clean profile transition (e.g. fallback_cak + fallback_ckn removed
-            # together) rather than a transient half-cleared profile that would
-            # briefly have a CKN with no CAK.
-            host.command("sonic-db-cli {} CONFIG_DB HDEL '{}' {}".format(
-                prefix, key, " ".join(to_del)), module_ignore_errors=True)
+    if host.is_multi_asic:
+        for ns in host.get_asic_namespace_list():
+            host.command("config macsec -n {} profile update {} {}".format(
+                ns, profile_name, opts))
+    else:
+        host.command("config macsec profile update {} {}".format(profile_name, opts))
 
 
 def enable_macsec_port(host, port, profile_name):

@@ -65,7 +65,7 @@ from tests.common.macsec.macsec_helper import (
 from tests.common.macsec.macsec_config_helper import (
     setup_macsec_configuration,
     delete_macsec_profile,
-    update_macsec_profile_fields,
+    update_macsec_profile,
     generate_macsec_fallback_keys,
 )
 
@@ -128,6 +128,23 @@ def _wait_principal_ckn(host, port, expected_ckn, timeout=60):
     expected = expected_ckn.lower()
     return wait_until(timeout, 2, 0,
                       lambda: get_principal_ckn(host, port) == expected)
+
+
+def _wait_principal_ckn_track_max_cas(host, port, expected_ckn, timeout=60):
+    """Wait for ``expected_ckn`` to become principal while recording the peak
+    number of CAs seen on the KaY. The rotation redesign guarantees at most two
+    coexisting CAs, so the returned max lets callers assert a transient third CA
+    never leaked during the swap. Returns ``(reached, max_ca_count)``.
+    """
+    expected = expected_ckn.lower()
+    peak = [0]
+
+    def _check():
+        peak[0] = max(peak[0], len(get_mka_participants(host, port)))
+        return get_principal_ckn(host, port) == expected
+
+    reached = wait_until(timeout, 2, 0, _check)
+    return reached, peak[0]
 
 
 @pytest.fixture(scope="class")
@@ -250,16 +267,6 @@ class TestMacsecFallbackKey():
         assert ingress_sc and egress_sa and ingress_sa, \
             "MACsec datapath not fully established on {}".format(dut_port)
 
-    @pytest.mark.xfail(
-        reason="Reactive primary->fallback failover is not reliably within the "
-               "repo's <1% coordinated-rekey continuity bar on swss 56fc6519: CP "
-               "failover always succeeds (principal moves to the fallback CKN) and "
-               "the shared RX SC is preserved, but datapath loss flaps (<1% .. ~7%, "
-               "a ~2s MKA peer-death detection blip). Pending wpa-supplicant CP "
-               "owner determination on whether reactive failover is expected fully "
-               "hitless; flips to XPASS on the hitless runs / a fixed -testing image.",
-        strict=False,
-    )
     def test_primary_to_fallback_failover(self, duthost, fallback_setup):
         """T2 -- breaking the primary CA on the peer moves the principal to the
         fallback CKN with <= tolerance loss and without recreating the shared
@@ -435,19 +442,21 @@ class TestMacsecFallbackConfigDb():
                 "Participant {} has no live peer".format(p.get("ckn"))
 
     @pytest.mark.xfail(
-        reason="macsecmgr (swss 56fc6519) does not remove the fallback MKA "
-               "participant when fallback_cak/fallback_ckn are cleared from "
-               "MACSEC_PROFILE: the 'Hot-updating MACsec profile' NOTICE fires "
-               "but the standby participant survives (no effective macsec_del_mka). "
-               "Pending swss macsecmgr hotUpdate fallback-removal fix; flips to "
-               "XPASS on a fixed -testing image.",
+        reason="Fallback removal via the sanctioned 'config macsec profile "
+               "update <profile> --remove_fallback' CLI is validated against the "
+               "batched macsec-fallback-cak -testing image (swss macsecmgr "
+               "hotUpdate fallback-removal fix + docker-macsec CLI 1f96f1599). "
+               "Held xfail(strict=False) until that image is on the testbed; "
+               "flips to XPASS there.",
         strict=False,
     )
     def test_remove_fallback_via_configdb(self, duthost, fallback_setup):
-        """T7 (CONFIG_DB) -- clearing fallback_cak/fallback_ckn from the profile
-        removes the standby participant without disturbing the principal or the
-        shared receive SC (macsecmgrd issues macsec_del_mka for the old
-        fallback CKN -- buildimage HLD section 4).
+        """T7 (CONFIG_DB) -- removing the fallback with ``config macsec profile
+        update <profile> --remove_fallback`` deletes the standby participant
+        without disturbing the principal or the shared receive SC (macsecmgrd
+        issues macsec_del_mka for the old fallback CKN -- buildimage HLD
+        section 4). This is the sanctioned replacement for the raw
+        fallback_cak/fallback_ckn CONFIG_DB HDEL.
         """
         dut_port = fallback_setup["dut_port"]
         nbr = fallback_setup["nbr"]
@@ -459,10 +468,10 @@ class TestMacsecFallbackConfigDb():
             "Principal did not start on the primary CKN"
         rx_before = get_rx_sc_count(duthost, dut_port)
         try:
-            # Clear the fallback fields on both ends -> macsecmgrd deletes the
-            # standby CA.
-            update_macsec_profile_fields(duthost, profile, fallback_cak=None, fallback_ckn=None)
-            update_macsec_profile_fields(nbr["host"], profile, fallback_cak=None, fallback_ckn=None)
+            # Remove the fallback on both ends via the sanctioned CLI -> macsecmgrd
+            # deletes the standby CA.
+            update_macsec_profile(duthost, profile, remove_fallback=True)
+            update_macsec_profile(nbr["host"], profile, remove_fallback=True)
 
             assert wait_until(
                 120, 2, 0,
@@ -482,33 +491,24 @@ class TestMacsecFallbackConfigDb():
             assert ingress_sc and egress_sa and ingress_sa, \
                 "Datapath torn down after removing the fallback via CONFIG_DB"
         finally:
-            # Restore the fallback fields on both ends and wait for the standby
-            # to renegotiate a live peer.
-            update_macsec_profile_fields(
+            # Restore the fallback on both ends and wait for the standby to
+            # renegotiate a live peer.
+            update_macsec_profile(
                 duthost, profile,
                 fallback_cak=fallback_setup["fallback_cak"], fallback_ckn=fb_ckn)
-            update_macsec_profile_fields(
+            update_macsec_profile(
                 nbr["host"], profile,
                 fallback_cak=fallback_setup["fallback_cak"], fallback_ckn=fb_ckn)
             wait_for_ckn_live(duthost, dut_port, fb_ckn, timeout=120)
 
-    @pytest.mark.xfail(
-        reason="In-place primary CAK rotation via a CONFIG_DB HSET is not fully "
-               "hitless on swss 56fc6519 (~3% loss with the ends sequenced; the "
-               "'Rotating primary MACsec CAK' hitless NOTICE fires but the old SAK "
-               "is retired slightly before the new SAK is active end-to-end). The "
-               "manual fallback-slot rotation (test_hitless_cak_rotation) achieves "
-               "<1% on the same image, so the staging mechanism is capable of "
-               "hitless. Pending swss in-place-rotation timing fix; flips to XPASS "
-               "on a fixed -testing image.",
-        strict=False,
-    )
     def test_cak_rotation_via_configdb(self, duthost, fallback_setup):
-        """T6 (CONFIG_DB) -- rotating the primary CAK/CKN by updating the
-        MACSEC_PROFILE completes hitlessly: macsecmgrd stages the new key, waits
-        for it to converge, then retires the old primary (buildimage HLD
-        section 5). The principal ends on the new CKN with <= tolerance loss and
-        the shared receive SC is preserved.
+        """T6 (CONFIG_DB) -- rotating the primary CAK/CKN with ``config macsec
+        profile update <profile> --primary_cak <cak> --primary_ckn <ckn>``
+        completes hitlessly: macsecmgrd stages the new key onto the warm fallback
+        slot, waits for it to converge, then retires the old primary (buildimage
+        HLD section 5). The principal ends on the new CKN with <= tolerance loss
+        and the shared receive SC is preserved. The redesign requires a fallback
+        CA to already be live before a primary rotation is accepted.
         """
         dut_port = fallback_setup["dut_port"]
         nbr = fallback_setup["nbr"]
@@ -518,6 +518,10 @@ class TestMacsecFallbackConfigDb():
 
         assert _wait_principal_ckn(duthost, dut_port, orig_ckn), \
             "Principal did not start on the primary CKN"
+        # The redesign refuses an in-place primary rotation unless a fallback CA
+        # is already established; make sure the standby is live before rotating.
+        assert wait_for_ckn_live(duthost, dut_port, fallback_setup["fallback_ckn"], timeout=120), \
+            "Fallback CA is not live; primary rotation would be refused"
 
         # New primary key pair, inheriting the profile cipher suite; keep it
         # distinct from both existing CKNs on the link.
@@ -538,12 +542,18 @@ class TestMacsecFallbackConfigDb():
             # before either side promotes to it and retires the old CKN. Firing
             # both ends simultaneously lets one end delete the old CA before the
             # other end's new CA is live end-to-end, which drops traffic.
-            update_macsec_profile_fields(nbr["host"], profile, primary_cak=new_cak, primary_ckn=new_ckn)
+            update_macsec_profile(nbr["host"], profile, primary_cak=new_cak, primary_ckn=new_ckn)
             time.sleep(15)
-            update_macsec_profile_fields(duthost, profile, primary_cak=new_cak, primary_ckn=new_ckn)
+            update_macsec_profile(duthost, profile, primary_cak=new_cak, primary_ckn=new_ckn)
 
-            assert _wait_principal_ckn(duthost, dut_port, new_ckn, timeout=180), \
+            reached, max_cas = _wait_principal_ckn_track_max_cas(
+                duthost, dut_port, new_ckn, timeout=180)
+            assert reached, \
                 "Principal did not end on the new CKN after CONFIG_DB rotation"
+            # The redesign caps coexistence at two CAs (old primary + staged new
+            # primary); a third would be a regression of the remove-first flow.
+            assert max_cas <= 2, \
+                "KaY held more than two CAs during rotation (peak {})".format(max_cas)
 
             rx_after = get_rx_sc_count(duthost, dut_port)
             if rx_before is not None and rx_after is not None:
@@ -558,8 +568,8 @@ class TestMacsecFallbackConfigDb():
         finally:
             # Rotate the primary back to the original key on both ends so the
             # shared fixture's teardown sees the expected baseline.
-            update_macsec_profile_fields(duthost, profile, primary_cak=orig_cak, primary_ckn=orig_ckn)
-            update_macsec_profile_fields(nbr["host"], profile, primary_cak=orig_cak, primary_ckn=orig_ckn)
+            update_macsec_profile(duthost, profile, primary_cak=orig_cak, primary_ckn=orig_ckn)
+            update_macsec_profile(nbr["host"], profile, primary_cak=orig_cak, primary_ckn=orig_ckn)
             wait_for_ckn_live(duthost, dut_port, orig_ckn, timeout=180)
 
 
