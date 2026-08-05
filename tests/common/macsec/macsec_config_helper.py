@@ -6,6 +6,7 @@ from passlib.hash import cisco_type7
 from tests.common.macsec.macsec_helper import get_mka_session, getns_prefix, wait_all_complete, \
      submit_async_task
 from tests.common.macsec.macsec_platform_helper import global_cmd, find_portchannel_from_member, get_portchannel
+from tests.common.devices.csonic import CsonicHost
 from tests.common.devices.eos import EosHost
 from tests.common.utilities import wait_until
 
@@ -202,7 +203,8 @@ def enable_macsec_feature(duthost, macsec_nbrhosts):
         for nbr in [n["host"] for n in list(nbrhosts.values())]:
             if isinstance(nbr, EosHost):
                 continue
-            if len(nbr.shell("docker ps | grep macsec | grep -v grep")["stdout_lines"]) < 1:
+            if not isinstance(nbr, CsonicHost) and \
+                    len(nbr.shell("docker ps | grep macsec | grep -v grep")["stdout_lines"]) < 1:
                 return False
             if len(nbr.shell("ps -ef | grep macsecmgrd | grep -v grep")["stdout_lines"]) < 1:
                 return False

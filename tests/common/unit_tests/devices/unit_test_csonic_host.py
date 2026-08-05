@@ -13,6 +13,7 @@ container. They cover:
                              deciding established-ness
   * _bgp_summary_peers      - summary parsing + FRR address-family nesting
   * _bgp_neighbors_json     - neighbors parsing + malformed-output handling
+  * MACsec host API         - single-ASIC facts, port state, and interface MAC
 
 Follows the repo unit-test convention (unit_test_*.py, unittest.mock).
 """
@@ -211,6 +212,34 @@ class TestSummaryAndNeighborParsers:
         host = make_host()
         with patch.object(host, "_docker_exec", return_value=docker_ok("[1,2,3]")):
             assert host._bgp_neighbors_json("ipv4") == {}
+
+
+class TestMacsecHostApi:
+    def test_single_asic_facts(self):
+        host = make_host()
+        assert host.facts["asic_type"] == "vs"
+        assert host.facts.get("platform_asic") != "broadcom-dnx"
+        assert host.is_multi_asic is False
+        assert host.num_asics() == 1
+
+    def test_iface_macsec_ok(self):
+        host = make_host()
+        with patch.object(host, "_docker_exec", return_value=docker_ok("ok")) as execute:
+            assert host.iface_macsec_ok("Ethernet1") is True
+        execute.assert_called_once_with(
+            'sonic-db-cli STATE_DB HGET "MACSEC_PORT_TABLE|Ethernet1" state'
+        )
+
+        with patch.object(host, "_docker_exec", return_value=docker_ok("pending")):
+            assert host.iface_macsec_ok("Ethernet1") is False
+
+    def test_get_dut_iface_mac(self):
+        host = make_host()
+        with patch.object(
+            host, "_docker_exec", return_value=docker_ok("52:54:00:12:34:56")
+        ) as execute:
+            assert host.get_dut_iface_mac("Ethernet1") == "52:54:00:12:34:56"
+        execute.assert_called_once_with("cat /sys/class/net/Ethernet1/address")
 
 
 if __name__ == "__main__":

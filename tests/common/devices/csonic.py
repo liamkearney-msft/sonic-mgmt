@@ -37,6 +37,8 @@ class CsonicHost(NeighborDevice):
         self.vm_host_ip = vm_host_ip
         self.vm_host_user = vm_host_user
         self.is_local = vm_host_ip is None or vm_host_ip in ('localhost', '127.0.0.1')
+        self.facts = {"asic_type": "vs"}
+        self.is_multi_asic = False
 
     def __str__(self):
         return '<CsonicHost {}>'.format(self.container_name)
@@ -129,6 +131,39 @@ class CsonicHost(NeighborDevice):
     def run_command_list(self, cmds, **kwargs):
         """Run a list of commands inside the container, returning a result per command."""
         return [self._docker_exec(cmd, **kwargs) for cmd in cmds]
+
+    def num_asics(self):
+        """Return the number of ASICs represented by this cSONiC container."""
+        return 1
+
+    def get_dut_iface_mac(self, iface_name):
+        """Return the MAC address assigned to an interface."""
+        try:
+            return self.command(
+                "cat /sys/class/net/{}/address".format(iface_name)
+            )["stdout"]
+        except Exception as exc:
+            logger.error(
+                'Failed to get MAC address for interface "%s", exception: %r',
+                iface_name,
+                exc,
+            )
+            return None
+
+    def iface_macsec_ok(self, interface_name):
+        """Return whether macsecmgrd reports the interface as ready."""
+        try:
+            cmd = 'sonic-db-cli STATE_DB HGET "MACSEC_PORT_TABLE|{}" state'.format(
+                interface_name
+            )
+            return self.shell(cmd)["stdout"].strip() == "ok"
+        except Exception as exc:
+            logger.error(
+                'Failed to get MACsec status for interface "%s", exception: %r',
+                interface_name,
+                exc,
+            )
+            return False
 
     def shell_cmds(self, cmds=None, continue_on_fail=False, **kwargs):
         """Run a sequence of shell commands, one result per command.

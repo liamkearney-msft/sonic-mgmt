@@ -8,6 +8,7 @@ from tests.common.helpers.dut_utils import (
     is_container_running,
     is_hitting_start_limit,
 )
+from tests.common.devices.csonic import CsonicHost
 from tests.common.macsec.macsec_helper import (
     check_appl_db,
     get_sci,
@@ -53,19 +54,20 @@ def dirty_kill_macsec_container(duthost):
 
 def dirty_kill_macsecmgrd(duthost, signal=9):
     """
-    Send a signal to macsecmgrd inside the macsec container.
+    Send a signal to macsecmgrd.
 
     signal=9 (SIGKILL) skips graceful shutdown; signal=6 (SIGABRT) generates a
-    core dump.  supervisord inside the container respawns macsecmgrd; the
-    container itself stays up, as do the per-port wpa_supplicant processes
-    and their UNIX control sockets.
+    core dump. On a full SONiC host the process is inside the macsec container;
+    on cSONiC it runs directly under the neighbor container's supervisord.
+    Supervisord respawns macsecmgrd while the per-port wpa_supplicant processes
+    and their UNIX control sockets stay up.
     """
-    logger.info("Sending signal %d to macsecmgrd inside macsec container on %s",
+    logger.info("Sending signal %d to macsecmgrd on %s",
                 signal, duthost.hostname)
-    duthost.shell(
-        "docker exec macsec pkill -{} -x macsecmgrd".format(signal),
-        module_ignore_errors=False,
-    )
+    cmd = "pkill -{} -x macsecmgrd".format(signal)
+    if not isinstance(duthost, CsonicHost):
+        cmd = "docker exec macsec {}".format(cmd)
+    duthost.shell(cmd, module_ignore_errors=False)
 
 
 def dirty_kill_wpa_supplicant(duthost, port_name):
@@ -79,10 +81,10 @@ def dirty_kill_wpa_supplicant(duthost, port_name):
     """
     logger.info("SIGKILL wpa_supplicant for %s on %s",
                 port_name, duthost.hostname)
-    duthost.shell(
-        "docker exec macsec pkill -9 -f '/var/run/{}'".format(port_name),
-        module_ignore_errors=False,
-    )
+    cmd = "pkill -9 -f '/var/run/{}'".format(port_name)
+    if not isinstance(duthost, CsonicHost):
+        cmd = "docker exec macsec {}".format(cmd)
+    duthost.shell(cmd, module_ignore_errors=False)
 
 
 # ---------------------------------------------------------------------------

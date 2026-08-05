@@ -15,6 +15,7 @@ import scapy.all as scapy
 import scapy.contrib.macsec as scapy_macsec
 
 from tests.common.macsec.macsec_platform_helper import sonic_db_cli
+from tests.common.devices.csonic import CsonicHost
 from tests.common.devices.eos import EosHost
 from tests.common.utilities import convert_scapy_packet_to_bytes
 
@@ -40,7 +41,6 @@ process_queue = []
 
 
 def submit_async_task(target, args):
-    global process_queue
     proc = Process(target=target, args=args)
     process_queue.append(proc)
     proc.start()
@@ -220,7 +220,8 @@ def check_appl_db(duthost, ctrl_links, policy, cipher_suite, send_sci):
 
 
 def get_mka_session(host):
-    cmd = "docker exec syncd ip -j macsec show"
+    cmd = "ip -j macsec show" if isinstance(host, CsonicHost) \
+        else "docker exec syncd ip -j macsec show"
     '''
     Here is an output example of `ip macsec show`
     admin@vlab-01:~$ ip macsec show
@@ -509,7 +510,6 @@ def load_all_macsec_info(duthost, ctrl_links, tbinfo):
 
 def macsec_send(test, port_id, pkt, count=1):
     global MACSEC_GLOBAL_PN_OFFSET
-    global MACSEC_GLOBAL_PN_INCR
 
     # Check if the port is macsec enabled, if so send the macsec encap/encrypted frame
     device, port_number = testutils.port_to_tuple(port_id)

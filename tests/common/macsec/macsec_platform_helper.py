@@ -5,6 +5,7 @@ from multiprocessing.pool import ThreadPool
 
 import pytest
 
+from tests.common.devices.csonic import CsonicHost
 from tests.common.devices.eos import EosHost
 
 
@@ -24,7 +25,7 @@ def global_cmd(duthost, nbrhosts, cmd):
     pool = ThreadPool(1 + len(nbrhosts))
     pool.apply_async(duthost.command, args=(cmd,))
     for nbr in list(nbrhosts.values()):
-        if isinstance(nbr["host"], EosHost):
+        if isinstance(nbr["host"], (EosHost, CsonicHost)):
             continue
         pool.apply_async(nbr["host"].command, args=(cmd, ))
     pool.close()
@@ -108,21 +109,29 @@ def get_portchannel(host):
         0003  PortChannel0003  LACP(A)(Up)  Ethernet120(S)
         0004  PortChannel0004  LACP(A)(Up)  N/A
     '''
-    lines = host.command("show interfaces portchannel")["stdout_lines"]
+    output = host.command("show interfaces portchannel", module_ignore_errors=True)
+    if output.get("rc", 0) != 0:
+        return {}
+    lines = output.get("stdout_lines", [])
     lines = lines[4:]  # Remove the output header
     portchannel_list = {}
     for line in lines:
         items = line.split()
+        if len(items) < 4:
+            continue
         portchannel = items[1]
         portchannel_list[portchannel] = {
             "name": portchannel, "status": None, "members": []}
         if items[-1] == "N/A":
             continue
-        portchannel_list[portchannel]["status"] = re.search(
-            r"\((Up|Dw)\)", items[2]).group(1)
+        status = re.search(r"\((Up|Dw)\)", items[2])
+        if status is None:
+            continue
+        portchannel_list[portchannel]["status"] = status.group(1)
         for item in items[3:]:
-            port = re.search(r"(Ethernet.*)\(", item).group(1)
-            portchannel_list[portchannel]["members"].append(port)
+            port = re.search(r"(Ethernet.*)\(", item)
+            if port is not None:
+                portchannel_list[portchannel]["members"].append(port.group(1))
     return portchannel_list
 
 
