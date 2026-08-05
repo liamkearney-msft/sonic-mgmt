@@ -164,6 +164,22 @@
   use_converged_peers: True
   comment: T2 Virtual chassis with Multi-ASIC LCs
 
+- conf-name: vms-kvm-t2-csonic
+  group-name: vms6-11
+  topo: t2_csonic
+  ptf_image_name: docker-ptf
+  ptf: ptf-11
+  ptf_ip: 10.250.0.127/24
+  ptf_ipv6: fec0::ffff:afb:b/64
+  server: server_1
+  vm_base: VM0152
+  vm_type: csonic
+  dut:
+    - vlab-09
+  inv_name: veos_vtb
+  auto_recover: 'False'
+  comment: T2 cSONiC neighbors without PortChannels or BGP confederation
+
 - conf-name: vms-kvm-t0-3
   group-name: vms6-6
   topo: t0

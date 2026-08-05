@@ -50,7 +50,9 @@
             "alias": "fortyGigE0/{{ (name | replace('Ethernet','') | int - 1) * 4 }}",
             "lanes": "{{ (name | replace('Ethernet','') | int - 1) * 4 + 25 }},{{ (name | replace('Ethernet','') | int - 1) * 4 + 26 }},{{ (name | replace('Ethernet','') | int - 1) * 4 + 27 }},{{ (name | replace('Ethernet','') | int - 1) * 4 + 28 }}",
             "mtu": "9100",
-            "speed": "40000"
+            "speed": "40000"{% if base_topo == 't2' and enable_macsec is defined %},
+            "macsec": "{{ profile.macsec_profile }}"
+{% endif %}
         }
 {% endif %}
 {% endfor %}
@@ -65,6 +67,18 @@
         }
 {% endif %}
     },
+{% if base_topo == 't2' and enable_macsec is defined %}
+    "MACSEC_PROFILE": {
+        "{{ profile.macsec_profile }}": {
+            "priority": "{{ profile.priority }}",
+            "cipher_suite": "{{ profile.cipher_suite }}",
+            "primary_cak": "{{ profile.primary_cak }}",
+            "primary_ckn": "{{ profile.primary_ckn }}",
+            "policy": "{{ profile.policy }}",
+            "send_sci": "{{ profile.send_sci }}"
+        }
+    },
+{% endif %}
     "DEVICE_METADATA": {
         "localhost": {
             "bgp_asn": "{{ host['bgp']['asn'] }}",

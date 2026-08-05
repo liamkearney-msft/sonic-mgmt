@@ -44,6 +44,7 @@ all:
           - t2
           - t2_2lc_min_ports-masic
           - t2_2lc_min_ports
+          - t2_csonic
           - m1-48
           - m1-44
           - m1-108
@@ -130,6 +131,9 @@ all:
         ptf-10:
           ansible_host: 10.250.0.121
           ansible_hostv6: fec0::ffff:afb:10
+        ptf-11:
+          ansible_host: 10.250.0.127
+          ansible_hostv6: fec0::ffff:afb:b
     sonic:
       vars:
         mgmt_subnet_mask_length: 24
@@ -530,3 +534,7 @@ vms_1:
       ansible_host: 10.250.0.101
     VM0151:
       ansible_host: 10.250.0.102
+    VM0152:
+      ansible_host: 10.250.0.128
+    VM0153:
+      ansible_host: 10.250.0.129

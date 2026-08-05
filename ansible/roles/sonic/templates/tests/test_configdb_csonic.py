@@ -11,7 +11,8 @@ gets wrong most easily and that has no other coverage:
     (so multi-link LAG neighbors do not collide with a second front-panel port),
   * routed Ethernet interfaces land in INTERFACE while LAG members land in
     PORTCHANNEL_MEMBER, and
-  * the synthetic VS lane numbering matches the SONiC-VM lanemap.
+  * the synthetic VS lane numbering matches the SONiC-VM lanemap, and
+  * MACsec profiles bind only to front-panel ports when enabled for T2.
 
 The test depends only on jinja2 so it runs standalone:
 
@@ -48,7 +49,7 @@ def _base_host():
     }
 
 
-def _render(host, props):
+def _render(host, props, **variables):
     env = Environment(
         loader=FileSystemLoader(TEMPLATES_DIR),
         trim_blocks=False,
@@ -56,17 +57,31 @@ def _render(host, props):
     )
     template = env.get_template(TEMPLATE_NAME)
     hostname = "ARISTA01T1"
-    return template.render(
+    context = dict(
         configuration={hostname: host},
         hostname=hostname,
         props=props,
     )
+    context.update(variables)
+    return template.render(**context)
 
 
-def _render_json(host, props):
-    rendered = _render(host, props)
+def _render_json(host, props, **variables):
+    rendered = _render(host, props, **variables)
     # A malformed template (e.g. trailing comma) makes this raise.
     return json.loads(rendered)
+
+
+def _macsec_profile():
+    return {
+        "macsec_profile": "256_XPN_SCI",
+        "priority": 64,
+        "cipher_suite": "GCM-AES-XPN-256",
+        "primary_cak": "0123456789abcdef",
+        "primary_ckn": "abcdef0123456789",
+        "policy": "security",
+        "send_sci": "true",
+    }
 
 
 def test_renders_valid_json_with_nexthops():
@@ -178,6 +193,49 @@ def test_no_backplane_when_absent():
     del host["bp_interface"]
     cfg = _render_json(host, {"swrole": "leaf"})
     assert "Ethernet3" not in cfg["PORT"]
+
+
+def test_macsec_disabled_omits_profile_and_port_bindings():
+    cfg = _render_json(_base_host(), {"swrole": "leaf"}, base_topo="t2")
+    assert "MACSEC_PROFILE" not in cfg
+    assert all("macsec" not in port for port in cfg["PORT"].values())
+
+
+def test_macsec_ignored_outside_t2():
+    cfg = _render_json(
+        _base_host(),
+        {"swrole": "leaf"},
+        base_topo="t0",
+        enable_macsec=True,
+        profile=_macsec_profile(),
+    )
+    assert "MACSEC_PROFILE" not in cfg
+    assert all("macsec" not in port for port in cfg["PORT"].values())
+
+
+def test_macsec_enabled_adds_profile_to_front_panel_ports_only():
+    profile = _macsec_profile()
+    cfg = _render_json(
+        _base_host(),
+        {"swrole": "leaf"},
+        base_topo="t2",
+        enable_macsec=True,
+        profile=profile,
+    )
+
+    assert cfg["MACSEC_PROFILE"] == {
+        "256_XPN_SCI": {
+            "priority": "64",
+            "cipher_suite": "GCM-AES-XPN-256",
+            "primary_cak": "0123456789abcdef",
+            "primary_ckn": "abcdef0123456789",
+            "policy": "security",
+            "send_sci": "true",
+        }
+    }
+    assert cfg["PORT"]["Ethernet1"]["macsec"] == "256_XPN_SCI"
+    assert cfg["PORT"]["Ethernet2"]["macsec"] == "256_XPN_SCI"
+    assert "macsec" not in cfg["PORT"]["Ethernet3"]
 
 
 def _run_standalone():
