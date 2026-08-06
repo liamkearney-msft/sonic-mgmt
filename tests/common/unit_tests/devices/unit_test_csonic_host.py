@@ -239,7 +239,18 @@ class TestMacsecHostApi:
             host, "_docker_exec", return_value=docker_ok("52:54:00:12:34:56")
         ) as execute:
             assert host.get_dut_iface_mac("Ethernet1") == "52:54:00:12:34:56"
-        execute.assert_called_once_with("cat /sys/class/net/Ethernet1/address")
+        execute.assert_called_once_with(
+            "cat /sys/class/net/Ethernet1/address", module_ignore_errors=True
+        )
+
+    def test_get_dut_iface_mac_missing_iface_is_none(self):
+        """_docker_exec signals failure via rc, not an exception. A missing
+        interface must yield None (matching SonicHost) rather than "", which
+        get_sci() would silently turn into a bogus SCI."""
+        host = make_host()
+        failure = {"rc": 1, "stdout": "", "stderr": "No such file or directory"}
+        with patch.object(host, "_docker_exec", return_value=failure):
+            assert host.get_dut_iface_mac("Ethernet99") is None
 
 
 if __name__ == "__main__":

@@ -137,11 +137,28 @@ class CsonicHost(NeighborDevice):
         return 1
 
     def get_dut_iface_mac(self, iface_name):
-        """Return the MAC address assigned to an interface."""
+        """Return the MAC address assigned to an interface, or None if unavailable.
+
+        Unlike SonicHost, whose Ansible ``command`` raises on failure,
+        ``_docker_exec`` reports failure via a non-zero rc with an empty
+        stdout. Check rc explicitly so a missing interface returns None
+        rather than "", which get_sci() would otherwise turn into a bogus
+        SCI and fail much later with an unrelated error.
+        """
         try:
-            return self.command(
-                "cat /sys/class/net/{}/address".format(iface_name)
-            )["stdout"]
+            result = self.command(
+                "cat /sys/class/net/{}/address".format(iface_name),
+                module_ignore_errors=True,
+            )
+            if result.get("rc", 0) != 0:
+                logger.error(
+                    'Failed to get MAC address for interface "%s" (rc=%s): %s',
+                    iface_name,
+                    result.get("rc"),
+                    result.get("stderr"),
+                )
+                return None
+            return result["stdout"]
         except Exception as exc:
             logger.error(
                 'Failed to get MAC address for interface "%s", exception: %r',
