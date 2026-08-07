@@ -92,6 +92,7 @@ all:
         vlab-t2-1-1:
         vlab-t2-1-2:
         vlab-t2-1-sup:
+        vlab-t2-csonic-01:
         vlab-c-02:
         vlab-vpp-01:
         vlab-vpp-02:
@@ -299,6 +300,23 @@ all:
           type: kvm
           hwsku: Force10-S6000
           serial_port: 9006
+          ansible_password: password
+          ansible_user: admin
+        # Standalone single-ASIC T2 DUT for the cSONiC MACsec testbed. It is
+        # deliberately not a virtual chassis, so it sets no card_type,
+        # switch_type, slot_num or num_asics. Force10-S6000 cannot be used
+        # here: it ships buffers_defaults_t0/t1 only, so a t2 topology fails
+        # to render buffers.json. Arista-7280R4K-32QF-32DF-64O provides
+        # buffers_defaults_t2.j2, derives its port list from the running
+        # config rather than a hardcoded range, and its lanemap starts at
+        # eth1 so front panel port N maps to the same VM NIC as on the other
+        # vlab DUTs.
+        vlab-t2-csonic-01:
+          ansible_host: 10.250.0.137
+          ansible_hostv6: fec0::ffff:afa:89
+          type: kvm
+          hwsku: Arista-7280R4K-32QF-32DF-64O
+          serial_port: 9030
           ansible_password: password
           ansible_user: admin
         vlab-10:
@@ -538,3 +556,9 @@ vms_1:
       ansible_host: 10.250.0.128
     VM0153:
       ansible_host: 10.250.0.129
+    VM0154:
+      ansible_host: 10.250.0.130
+    VM0155:
+      ansible_host: 10.250.0.131
+    VM0156:
+      ansible_host: 10.250.0.132
