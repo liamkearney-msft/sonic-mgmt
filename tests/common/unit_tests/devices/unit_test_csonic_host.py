@@ -252,6 +252,31 @@ class TestMacsecHostApi:
         with patch.object(host, "_docker_exec", return_value=failure):
             assert host.get_dut_iface_mac("Ethernet99") is None
 
+    def test_get_interface_ipv4(self):
+        host = make_host()
+        stdout = ("2: Ethernet1    inet 10.0.0.3/31 scope global Ethernet1\\"
+                  "       valid_lft forever preferred_lft forever")
+        with patch.object(
+            host, "_docker_exec", return_value=docker_ok(stdout)
+        ) as execute:
+            assert host.get_interface_ipv4("Ethernet1") == "10.0.0.3"
+        execute.assert_called_once_with(
+            "ip -4 -o addr show Ethernet1", module_ignore_errors=True
+        )
+
+    def test_get_interface_ipv4_missing_iface_is_none(self):
+        host = make_host()
+        failure = {"rc": 1, "stdout": "", "stderr": "Device does not exist"}
+        with patch.object(host, "_docker_exec", return_value=failure):
+            assert host.get_interface_ipv4("Ethernet99") is None
+
+    def test_get_interface_ipv4_no_address_is_none(self):
+        """An interface that exists but has no IPv4 address must yield None
+        rather than raising, so callers can fall back cleanly."""
+        host = make_host()
+        with patch.object(host, "_docker_exec", return_value=docker_ok("")):
+            assert host.get_interface_ipv4("Ethernet1") is None
+
 
 if __name__ == "__main__":
     sys.exit(pytest.main([os.path.abspath(__file__), "-v"]))

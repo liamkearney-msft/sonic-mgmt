@@ -102,9 +102,18 @@ def get_snmp_output(ip, duthost, nbr, creds_all_duts, oid='.1.3.6.1.2.1.1.1.0'):
     elif isinstance(nbr["host"], CsonicHost):
         # A cSONiC neighbour is a single flat container rather than a SONiC host
         # running nested service containers, so there is no `snmp` container to
-        # exec into. Invoke snmpwalk directly instead.
-        command = "snmpwalk -v 2c -c {} {} {}".format(
-                  creds_all_duts[duthost.hostname]['snmp_rocommunity'], ip, oid)
+        # exec into. Invoke snmpwalk directly.
+        #
+        # SONiC's zebra rewrites the source address of BGP-routed traffic to
+        # Loopback0 (route-map RM_SET_SRC), which cEOS does not do. The DUT has
+        # no route back to a neighbour's loopback, so replies would be dropped.
+        # Bind the query to the address of the link under test instead: the DUT
+        # reaches that over its connected route, and it is the interface whose
+        # MACsec encryption we actually want to exercise.
+        src_addr = nbr["host"].get_interface_ipv4(nbr["port"])
+        clientaddr = "--clientaddr={} ".format(src_addr) if src_addr else ""
+        command = "snmpwalk {}-v 2c -c {} {} {}".format(
+                  clientaddr, creds_all_duts[duthost.hostname]['snmp_rocommunity'], ip, oid)
         out = nbr['host'].command(command)
     else:
         command = "docker exec snmp snmpwalk -v 2c -c {} {} {}".format(

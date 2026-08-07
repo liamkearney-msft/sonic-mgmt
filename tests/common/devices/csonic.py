@@ -167,6 +167,43 @@ class CsonicHost(NeighborDevice):
             )
             return None
 
+    def get_interface_ipv4(self, iface_name):
+        """Return the IPv4 address configured on an interface, or None.
+
+        The address is returned without its prefix length. Follows the same
+        defensive contract as get_dut_iface_mac(): ``_docker_exec`` reports
+        failure via a non-zero rc rather than raising, so check rc explicitly
+        and return None instead of an empty string.
+        """
+        try:
+            result = self.command(
+                "ip -4 -o addr show {}".format(iface_name),
+                module_ignore_errors=True,
+            )
+            if result.get("rc", 0) != 0:
+                logger.error(
+                    'Failed to get IPv4 address for interface "%s" (rc=%s): %s',
+                    iface_name,
+                    result.get("rc"),
+                    result.get("stderr"),
+                )
+                return None
+            # e.g. "2: Ethernet1    inet 10.0.0.3/31 scope global Ethernet1\..."
+            for line in result.get("stdout", "").splitlines():
+                fields = line.split()
+                if "inet" in fields:
+                    return fields[fields.index("inet") + 1].split("/")[0]
+            logger.error(
+                'No IPv4 address found for interface "%s"', iface_name)
+            return None
+        except Exception as exc:
+            logger.error(
+                'Failed to get IPv4 address for interface "%s", exception: %r',
+                iface_name,
+                exc,
+            )
+            return None
+
     def iface_macsec_ok(self, interface_name):
         """Return whether macsecmgrd reports the interface as ready."""
         try:
