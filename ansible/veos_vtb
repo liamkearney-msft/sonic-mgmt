@@ -325,6 +325,22 @@ all:
           type: kvm
           hwsku: Force10-S6000
           serial_port: 9030
+          # macsec_card marks this DUT as MACsec capable. It does three things:
+          #  - tests/common/helpers/dut_utils.py:is_macsec_capable_node()
+          #    returns True, so the macsec_duthost fixture stops skipping every
+          #    T2 macsec test with "macsec capable dut not found".
+          #  - ansible/templates/minigraph_link_meta.j2 emits <MacSecEnabled>
+          #    link metadata for each link to a VM whose name ends in T3, which
+          #    minigraph_facts turns into mg_facts['macsec_neighbors'].
+          #  - ansible/templates/minigraph_meta.j2 emits the MacSecProfile
+          #    device property.
+          # Populating macsec_neighbors matters. Without it MacsecPluginT2 falls
+          # back to natsorted(nbrhosts)[:4], which would make leaf neighbors
+          # controlled links. With it the controlled links are exactly the two
+          # T3 core neighbors that roles/sonic pre-configures MACsec on, and the
+          # three LT2 leaf neighbors stay uncontrolled so that
+          # test_mismatch_macsec_configuration has a link to work with.
+          macsec_card: true
           ansible_password: password
           ansible_user: admin
         vlab-10:
