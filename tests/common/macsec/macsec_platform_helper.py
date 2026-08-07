@@ -142,6 +142,21 @@ def find_portchannel_from_member(port_name, portchannel_list):
     return None
 
 
+def get_portchannel_status(host, port_name):
+    """Return the status of the PortChannel that port_name belongs to.
+
+    Returns None when the port is not a member of any PortChannel, which is the
+    case on routed topologies such as the T2 cSONiC testbed. Callers must not
+    subscript find_portchannel_from_member() directly: it returns None for a
+    non-member, so doing so raises TypeError instead of the intended assertion
+    message.
+    """
+    portchannel = find_portchannel_from_member(port_name, get_portchannel(host))
+    if portchannel is None:
+        return None
+    return portchannel["status"]
+
+
 def get_lldp_list(host):
     '''
         Here is an output example of `show lldp table`

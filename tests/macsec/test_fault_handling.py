@@ -7,24 +7,10 @@ from tests.common.devices.eos import EosHost
 from tests.common.macsec.macsec_helper import get_appl_db
 from tests.common.macsec.macsec_config_helper import disable_macsec_port, \
     enable_macsec_port, delete_macsec_profile, set_macsec_profile
-from tests.common.macsec.macsec_platform_helper import get_eth_ifname, find_portchannel_from_member, get_portchannel
+from tests.common.macsec.macsec_platform_helper import get_eth_ifname, find_portchannel_from_member, \
+    get_portchannel, get_portchannel_status
 
 logger = logging.getLogger(__name__)
-
-
-def get_portchannel_status(duthost, port_name):
-    """Return the status of the PortChannel that port_name belongs to.
-
-    Returns None when the port is not a member of any PortChannel, which is the
-    case on routed topologies such as the T2 cSONiC testbed. Callers must not
-    subscript find_portchannel_from_member() directly: it returns None for a
-    non-member, so doing so raises TypeError instead of the intended assertion
-    message.
-    """
-    portchannel = find_portchannel_from_member(port_name, get_portchannel(duthost))
-    if portchannel is None:
-        return None
-    return portchannel["status"]
 
 
 pytestmark = [

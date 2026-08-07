@@ -5,6 +5,7 @@ from tests.common.utilities import wait_until
 from tests.common.errors import RunAnsibleModuleFail
 from tests.common.helpers.assertions import pytest_assert
 from tests.common.devices.eos import EosHost
+from tests.common.devices.csonic import CsonicHost
 
 logger = logging.getLogger(__name__)
 
@@ -98,6 +99,13 @@ def get_snmp_output(ip, duthost, nbr, creds_all_duts, oid='.1.3.6.1.2.1.1.1.0'):
         eos_snmpget = "bash {} snmpget -v2c -c {} {} {}".format(
             vrf_prefix, creds_all_duts[duthost.hostname]['snmp_rocommunity'], ip, oid)
         out = nbr['host'].eos_command(commands=[eos_snmpget])
+    elif isinstance(nbr["host"], CsonicHost):
+        # A cSONiC neighbour is a single flat container rather than a SONiC host
+        # running nested service containers, so there is no `snmp` container to
+        # exec into. Invoke snmpwalk directly instead.
+        command = "snmpwalk -v 2c -c {} {} {}".format(
+                  creds_all_duts[duthost.hostname]['snmp_rocommunity'], ip, oid)
+        out = nbr['host'].command(command)
     else:
         command = "docker exec snmp snmpwalk -v 2c -c {} {} {}".format(
                   creds_all_duts[duthost.hostname]['snmp_rocommunity'], ip, oid)

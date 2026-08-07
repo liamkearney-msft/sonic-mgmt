@@ -6,7 +6,7 @@ from tests.common.utilities import wait_until
 from tests.common.macsec.macsec_helper import getns_prefix
 from tests.common.macsec.macsec_config_helper import disable_macsec_port, enable_macsec_port
 from tests.common.macsec.macsec_platform_helper import find_portchannel_from_member, \
-    get_portchannel, get_lldp_list, sonic_db_cli
+    get_portchannel, get_portchannel_status, get_lldp_list, sonic_db_cli
 from tests.common.helpers.snmp_helpers import get_snmp_output
 
 logger = logging.getLogger(__name__)
@@ -28,6 +28,11 @@ class TestInteropProtocol():
         '''
         ctrl_port, _ = list(ctrl_links.items())[0]
         pc = find_portchannel_from_member(ctrl_port, get_portchannel(duthost))
+        if pc is None:
+            pytest.skip(
+                "Port {} is not a member of any PortChannel. This test only applies to "
+                "topologies whose MACsec links are LAG members; routed topologies such as "
+                "the T2 cSONiC testbed have none.".format(ctrl_port))
         assert pc["status"] == "Up", \
             "Assertion failed: PortChannel status is not 'Up'. Current status: '{}'. PortChannel details: {}".format(
                 pc["status"], pc
@@ -50,11 +55,11 @@ class TestInteropProtocol():
                         .format(getns_prefix(duthost, ctrl_port), pc["name"], ctrl_port))
         assert wait_until(
             90, 1, 0,
-            lambda: find_portchannel_from_member(ctrl_port, get_portchannel(duthost))["status"] == "Up"
+            lambda: get_portchannel_status(duthost, ctrl_port) == "Up"
         ), (
             "PortChannel status did not reach 'Up' within the specified timeout. "
             "Current status: '{}'.".format(
-                find_portchannel_from_member(ctrl_port, get_portchannel(duthost))["status"]
+                get_portchannel_status(duthost, ctrl_port)
             )
         )
 
@@ -179,8 +184,8 @@ class TestInteropProtocol():
             # Wait PortChannel up, which might flap if having one port member
             pc = find_portchannel_from_member(ctrl_port, get_portchannel(duthost))
             if pc:
-                wait_until(BGP_TIMEOUT, 5, 5, lambda: find_portchannel_from_member(
-                    ctrl_port, get_portchannel(duthost))["status"] == "Up")
+                wait_until(BGP_TIMEOUT, 5, 5,
+                           lambda: get_portchannel_status(duthost, ctrl_port) == "Up")
             # BGP session should keep established even after holdtime
             assert wait_until(
                 BGP_TIMEOUT, BGP_KEEPALIVE, BGP_HOLDTIME,
