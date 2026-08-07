@@ -304,13 +304,16 @@ all:
           ansible_user: admin
         # Standalone single-ASIC T2 DUT for the cSONiC MACsec testbed. It is
         # deliberately not a virtual chassis, so it sets no card_type,
-        # switch_type, slot_num or num_asics. Force10-S6000 cannot be used
-        # here: it ships buffers_defaults_t0/t1 only, so a t2 topology fails
-        # to render buffers.json. Arista-7280R4K-32QF-32DF-64O provides
-        # buffers_defaults_t2.j2, derives its port list from the running
-        # config rather than a hardcoded range, and its lanemap starts at
-        # eth1 so front panel port N maps to the same VM NIC as on the other
-        # vlab DUTs.
+        # switch_type, slot_num or num_asics.
+        #
+        # It uses Force10-S6000 like every other vlab DUT. That HWSKU needs a
+        # sonic-buildimage image containing "[device/dell]: Add T2 buffer
+        # profile to Force10-S6000"; without it, deploy-mg fails with
+        # "TemplateNotFound: buffers_defaults_t2.j2". Do not work around that
+        # by switching to one of the T2-capable Arista/NH HWSKUs: they ship
+        # gearbox_config.json and phy*_config.json, which makes the gbsyncd
+        # container's syncd exit on the vs platform and takes swss/syncd down
+        # with it via docker-wait-any-rs.
         #
         # The name must stay at or below 11 characters. roles/vm_set builds the
         # KVM DUT tap devices as "<dut_name>-t<fp_num>" (sonic_vm.xml.j2), and
@@ -320,7 +323,7 @@ all:
           ansible_host: 10.250.0.137
           ansible_hostv6: fec0::ffff:afa:89
           type: kvm
-          hwsku: Arista-7280R4K-32QF-32DF-64O
+          hwsku: Force10-S6000
           serial_port: 9030
           ansible_password: password
           ansible_user: admin
