@@ -10,6 +10,17 @@
     meta: end_play
     when: is_vs_chassis is not defined or is_vs_chassis == false
 
+  # A virtual chassis DUT is a supervisor or linecard occupying a chassis slot,
+  # and the metadata rendered below (vs_chassis_metadata.json) is built from
+  # that slot assignment. A single-node T2 testbed -- for example a standalone
+  # T2 DUT peered with cSONiC neighbors -- is not a chassis and leaves slot_num
+  # undefined, so there is no chassis metadata to render. Without this gate the
+  # play aborts on the undefined slot_num below. end_host keeps the skip scoped
+  # to the non-chassis DUT so genuine chassis members still get configured.
+  - name: Skip if the DUT is not part of a virtual chassis
+    meta: end_host
+    when: hostvars[inventory_hostname].slot_num is not defined
+
   - name: Check that variable topo is defined
     fail: msg="Define topo variable with -e topo=something"
     when: topo is not defined
