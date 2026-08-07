@@ -196,7 +196,7 @@ def test_no_backplane_when_absent():
 
 
 def test_macsec_disabled_omits_profile_and_port_bindings():
-    cfg = _render_json(_base_host(), {"swrole": "leaf"}, base_topo="t2")
+    cfg = _render_json(_base_host(), {"swrole": "core"}, base_topo="t2")
     assert "MACSEC_PROFILE" not in cfg
     assert all("macsec" not in port for port in cfg["PORT"].values())
 
@@ -204,7 +204,7 @@ def test_macsec_disabled_omits_profile_and_port_bindings():
 def test_macsec_ignored_outside_t2():
     cfg = _render_json(
         _base_host(),
-        {"swrole": "leaf"},
+        {"swrole": "core"},
         base_topo="t0",
         enable_macsec=True,
         profile=_macsec_profile(),
@@ -217,7 +217,7 @@ def test_macsec_enabled_adds_profile_to_front_panel_ports_only():
     profile = _macsec_profile()
     cfg = _render_json(
         _base_host(),
-        {"swrole": "leaf"},
+        {"swrole": "core"},
         base_topo="t2",
         enable_macsec=True,
         profile=profile,
@@ -236,6 +236,38 @@ def test_macsec_enabled_adds_profile_to_front_panel_ports_only():
     assert cfg["PORT"]["Ethernet1"]["macsec"] == "256_XPN_SCI"
     assert cfg["PORT"]["Ethernet2"]["macsec"] == "256_XPN_SCI"
     assert "macsec" not in cfg["PORT"]["Ethernet3"]
+
+
+def test_macsec_only_preconfigured_on_core_role():
+    """Mirror the cEOS split: t2-core.j2 binds MACsec, t2-leaf.j2 does not.
+
+    The macsec pytest plugin configures ctrl_links itself on both ends and
+    deliberately leaves unctrl_links alone, so a pre-bound 'leaf' neighbor
+    would stop test_mismatch_macsec_configuration from starting on a clean
+    unconfigured link.
+    """
+    for role in ("leaf", "tor"):
+        cfg = _render_json(
+            _base_host(),
+            {"swrole": role},
+            base_topo="t2",
+            enable_macsec=True,
+            profile=_macsec_profile(),
+        )
+        assert "MACSEC_PROFILE" not in cfg, role
+        assert all("macsec" not in port for port in cfg["PORT"].values()), role
+
+
+def test_macsec_defaults_to_leaf_role_when_swrole_absent():
+    cfg = _render_json(
+        _base_host(),
+        {},
+        base_topo="t2",
+        enable_macsec=True,
+        profile=_macsec_profile(),
+    )
+    assert "MACSEC_PROFILE" not in cfg
+    assert all("macsec" not in port for port in cfg["PORT"].values())
 
 
 def test_device_type_never_spine_router():

@@ -40,6 +40,19 @@
 {# topology file remains the source of truth for a VM's tier.                     #}
 {% set _role_type_map = {'leaf': 'LeafRouter', 'spine': 'LeafRouter', 'tor': 'ToRRouter', 'core': 'LeafRouter'} %}
 {% set device_type = _role_type_map.get(props.swrole | default('leaf'), 'LeafRouter') %}
+{# Pre-configure MACsec only on 'core' role neighbors, mirroring the cEOS       #}
+{# baseline: roles/eos/templates/t2-core.j2 emits both the 'mac security'       #}
+{# profile and the per-interface binding, while t2-leaf.j2 emits neither.       #}
+{#                                                                              #}
+{# This split is load-bearing for the test framework, not cosmetic. The macsec  #}
+{# pytest plugin splits neighbors into ctrl_links (which it configures itself,  #}
+{# on both the DUT and the neighbor, via setup_macsec_configuration) and        #}
+{# unctrl_links (which it deliberately leaves alone). Pre-binding MACsec on     #}
+{# every role would leave the uncontrolled neighbor already sessioned up, so    #}
+{# test_mismatch_macsec_configuration would no longer start from a clean        #}
+{# unconfigured link. Leaving 'leaf' neighbors bare costs nothing for the       #}
+{# controlled ones, since the plugin configures those at test time anyway.      #}
+{% set macsec_enabled = base_topo == 't2' and enable_macsec is defined and (props.swrole | default('leaf')) == 'core' %}
 {# Count front-panel Ethernet interfaces so the backplane can be placed past   #}
 {# them (Ethernet{K+1}). For single-link neighbors K==1 -> Ethernet2 (same as  #}
 {# before); for multi-link LAG neighbors (T1-LAG/T2) the backplane moves up so  #}
@@ -66,7 +79,7 @@
             "alias": "fortyGigE0/{{ (name | replace('Ethernet','') | int - 1) * 4 }}",
             "lanes": "{{ (name | replace('Ethernet','') | int - 1) * 4 + 25 }},{{ (name | replace('Ethernet','') | int - 1) * 4 + 26 }},{{ (name | replace('Ethernet','') | int - 1) * 4 + 27 }},{{ (name | replace('Ethernet','') | int - 1) * 4 + 28 }}",
             "mtu": "9100",
-            "speed": "40000"{% if base_topo == 't2' and enable_macsec is defined %},
+            "speed": "40000"{% if macsec_enabled %},
             "macsec": "{{ profile.macsec_profile }}"
 {% endif %}
         }
@@ -83,7 +96,7 @@
         }
 {% endif %}
     },
-{% if base_topo == 't2' and enable_macsec is defined %}
+{% if macsec_enabled %}
     "MACSEC_PROFILE": {
         "{{ profile.macsec_profile }}": {
             "priority": "{{ profile.priority }}",
