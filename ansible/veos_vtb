@@ -92,7 +92,7 @@ all:
         vlab-t2-1-1:
         vlab-t2-1-2:
         vlab-t2-1-sup:
-        vlab-t2-csonic-01:
+        vlab-cs-01:
         vlab-c-02:
         vlab-vpp-01:
         vlab-vpp-02:
@@ -311,7 +311,12 @@ all:
         # config rather than a hardcoded range, and its lanemap starts at
         # eth1 so front panel port N maps to the same VM NIC as on the other
         # vlab DUTs.
-        vlab-t2-csonic-01:
+        #
+        # The name must stay at or below 11 characters. roles/vm_set builds the
+        # KVM DUT tap devices as "<dut_name>-t<fp_num>" (sonic_vm.xml.j2), and
+        # Linux caps interface names at 15 characters, so a longer name makes
+        # VM creation fail with "Network interface name ... is too long".
+        vlab-cs-01:
           ansible_host: 10.250.0.137
           ansible_hostv6: fec0::ffff:afa:89
           type: kvm

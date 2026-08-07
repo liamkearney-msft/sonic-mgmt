@@ -175,7 +175,7 @@
   vm_base: VM0152
   vm_type: csonic
   dut:
-    - vlab-t2-csonic-01
+    - vlab-cs-01
   inv_name: veos_vtb
   auto_recover: 'False'
   comment: T2 cSONiC neighbors without PortChannels or BGP confederation
