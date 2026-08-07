@@ -22,7 +22,23 @@
 {# neighbor's Loopback0 addresses (already unique/valid); the loopback is only  #}
 {# needed to satisfy the dependency + as an (inert) update-source.              #}
 {% set _lo0 = host['interfaces'].get('Loopback0', {}) %}
-{% set _role_type_map = {'leaf': 'LeafRouter', 'spine': 'SpineRouter', 'tor': 'ToRRouter', 'core': 'SpineRouter'} %}
+{# A cSONiC neighbor is a single standalone container, never a chassis, so it     #}
+{# must not advertise the 'SpineRouter' device type:                             #}
+{#   * sonic-py-common device_info.is_chassis() returns True for any device whose #}
+{#     type is exactly 'SpineRouter'. bgpcfgd then registers a CHASSIS_APP_DB     #}
+{#     manager, but docker-sonic-vs's start.sh strips CHASSIS_APP_DB from         #}
+{#     database_config.json on non-chassis containers, so bgpcfgd dies at startup #}
+{#     ("Failed to find CHASSIS_APP_DB database") and FRR never receives any BGP  #}
+{#     configuration from CONFIG_DB.                                              #}
+{#   * bgpd's peer-group.conf.j2 dereferences DEVICE_METADATA.localhost.subtype   #}
+{#     unguarded once the type is 'SpineRouter', which we never set.              #}
+{# 'UpperSpineRouter' avoids is_chassis() but turns on chassis-linecard selective #}
+{# route download (table-map SELECTIVE_ROUTE_DOWNLOAD_*), which would stop the    #}
+{# neighbor from programming routes into its FIB. Spine/core roles therefore map  #}
+{# to 'LeafRouter', which yields plain eBGP peer behavior -- all a simulated      #}
+{# neighbor needs. The type is local to the neighbor's own FRR rendering; the     #}
+{# topology file remains the source of truth for a VM's tier.                     #}
+{% set _role_type_map = {'leaf': 'LeafRouter', 'spine': 'LeafRouter', 'tor': 'ToRRouter', 'core': 'LeafRouter'} %}
 {% set device_type = _role_type_map.get(props.swrole | default('leaf'), 'LeafRouter') %}
 {# Count front-panel Ethernet interfaces so the backplane can be placed past   #}
 {# them (Ethernet{K+1}). For single-link neighbors K==1 -> Ethernet2 (same as  #}

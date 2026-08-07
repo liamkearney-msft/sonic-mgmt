@@ -238,6 +238,32 @@ def test_macsec_enabled_adds_profile_to_front_panel_ports_only():
     assert "macsec" not in cfg["PORT"]["Ethernet3"]
 
 
+def test_device_type_never_spine_router():
+    """A cSONiC neighbor is a standalone container, never a chassis.
+
+    device_info.is_chassis() returns True for any device whose type is exactly
+    'SpineRouter'. bgpcfgd would then register a CHASSIS_APP_DB manager, but
+    docker-sonic-vs strips CHASSIS_APP_DB from database_config.json on
+    non-chassis containers, so bgpcfgd exits at startup and FRR never receives
+    any BGP configuration. 'UpperSpineRouter' dodges is_chassis() but enables
+    chassis selective route download, which stops the neighbor programming its
+    FIB. Every role must therefore render a plain, non-chassis device type.
+    """
+    for swrole in ("leaf", "spine", "tor", "core", "unknown-role"):
+        cfg = _render_json(_base_host(), {"swrole": swrole})
+        device_type = cfg["DEVICE_METADATA"]["localhost"]["type"]
+        assert device_type not in ("SpineRouter", "UpperSpineRouter"), \
+            "swrole {} rendered chassis-triggering type {}".format(swrole, device_type)
+
+
+def test_spine_and_core_roles_render_leaf_router():
+    for swrole in ("spine", "core"):
+        cfg = _render_json(_base_host(), {"swrole": swrole})
+        assert cfg["DEVICE_METADATA"]["localhost"]["type"] == "LeafRouter"
+    assert _render_json(_base_host(), {"swrole": "tor"})[
+        "DEVICE_METADATA"]["localhost"]["type"] == "ToRRouter"
+
+
 def _run_standalone():
     tests = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and callable(v)]
