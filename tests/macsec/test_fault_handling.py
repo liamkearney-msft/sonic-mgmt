@@ -11,6 +11,22 @@ from tests.common.macsec.macsec_platform_helper import get_eth_ifname, find_port
 
 logger = logging.getLogger(__name__)
 
+
+def get_portchannel_status(duthost, port_name):
+    """Return the status of the PortChannel that port_name belongs to.
+
+    Returns None when the port is not a member of any PortChannel, which is the
+    case on routed topologies such as the T2 cSONiC testbed. Callers must not
+    subscript find_portchannel_from_member() directly: it returns None for a
+    non-member, so doing so raises TypeError instead of the intended assertion
+    message.
+    """
+    portchannel = find_portchannel_from_member(port_name, get_portchannel(duthost))
+    if portchannel is None:
+        return None
+    return portchannel["status"]
+
+
 pytestmark = [
     pytest.mark.macsec_required,
     pytest.mark.topology("t0", "t2", "lrh", "urh", "t0-sonic"),
@@ -94,14 +110,24 @@ class TestFaultHandling():
             "New MKA session not established within expected time. ")
 
         # Flap > 90 seconds
-        assert wait_until(12, 1, 0, lambda: find_portchannel_from_member(
-            port_name, get_portchannel(duthost))["status"] == "Up"), (
+        # This section exercises LACP timeout handling, so it only applies when
+        # the controlled link is a PortChannel member. Routed topologies such as
+        # the T2 cSONiC testbed have no PortChannel over the MACsec links, so
+        # there is nothing to observe and the test ends here.
+        if find_portchannel_from_member(port_name, get_portchannel(duthost)) is None:
+            logger.info(
+                "Skipping the LACP timeout portion of the link flap test because %s "
+                "is not a member of any PortChannel.", port_name)
+            return
+
+        assert wait_until(12, 1, 0, lambda: get_portchannel_status(
+            duthost, port_name) == "Up"), (
             "Portchannel {} did not come up within expected time. "
             "Portchannel status: {} "
             "Find portchannel from member: {} "
         ).format(
             port_name,
-            find_portchannel_from_member(port_name, get_portchannel(duthost))["status"],
+            get_portchannel_status(duthost, port_name),
             find_portchannel_from_member(port_name, get_portchannel(duthost))
         )
 
@@ -111,14 +137,14 @@ class TestFaultHandling():
         else:
             nbr["host"].shell("ifconfig {} down && sleep {}".format(
                 nbr_eth_port, TestFaultHandling.LACP_TIMEOUT))
-        assert wait_until(6, 1, 0, lambda: find_portchannel_from_member(
-                    port_name, get_portchannel(duthost))["status"] == "Dw"), (
+        assert wait_until(6, 1, 0, lambda: get_portchannel_status(
+                    duthost, port_name) == "Dw"), (
             "Portchannel {} did not go down within expected time. "
             "Portchannel status: {} "
             "Find portchannel from member: {} "
         ).format(
             port_name,
-            find_portchannel_from_member(port_name, get_portchannel(duthost))["status"],
+            get_portchannel_status(duthost, port_name),
             find_portchannel_from_member(port_name, get_portchannel(duthost))
         )
 
@@ -126,14 +152,14 @@ class TestFaultHandling():
             nbr["host"].no_shutdown(nbr_eth_port)
         else:
             nbr["host"].shell("ifconfig {} up".format(nbr_eth_port))
-        assert wait_until(12, 1, 0, lambda: find_portchannel_from_member(
-            port_name, get_portchannel(duthost))["status"] == "Up"), (
+        assert wait_until(12, 1, 0, lambda: get_portchannel_status(
+            duthost, port_name) == "Up"), (
             "Portchannel {} did not come up within expected time. "
             "Portchannel status: {} "
             "Find portchannel from member: {} "
         ).format(
             port_name,
-            find_portchannel_from_member(port_name, get_portchannel(duthost))["status"],
+            get_portchannel_status(duthost, port_name),
             find_portchannel_from_member(port_name, get_portchannel(duthost))
         )
 
