@@ -4,10 +4,11 @@ import time
 from passlib.hash import cisco_type7
 
 from tests.common.macsec.macsec_helper import get_mka_session, getns_prefix, wait_all_complete, \
-     submit_async_task
+     submit_async_task, _eos_profile_key_lines
 from tests.common.macsec.macsec_platform_helper import global_cmd, find_portchannel_from_member, get_portchannel
 from tests.common.config_reload import config_reload
 from tests.common.devices.eos import EosHost
+from tests.common.errors import RunAnsibleModuleFail
 from tests.common.utilities import wait_until
 
 __all__ = [
@@ -17,12 +18,15 @@ __all__ = [
     'cleanup_macsec_configuration',
     'set_macsec_profile',
     'delete_macsec_profile',
+    'replace_macsec_profile',
+    'rotate_macsec_profile_key',
     'enable_macsec_port',
     'disable_macsec_port',
     'get_macsec_enable_status',
     'get_macsec_profile',
     'wait_for_macsec_cleanup',
     'generate_macsec_profile',
+    'generate_macsec_key_pair',
     'setup_macsec_multi_profile_configuration',
     'cleanup_macsec_multi_profile_configuration',
 ]
@@ -42,8 +46,36 @@ def get_macsec_profile(host):
     return request.config.getoption("--macsec_profile", default=None)
 
 
+def _eos_set_rekey_period(host, profile_name, rekey_period):
+    """Arm a periodic SAK refresh on an EOS profile where the release allows it.
+
+    ``mka session rekey-period`` is not accepted by every EOS release, and it
+    does not have to be: the SAK is generated and distributed by whichever end
+    wins the key server election, so only the key server acts on the period. A
+    follower installs the SAKs it is sent regardless of its own configuration.
+
+    A rejection is therefore logged and tolerated rather than raised. It only
+    costs the test something when the peer is the key server, which is why
+    callers that depend on a rekey actually happening check that separately.
+
+    Returns True when the period was accepted.
+    """
+    try:
+        host.eos_config(
+            lines=['mka session rekey-period {}'.format(rekey_period)],
+            parents=['mac security', 'profile {}'.format(profile_name)])
+        return True
+    except RunAnsibleModuleFail as err:
+        logger.warning(
+            "%s rejected 'mka session rekey-period %s' on profile %s: %s. "
+            "Continuing: the peer follows SAKs distributed by the key server.",
+            host.hostname, rekey_period, profile_name, err)
+        return False
+
+
 def set_macsec_profile(host, profile_name, priority, cipher_suite,
-                       primary_cak, primary_ckn, policy, send_sci, rekey_period=0):
+                       primary_cak, primary_ckn, policy, send_sci, rekey_period=0,
+                       fallback_cak=None, fallback_ckn=None):
     if isinstance(host, EosHost):
         eos_cipher_suite = {
             "GCM-AES-128": "aes128-gcm",
@@ -56,13 +88,19 @@ def set_macsec_profile(host, profile_name, priority, cipher_suite,
             'key {} 7 {}'.format(primary_ckn, primary_cak),
             'mka key-server priority {}'.format(priority)
             ]
-        if rekey_period:
-            lines.append('mka session rekey-period {}'.format(rekey_period))
+        # EOS marks the standby CA with the trailing `fallback` keyword; it
+        # inherits the profile cipher suite exactly like the SONiC side.
+        if fallback_cak and fallback_ckn:
+            lines.append('key {} 7 {} fallback'.format(fallback_ckn, fallback_cak))
         if send_sci == 'true':
             lines.append('sci')
         host.eos_config(
             lines=lines,
             parents=['mac security', 'profile {}'.format(profile_name)])
+        # Armed separately: not every EOS release accepts the rekey-period
+        # line, and it is not required on both ends. See _eos_set_rekey_period.
+        if rekey_period:
+            _eos_set_rekey_period(host, profile_name, rekey_period)
         return
 
     macsec_profile = {
@@ -74,6 +112,12 @@ def set_macsec_profile(host, profile_name, priority, cipher_suite,
         "send_sci" if send_sci == "true" else "no_send_sci": "",
         "rekey_period": rekey_period,
     }
+
+    # Fallback CAK/CKN bring up a standby MKA participant alongside the primary.
+    # They are optional; only emit them when both are provided.
+    if fallback_cak and fallback_ckn:
+        macsec_profile["fallback_cak"] = fallback_cak
+        macsec_profile["fallback_ckn"] = fallback_ckn
 
     opts = ""
     for k, v in list(macsec_profile.items()):
@@ -141,6 +185,111 @@ def delete_macsec_profile(host, profile_name):
     else:
         cmd = ("config macsec profile del {}".format(profile_name))
         host.command(cmd, module_ignore_errors=True)
+
+
+def _eos_rotate_macsec_profile_key(host, profile_name, old_ckn, new_ckn, new_cak):
+    """EOS counterpart of rotate_macsec_profile_key().
+
+    EOS has no CONFIG_DB and no single rotate command; a key is replaced by
+    configuring the new one and negating the line that configured the old one.
+    """
+    old_line = _eos_profile_key_lines(host, profile_name).get(old_ckn.lower())
+    if old_line is None:
+        raise ValueError(
+            "Profile {} on {} has no key {} to rotate".format(
+                profile_name, host.hostname, old_ckn))
+
+    # EOS marks the standby CA with a trailing `fallback` keyword. The
+    # replacement has to keep the role of the key it replaces, otherwise the
+    # rotation would promote or demote the CA instead of re-keying it.
+    role = ' fallback' if old_line.endswith(' fallback') else ''
+    # Configure the replacement before negating the old line so the profile is
+    # never momentarily left without the CA being rotated. EOS rejects a bare
+    # `no key <ckn>`, hence negating the configured line verbatim.
+    host.eos_config(
+        lines=['key {} 7 {}{}'.format(new_ckn, new_cak, role),
+               'no {}'.format(old_line)],
+        parents=['mac security', 'profile {}'.format(profile_name)])
+
+
+def rotate_macsec_profile_key(host, profile_name, old_ckn, new_ckn, new_cak):
+    """Rotate one CA of a MACsec profile with ``config macsec profile update``.
+
+    This is the production path for a CAK rollover. ``old_ckn`` names the key
+    being replaced and so selects which CA is rotated -- the same call rotates
+    the primary or the fallback. Every other field of the profile is left
+    alone and the profile's other CA stays live, which is what keeps the port
+    protected while the rotation runs.
+
+    ``new_cak`` is cisco_type7 encoded, the form CONFIG_DB stores and the form
+    ``set_macsec_profile`` already passes around.
+
+    Args:
+        host: SONiC or EOS host object.
+        profile_name: MACsec profile to rotate a key of.
+        old_ckn: CKN of the key being replaced.
+        new_ckn: CKN of the replacement key.
+        new_cak: cisco_type7 encoded CAK of the replacement key.
+
+    Returns:
+        list: the namespaces the rotation was applied to (``[None]`` on a
+        single-ASIC host or on EOS).
+    """
+    if isinstance(host, EosHost):
+        _eos_rotate_macsec_profile_key(host, profile_name, old_ckn, new_ckn, new_cak)
+        return [None]
+
+    namespaces = host.get_asic_namespace_list() if host.is_multi_asic else [None]
+    rotated = []
+    for ns in namespaces:
+        prefix = "-n {} ".format(ns) if ns is not None else ""
+        cmd = ("config macsec {}profile update {} --old_ckn {} --new_ckn {} "
+               "--new_cak {}").format(prefix, profile_name, old_ckn, new_ckn, new_cak)
+        result = host.command(cmd, module_ignore_errors=True)
+        if not result["rc"]:
+            rotated.append(ns)
+            continue
+
+        output = "{}\n{}".format(result.get("stdout", ""), result.get("stderr", ""))
+        # A per-interface profile only exists in the namespace of the port it
+        # belongs to, so the other namespaces legitimately do not know it.
+        if "doesn't exist" in output:
+            continue
+        raise RuntimeError(
+            "'{}' failed on {}: {}".format(cmd, host.hostname, output.strip()))
+
+    if not rotated:
+        raise RuntimeError(
+            "MACsec profile {} does not exist in any namespace of {}".format(
+                profile_name, host.hostname))
+    return rotated
+
+
+def replace_macsec_profile(host, port, profile_name, priority, cipher_suite,
+                           primary_cak, primary_ckn, policy, send_sci,
+                           rekey_period=0, fallback_cak=None, fallback_ckn=None):
+    """Replace a MACsec profile wholesale, using config commands only.
+
+    ``config macsec profile add`` refuses to touch a profile that already
+    exists and ``config macsec profile del`` refuses to drop one a port is
+    still bound to, so changing anything other than a key -- the cipher suite,
+    the rekey period, or whether the profile carries a fallback CA at all -- is
+    the unbind / delete / add / rebind sequence an operator would run.
+
+    Unbinding drops the port for the duration of the replacement. That is also
+    what restarts the CA, and restarting the CA is the only thing that arms a
+    new ``rekey_period``: wpa_supplicant reads the period when the CA starts,
+    so hot-updating it on a running session has no effect.
+
+    The profile named here has to be bound to ``port`` and to nothing else, or
+    the delete step will fail on whichever other port is still using it.
+    """
+    disable_macsec_port(host, port)
+    delete_macsec_profile(host, profile_name)
+    set_macsec_profile(host, profile_name, priority, cipher_suite, primary_cak,
+                       primary_ckn, policy, send_sci, rekey_period,
+                       fallback_cak, fallback_ckn)
+    enable_macsec_port(host, port, profile_name)
 
 
 def enable_macsec_port(host, port, profile_name):
@@ -306,13 +455,14 @@ def cleanup_macsec_configuration(duthost, ctrl_links, profile_name):
 
 
 def setup_macsec_configuration(duthost, ctrl_links, profile_name, default_priority,
-                               cipher_suite, primary_cak, primary_ckn, policy, send_sci, rekey_period, tbinfo):
+                               cipher_suite, primary_cak, primary_ckn, policy, send_sci, rekey_period, tbinfo,
+                               fallback_cak=None, fallback_ckn=None):
     logger.info("Setup macsec configuration step1: set macsec profile")
     # 1. Set macsec profile. The profile is host-wide (no port arg), so the
     # DUT-side set runs once outside the per-link loop.
     submit_async_task(set_macsec_profile, (duthost, profile_name, default_priority,
                       cipher_suite, primary_cak, primary_ckn, policy,
-                      send_sci, rekey_period))
+                      send_sci, rekey_period, fallback_cak, fallback_ckn))
     i = 0
     for dut_port, nbr in ctrl_links.items():
         if i % 2 == 0:
@@ -321,7 +471,8 @@ def setup_macsec_configuration(duthost, ctrl_links, profile_name, default_priori
             priority = default_priority + 1
         submit_async_task(set_macsec_profile,
                           (nbr["host"], profile_name, priority,
-                           cipher_suite, primary_cak, primary_ckn, policy, send_sci, rekey_period))
+                           cipher_suite, primary_cak, primary_ckn, policy, send_sci, rekey_period,
+                           fallback_cak, fallback_ckn))
         i += 1
     wait_all_complete(timeout=180)
 
@@ -345,13 +496,45 @@ def setup_macsec_configuration(duthost, ctrl_links, profile_name, default_priori
     logger.info("Setup macsec configuration finished")
 
 
+def generate_macsec_key_pair(cipher_suite="GCM-AES-128", exclude_ckns=()):
+    """Generate a random CAK/CKN pair valid for ``cipher_suite``.
+
+    The cipher suite fixes the key lengths: the AES-128 variants take a 32
+    character CAK and CKN, the AES-256 variants take 64. ``secrets.token_hex``
+    is asked for half that many bytes because it renders every byte as two
+    characters, and the CKN is carried as the literal string it produces.
+
+    The CAK is returned cisco_type7 encoded, which is how CONFIG_DB stores it
+    and what both ``config macsec profile add`` and the EOS ``key ... 7 ...``
+    syntax expect.
+
+    Args:
+        cipher_suite: Cipher suite the key pair has to satisfy.
+        exclude_ckns: A CKN, or an iterable of CKNs, the generated one must not
+            collide with. A CA is keyed by its CKN, so every key that has to
+            coexist with -- or replace -- another one needs a distinct name.
+
+    Returns:
+        tuple: ``(cak, ckn)``, the CAK cisco_type7 encoded and the CKN plain hex.
+    """
+    if isinstance(exclude_ckns, str):
+        exclude_ckns = (exclude_ckns,)
+    excluded = {ckn.lower() for ckn in exclude_ckns if ckn}
+
+    num_bytes = 16 if "128" in cipher_suite else 32
+    while True:
+        ckn = secrets.token_hex(num_bytes)
+        if ckn.lower() not in excluded:
+            return cisco_type7.hash(secrets.token_hex(num_bytes)), ckn
+
+
 def generate_macsec_profile(port_name, cipher_suite="GCM-AES-128", priority=64,
                             policy="security", send_sci="true", rekey_period=0):
     """Generate a MACsec profile with random CAK/CKN for a specific port.
 
     The profile is named ``MACSEC_PROFILE_<port_name>`` and the pre-shared keys
-    are generated using ``secrets.token_hex`` so that every port receives a
-    unique key pair.
+    are generated by :func:`generate_macsec_key_pair` so that every port
+    receives a unique key pair.
 
     Args:
         port_name: Interface name (e.g. "Ethernet0"). Used in the profile name.
@@ -364,26 +547,7 @@ def generate_macsec_profile(port_name, cipher_suite="GCM-AES-128", priority=64,
     Returns:
         dict: A profile dict compatible with set_macsec_profile().
     """
-
-    # CAK length: AES-128 variants use 32 bytes (66 hex chars),
-    #             AES-256 variants use 64 bytes (130 hex chars).
-    # CKN length: AES-128 variants use 16 bytes (32 hex chars),
-    #             AES-256 variants use 32 bytes (64 hex chars).
-    if "128" in cipher_suite:
-        cak = secrets.token_hex(16)
-        # token_hex produces a string of n*2 chars (as each hex num is 2 chars)
-        # For CKN, this is interpreted as the literal password, so when passed to
-        # the type7 encoder each hex char is treated as its own byte.
-        # This is why the number passed to token hex is half the expected number of bytes,
-        # because the length of the string generated is double
-        ckn = secrets.token_hex(16)
-    else:
-        cak = secrets.token_hex(32)
-        ckn = secrets.token_hex(32)
-
-    # CAK is expected to be in "type7" encoding format
-    # This adds the extra byte to the cak / ckn length
-    cak = cisco_type7.hash(cak)
+    cak, ckn = generate_macsec_key_pair(cipher_suite)
 
     profile_name = "MACSEC_PROFILE_{}".format(port_name)
     return {

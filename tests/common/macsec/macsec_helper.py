@@ -14,7 +14,7 @@ import ptf.testutils as testutils
 import scapy.all as scapy
 import scapy.contrib.macsec as scapy_macsec
 
-from tests.common.macsec.macsec_platform_helper import sonic_db_cli
+from tests.common.macsec.macsec_platform_helper import sonic_db_cli, get_macsec_ifname
 from tests.common.devices.eos import EosHost
 from tests.common.utilities import convert_scapy_packet_to_bytes, wait_until
 
@@ -33,6 +33,17 @@ __all__ = [
     'get_sci',
     'getns_prefix',
     'get_ipnetns_prefix',
+    'run_wpa_cli',
+    'get_mka_participants',
+    'get_participant_by_ckn',
+    'get_principal_ckn',
+    'check_principal_invariant',
+    'wait_principal_invariant',
+    'wait_for_ckn_live',
+    'macsec_add_mka',
+    'macsec_del_mka',
+    'macsec_rekey',
+    'get_rx_sc_count',
 ]
 
 logger = logging.getLogger(__name__)
@@ -103,6 +114,337 @@ def get_ipnetns_prefix(host, intf):
         ns_prefix = "sudo ip netns exec {}".format(ns)
 
     return ns_prefix
+
+
+def get_macsec_container(host, port):
+    '''
+    Return the docker container that runs wpa_supplicant/macsecmgrd for the
+    given port. Single-asic uses "macsec"; multi-asic uses a per-namespace
+    container named "macsec<asic_index>".
+    '''
+    if host.is_multi_asic:
+        asic = host.get_port_asic_instance(port)
+        return "macsec{}".format(asic.asic_index)
+    return "macsec"
+
+
+def run_wpa_cli(host, port, *args, **kwargs):
+    '''
+    Run a wpa_cli command against the per-port wpa_supplicant control socket.
+
+    macsecmgrd starts one wpa_supplicant per MACsec port with a global control
+    socket at /var/run/<port> inside the macsec docker. Mirror the exact
+    invocation macsecmgrd uses:
+        wpa_cli -g /var/run/<port> IFNAME=<port> <args>
+    '''
+    module_ignore_errors = kwargs.get("module_ignore_errors", False)
+    container = get_macsec_container(host, port)
+    cmd = "docker exec {container} wpa_cli -g /var/run/{port} IFNAME={port} {args}".format(
+        container=container, port=port,
+        args=" ".join(str(a) for a in args))
+    return host.command(cmd, module_ignore_errors=module_ignore_errors)
+
+
+def _mka_bool(value):
+    return str(value).strip().lower() == "yes"
+
+
+def _eos_yn(value):
+    return "yes" if value else "no"
+
+
+def _eos_port_profile(host, port):
+    '''Return the MACsec profile name attached to an EOS interface, or None.'''
+    output = host.eos_command(
+        commands=["show running-config interfaces {}".format(port)])["stdout"][0]
+    if not isinstance(output, str):
+        output = str(output)
+    match = re.search(r"^\s*mac security profile (\S+)\s*$", output, re.M)
+    return match.group(1) if match else None
+
+
+def _eos_profile_key_lines(host, profile_name):
+    '''Return ``{ckn_lower: verbatim_key_line}`` for an EOS mac security profile.
+
+    EOS rejects a bare ``no key <ckn>`` with "% Incomplete command": removing a
+    key requires repeating the configured line in full, including the encryption
+    type, the encrypted CAK and any trailing ``fallback`` marker. Callers
+    therefore need the line exactly as the device rendered it.
+    '''
+    output = host.eos_command(
+        commands=["show running-config section mac security"])["stdout"][0]
+    if not isinstance(output, str):
+        output = str(output)
+    lines = {}
+    in_profile = False
+    for raw in output.splitlines():
+        line = raw.strip()
+        match = re.match(r"^profile (\S+)$", line)
+        if match:
+            in_profile = (match.group(1) == profile_name)
+            continue
+        if line.startswith("interface "):
+            in_profile = False
+            continue
+        if in_profile:
+            key_match = re.match(r"^key (\S+) \d+ \S+(\s+fallback)?$", line)
+            if key_match:
+                lines[key_match.group(1).lower()] = line
+    return lines
+
+
+def _eos_mka_participants(host, port):
+    '''Return EOS MKA participants for a port shaped like the wpa_cli output.
+
+    EOS reports one dict per CKN under ``interfaces.<port>.participants``.
+    The fields map onto the wpa_cli names the fallback tests assert on::
+
+        <dict key>     -> ckn
+        msgId          -> mi
+        principalActor -> is_principal
+        electedSelf    -> is_key_server / is_elected
+        defaultActor   -> marks the fallback CA, so is_primary = not defaultActor
+        success        -> peer liveness. EOS exposes no live_peers counter, so
+                          it is projected to "1"/"0" to keep the SONiC-shaped
+                          contract used by wait_for_ckn_live().
+    '''
+    output = host.eos_command(
+        commands=["show mac security participants | json"])["stdout"][0]
+    if isinstance(output, str):
+        output = json.loads(output)
+    port_data = output.get("interfaces", {}).get(port, {})
+    participants = []
+    for ckn, fields in port_data.get("participants", {}).items():
+        participants.append({
+            "ckn": ckn,
+            "mi": fields.get("msgId", ""),
+            "is_principal": _eos_yn(fields.get("principalActor")),
+            "is_key_server": _eos_yn(fields.get("electedSelf")),
+            "is_elected": _eos_yn(fields.get("electedSelf")),
+            "is_primary": _eos_yn(not fields.get("defaultActor")),
+            "is_fallback": _eos_yn(fields.get("defaultActor")),
+            "live_peers": "1" if fields.get("success") else "0",
+            "potential_peers": "0",
+        })
+    return participants
+
+
+def get_mka_participants(host, port):
+    '''
+    Parse `macsec_mka_list` into a list of participant dicts.
+
+    Output is a flat sequence of key=value lines. Top-level keys
+    (actor_sci, key_server_sci) precede the participant blocks; each
+    participant block begins with a `participant_idx=` line. Booleans are
+    emitted as the literal strings "yes"/"no".
+
+    EOS neighbors expose the same information through
+    `show mac security participants`, which is normalised to the identical
+    shape so callers stay device-agnostic.
+    '''
+    if isinstance(host, EosHost):
+        return _eos_mka_participants(host, port)
+    output = run_wpa_cli(host, port, "macsec_mka_list")["stdout"]
+    participants = []
+    current = None
+    for raw in output.splitlines():
+        line = raw.strip()
+        if not line or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key == "participant_idx":
+            current = {}
+            participants.append(current)
+            continue
+        if current is not None:
+            current[key] = value
+    for participant in participants:
+        # wpa_supplicant only reports the positive form (is_primary=No marks
+        # the standby CA); expose the complement so callers may use either name.
+        if "is_primary" in participant and "is_fallback" not in participant:
+            participant["is_fallback"] = (
+                "No" if _mka_bool(participant["is_primary"]) else "Yes")
+    return participants
+
+
+def get_participant_by_ckn(host, port, ckn):
+    '''Return the participant dict whose CKN matches (case-insensitive), or None.'''
+    ckn = ckn.lower()
+    for participant in get_mka_participants(host, port):
+        if participant.get("ckn", "").lower() == ckn:
+            return participant
+    return None
+
+
+def get_principal_ckn(host, port):
+    '''Return the CKN (lowercase) of the principal participant, or None.'''
+    for participant in get_mka_participants(host, port):
+        if _mka_bool(participant.get("is_principal")):
+            return participant.get("ckn", "").lower()
+    return None
+
+
+def _mka_int(value, default=0):
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def check_principal_invariant(host, port):
+    '''
+    Check the port-level principal invariant on one end of a MACsec link.
+
+    KaY tracks the principal as a single pointer, so at most one participant
+    may report is_principal. A CA with no live peer is legitimately unowned,
+    so the pointer may be unset while every participant is peerless. Once any
+    participant has a live peer, however, exactly one participant must own the
+    port.
+
+    Live peers with no principal is the signature of a wedged CA: no SAK is
+    distributed and no SA is installed, so the datapath blackholes while MKA
+    still reports the session as healthy. That state is invisible to peer
+    liveness checks, which is why it is asserted separately from SA presence.
+
+    Returns None when the invariant holds, otherwise a description of the
+    violation suitable for use as an assertion message.
+    '''
+    participants = get_mka_participants(host, port)
+    if not participants:
+        return None
+    with_peers = [p for p in participants
+                  if _mka_int(p.get("live_peers")) >= 1]
+    principals = [p for p in participants
+                  if _mka_bool(p.get("is_principal"))]
+    if not with_peers or len(principals) == 1:
+        return None
+    detail = ", ".join(
+        "ckn={}.. live_peers={} is_principal={} is_elected={}".format(
+            p.get("ckn", "?")[:16], p.get("live_peers", "?"),
+            p.get("is_principal", "?"), p.get("is_elected", "?"))
+        for p in participants)
+    return ("{} {}: {} of {} participant(s) have a live peer but {} report "
+            "is_principal; expected exactly 1 [{}]").format(
+        host.hostname, port, len(with_peers), len(participants),
+        len(principals), detail)
+
+
+def wait_principal_invariant(host, port, timeout=30, interval=2):
+    '''
+    Wait for the principal invariant to hold, tolerating transients.
+
+    Principal selection is not instantaneous after a CA change, so a momentary
+    violation while peers re-converge is expected. One that outlives the
+    timeout is a genuine wedge.
+
+    The legitimate violation window is bounded by KaY re-running principal
+    selection. Today that happens only on edges -- a live peer being removed, a
+    peer transitioning to live, or a participant being deleted -- so the
+    default is deliberately generous. If selection is re-armed on every
+    participant timer tick the bound collapses to a single mka_hello_time, and
+    this timeout should be tightened rather than grown: past that point a
+    violation outliving one hello interval indicates a regression, not slow
+    convergence.
+    '''
+    deadline = time.time() + timeout
+    while True:
+        violation = check_principal_invariant(host, port)
+        if violation is None:
+            return None
+        if time.time() >= deadline:
+            return violation
+        time.sleep(interval)
+
+
+def wait_for_ckn_live(host, port, ckn, timeout=60, interval=2):
+    '''
+    Wait until the participant identified by ckn has at least one live peer.
+    Returns True on success, False on timeout.
+    '''
+    def _is_live():
+        participant = get_participant_by_ckn(host, port, ckn)
+        if participant is None:
+            return False
+        try:
+            return int(participant.get("live_peers", 0)) >= 1
+        except ValueError:
+            return False
+
+    return wait_until(timeout, interval, 0, _is_live)
+
+
+def macsec_add_mka(host, port, ckn, cak, fallback=False, module_ignore_errors=False):
+    '''Add an MKA participant at runtime. fallback=True marks it as standby.
+
+    On EOS the participant set is driven by the profile attached to the port,
+    so the key is added to that profile instead (0 = cleartext CAK, matching
+    the raw value wpa_cli takes).
+    '''
+    if isinstance(host, EosHost):
+        profile = _eos_port_profile(host, port)
+        if profile is None:
+            raise ValueError(
+                "No mac security profile attached to {} on {}".format(port, host.hostname))
+        line = "key {} 0 {}{}".format(ckn, cak, " fallback" if fallback else "")
+        return host.eos_config(
+            lines=[line], parents=["mac security", "profile {}".format(profile)],
+            module_ignore_errors=module_ignore_errors)
+
+    args = ["macsec_add_mka", "ckn={}".format(ckn), "cak={}".format(cak)]
+    if fallback:
+        args.append("fallback=1")
+    return run_wpa_cli(host, port, *args, module_ignore_errors=module_ignore_errors)
+
+
+def macsec_del_mka(host, port, ckn, module_ignore_errors=False):
+    '''Remove an MKA participant. Hitless failover to the survivor if it owned the CP.'''
+    if isinstance(host, EosHost):
+        profile = _eos_port_profile(host, port)
+        if profile is None:
+            raise ValueError(
+                "No mac security profile attached to {} on {}".format(port, host.hostname))
+        line = _eos_profile_key_lines(host, profile).get(ckn.lower())
+        if line is None:
+            if module_ignore_errors:
+                return None
+            raise ValueError(
+                "No key {} configured under profile {} on {}".format(
+                    ckn, profile, host.hostname))
+        return host.eos_config(
+            lines=["no {}".format(line)],
+            parents=["mac security", "profile {}".format(profile)],
+            module_ignore_errors=module_ignore_errors)
+
+    return run_wpa_cli(host, port, "macsec_del_mka", "ckn={}".format(ckn),
+                       module_ignore_errors=module_ignore_errors)
+
+
+def macsec_rekey(host, port, module_ignore_errors=False):
+    '''Force a SAK rekey under the current principal CKN (SAK refresh, not CAK change).'''
+    if isinstance(host, EosHost):
+        raise ValueError("macsec_rekey has no EOS equivalent; drive rekey from the DUT")
+
+    return run_wpa_cli(host, port, "macsec_rekey", module_ignore_errors=module_ignore_errors)
+
+
+def get_rx_sc_count(host, port):
+    '''
+    Return the number of ingress (receive) SCs on the SecY for the port.
+
+    Uses `ip macsec show` via get_mka_session, which is only available on
+    virtual switch (VS) testbeds. Returns None when the datapath view is not
+    available (e.g. physical platforms), so callers can guard SC-refcount
+    assertions to VS.
+    '''
+    ifname = get_macsec_ifname(host, port)
+    if ifname is None:
+        return None
+    sessions = get_mka_session(host)
+    if ifname not in sessions:
+        return None
+    return len(sessions[ifname].get("ingress_scs", {}))
 
 
 def get_dict_macsec_counters(duthost, port):  # noqa: F811

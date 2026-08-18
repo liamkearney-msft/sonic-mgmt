@@ -30,19 +30,30 @@ def profile_name(macsec_profile):
 
 
 @pytest.fixture(scope="module")
-def get_port_profile_name(macsec_profile, port_profiles):
+def get_port_profile(macsec_profile, port_profiles):
+    """Return a callable ``f(dut_port)`` that resolves the MACsec profile
+    bound to a given port.  In single-profile mode every controlled port
+    shares the module-wide ``--macsec_profile``.  Under
+    ``--per_interface_macsec`` each port carries its own generated profile
+    with a unique name and CAK/CKN, so tests that need a port's keys -- not
+    just its profile name -- have to resolve them per port.
+    """
+    def _resolve(dut_port):
+        if port_profiles:
+            return port_profiles.get(dut_port, macsec_profile)
+        return macsec_profile
+    return _resolve
+
+
+@pytest.fixture(scope="module")
+def get_port_profile_name(get_port_profile):
     """Return a callable ``f(dut_port)`` that resolves the MACsec profile
     name for a given port.  In single-profile mode this always returns the
     same name.  Tests that disable/re-enable MACsec on a port should use
     this instead of ``profile_name``.
     """
-    if port_profiles:
-        def _resolve(dut_port):
-            return port_profiles[dut_port]['name']
-    else:
-        name = macsec_profile['name']
-        def _resolve(dut_port):       # noqa: E306
-            return name
+    def _resolve(dut_port):
+        return get_port_profile(dut_port)['name']
     return _resolve
 
 
