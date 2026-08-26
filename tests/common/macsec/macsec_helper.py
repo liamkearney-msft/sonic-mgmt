@@ -95,6 +95,18 @@ def getns_prefix(host, intf):
     return ns_prefix
 
 
+def get_macsec_container(host, port):
+    '''
+    Return the docker container that runs wpa_supplicant/macsecmgrd for the
+    given port. Single-asic uses "macsec"; multi-asic uses a per-namespace
+    container named "macsec<asic_index>".
+    '''
+    if host.is_multi_asic:
+        asic = host.get_port_asic_instance(port)
+        return "macsec{}".format(asic.asic_index)
+    return "macsec"
+
+
 def get_ipnetns_prefix(host, intf):
     ns_prefix = " "
     if host.is_multi_asic:

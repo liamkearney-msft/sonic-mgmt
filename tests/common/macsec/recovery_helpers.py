@@ -10,6 +10,7 @@ from tests.common.helpers.dut_utils import (
 )
 from tests.common.macsec.macsec_helper import (
     check_appl_db,
+    get_macsec_container,
     get_sci,
     getns_prefix,
 )
@@ -32,40 +33,80 @@ MKA_CONVERGE_DELAY = 12
 
 
 # ---------------------------------------------------------------------------
+# macsec container/service instances (namespace aware)
+# ---------------------------------------------------------------------------
+
+def _macsec_service_for_container(container_name):
+    """Map a macsec container name to the systemd unit that manages it."""
+    suffix = container_name[len("macsec"):]
+    return "macsec@{}".format(suffix) if suffix else "macsec"
+
+
+def macsec_instances(duthost):
+    """
+    Return ``[(container_name, systemd_service_name), ...]`` for every macsec
+    instance on ``duthost``.
+
+    A multi-ASIC DUT runs one macsec container per ASIC -- ``macsec0``,
+    ``macsec1``, ... driven by the templated units ``macsec@0``, ``macsec@1``,
+    ... and the un-suffixed ``macsec.service`` is masked there. Acting on the
+    bare name therefore fails outright, and hardcoding instance 0 silently
+    leaves every other ASIC's container untouched, so a disruption test would
+    report success while never having disturbed most of the links it checks.
+    """
+    if not duthost.is_multi_asic:
+        return [("macsec", "macsec")]
+    return [("macsec{}".format(asic_id), "macsec@{}".format(asic_id))
+            for asic_id in duthost.get_frontend_asic_ids()]
+
+
+def macsec_instance_for_port(duthost, port_name):
+    """Return ``(container_name, service_name)`` of the macsec instance owning ``port_name``."""
+    container_name = get_macsec_container(duthost, port_name)
+    return (container_name, _macsec_service_for_container(container_name))
+
+
+# ---------------------------------------------------------------------------
 # Disruption primitives
 # ---------------------------------------------------------------------------
 
 def graceful_restart_macsec(duthost):
-    """`systemctl restart macsec` via the startlimit-aware helper."""
-    logger.info("Graceful restart of macsec on %s", duthost.hostname)
-    restart_service_with_startlimit_guard(
-        duthost, "macsec",
-        backoff_seconds=35,
-        verify_timeout=CONTAINER_UP_TIMEOUT,
-    )
+    """`systemctl restart macsec` via the startlimit-aware helper, on every ASIC."""
+    for container_name, service_name in macsec_instances(duthost):
+        logger.info("Graceful restart of %s on %s", service_name, duthost.hostname)
+        restart_service_with_startlimit_guard(
+            duthost, service_name,
+            backoff_seconds=35,
+            verify_timeout=CONTAINER_UP_TIMEOUT,
+            container_name=container_name,
+        )
 
 
 def dirty_kill_macsec_container(duthost):
     """`docker kill -s 9 macsec` — bypasses macsecmgrd's per-port disable loop."""
-    logger.info("Sending SIGKILL to macsec container on %s", duthost.hostname)
-    duthost.shell("docker kill -s 9 macsec", module_ignore_errors=False)
+    containers = [container for container, _ in macsec_instances(duthost)]
+    logger.info("Sending SIGKILL to macsec container(s) %s on %s",
+                ", ".join(containers), duthost.hostname)
+    duthost.shell("docker kill -s 9 {}".format(" ".join(containers)),
+                  module_ignore_errors=False)
 
 
 def dirty_kill_macsecmgrd(duthost, signal=9):
     """
-    Send a signal to macsecmgrd inside the macsec container.
+    Send a signal to macsecmgrd inside every macsec container.
 
     signal=9 (SIGKILL) skips graceful shutdown; signal=6 (SIGABRT) generates a
     core dump.  supervisord inside the container respawns macsecmgrd; the
     container itself stays up, as do the per-port wpa_supplicant processes
     and their UNIX control sockets.
     """
-    logger.info("Sending signal %d to macsecmgrd inside macsec container on %s",
-                signal, duthost.hostname)
-    duthost.shell(
-        "docker exec macsec pkill -{} -x macsecmgrd".format(signal),
-        module_ignore_errors=False,
-    )
+    for container_name, _ in macsec_instances(duthost):
+        logger.info("Sending signal %d to macsecmgrd inside %s on %s",
+                    signal, container_name, duthost.hostname)
+        duthost.shell(
+            "docker exec {} pkill -{} -x macsecmgrd".format(container_name, signal),
+            module_ignore_errors=False,
+        )
 
 
 def dirty_kill_wpa_supplicant(duthost, port_name):
@@ -75,12 +116,14 @@ def dirty_kill_wpa_supplicant(duthost, port_name):
     The wpa_supplicant command line includes the per-port control socket
     path (/var/run/Ethernet<N>), so we use that to scope the pkill to one
     instance.  macsecmgrd respawns it; other ports' wpa_supplicants are
-    untouched.
+    untouched.  The process lives in the macsec container of the port's own
+    ASIC, so the port has to be mapped to its instance first.
     """
-    logger.info("SIGKILL wpa_supplicant for %s on %s",
-                port_name, duthost.hostname)
+    container_name, _ = macsec_instance_for_port(duthost, port_name)
+    logger.info("SIGKILL wpa_supplicant for %s in %s on %s",
+                port_name, container_name, duthost.hostname)
     duthost.shell(
-        "docker exec macsec pkill -9 -f '/var/run/{}'".format(port_name),
+        "docker exec {} pkill -9 -f '/var/run/{}'".format(container_name, port_name),
         module_ignore_errors=False,
     )
 
@@ -91,7 +134,7 @@ def dirty_kill_wpa_supplicant(duthost, port_name):
 
 def wait_for_macsec_container(duthost):
     """
-    Wait for systemd to *auto-respawn* the macsec container after a dirty
+    Wait for systemd to *auto-respawn* the macsec container(s) after a dirty
     kill.  Deliberately does NOT issue `systemctl restart`: the macsec
     service has a Restart= policy, so after SIGKILL systemd brings the
     container back on its own.  A `systemctl restart` here would graceful-
@@ -99,7 +142,7 @@ def wait_for_macsec_container(duthost):
     clean per-port teardown that wipes orchagent's stale SA state — which
     converts the dirty restart into a graceful one.
 
-    Fallback: if the container hasn't come back within CONTAINER_UP_TIMEOUT
+    Fallback: if a container hasn't come back within CONTAINER_UP_TIMEOUT
     (e.g. rapid repeated kills tripped systemd's StartLimitHit so auto-
     respawn is suppressed), clear the failure counter and `start` it — a
     start, never a restart, so a still-running container is never gracefully
@@ -107,24 +150,29 @@ def wait_for_macsec_container(duthost):
     """
     time.sleep(KILL_SETTLE_SECONDS)
 
-    if wait_until(CONTAINER_UP_TIMEOUT, 2, 0,
-                  is_container_running, duthost, "macsec"):
-        logger.info("macsec container auto-respawned on %s", duthost.hostname)
-        return
+    for container_name, service_name in macsec_instances(duthost):
+        if wait_until(CONTAINER_UP_TIMEOUT, 2, 0,
+                      is_container_running, duthost, container_name):
+            logger.info("%s container auto-respawned on %s",
+                        container_name, duthost.hostname)
+            continue
 
-    logger.warning(
-        "macsec did not auto-respawn on %s (StartLimitHit=%s); "
-        "clearing failure counter and starting",
-        duthost.hostname, is_hitting_start_limit(duthost, "macsec"))
-    duthost.shell("sudo systemctl reset-failed macsec.service",
-                  module_ignore_errors=True)
-    duthost.shell("sudo systemctl start macsec.service",
-                  module_ignore_errors=True)
-    pytest_assert(
-        wait_until(CONTAINER_UP_TIMEOUT, 2, 0,
-                   is_container_running, duthost, "macsec"),
-        "macsec container did not come up after dirty kill + fallback start")
-    logger.info("macsec container started via fallback on %s", duthost.hostname)
+        logger.warning(
+            "%s did not auto-respawn on %s (StartLimitHit=%s); "
+            "clearing failure counter and starting",
+            container_name, duthost.hostname,
+            is_hitting_start_limit(duthost, service_name))
+        duthost.shell("sudo systemctl reset-failed {}.service".format(service_name),
+                      module_ignore_errors=True)
+        duthost.shell("sudo systemctl start {}.service".format(service_name),
+                      module_ignore_errors=True)
+        pytest_assert(
+            wait_until(CONTAINER_UP_TIMEOUT, 2, 0,
+                       is_container_running, duthost, container_name),
+            "{} container did not come up after dirty kill + fallback start".format(
+                container_name))
+        logger.info("%s container started via fallback on %s",
+                    container_name, duthost.hostname)
 
 
 def wait_for_mka_converged(duthost, ctrl_links, policy, cipher_suite, send_sci):
