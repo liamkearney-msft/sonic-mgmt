@@ -48,14 +48,22 @@ def submit_async_task(target, args):
 
 
 def wait_all_complete(timeout=300):
+    """Join every queued process, treating `timeout` as one overall deadline.
+
+    The queue is taken and cleared up front so that a caller which catches the
+    timeout and retries starts from a clean queue instead of re-joining the
+    processes this call already terminated.
+    """
     global process_queue
-    for proc in process_queue:
-        proc.join(timeout)
+    procs = process_queue
+    process_queue = []
+    deadline = time.time() + timeout
+    for proc in procs:
+        proc.join(max(0, deadline - time.time()))
         # If process timeout, terminate all processes, otherwise the pytest process will never finish.
         if proc.is_alive():
-            [p.terminate() for p in process_queue]
+            [p.terminate() for p in procs]
             raise RuntimeError("Process {} timeout {}".format(proc, timeout))
-    process_queue = []
 
 
 def check_wpa_supplicant_process(host, ctrl_port_name):
@@ -83,6 +91,8 @@ QUERY_MACSEC_EGRESS_SC = "sonic-db-cli {} APPL_DB HGETALL 'MACSEC_EGRESS_SC_TABL
 QUERY_MACSEC_INGRESS_SA = "sonic-db-cli {} APPL_DB HGETALL 'MACSEC_INGRESS_SA_TABLE:{}:{}:{}'"
 
 QUERY_MACSEC_EGRESS_SA = "sonic-db-cli {} APPL_DB HGETALL 'MACSEC_EGRESS_SA_TABLE:{}:{}:{}'"
+
+QUERY_MACSEC_TABLE_KEYS = "sonic-db-cli {} APPL_DB KEYS '{}:{}:*'"
 
 
 def getns_prefix(host, intf):
@@ -160,26 +170,82 @@ def get_appl_db(host, host_port_name, peer, peer_port_name):
     return port_table, egress_sc_table, ingress_sc_table, egress_sa_table, ingress_sa_table
 
 
-def __check_appl_db(duthost, dut_ctrl_port_name, nbrhost, nbr_ctrl_port_name, policy, cipher_suite, send_sci):
-    # Check MACsec port table
-    dut_port_table, dut_egress_sc_table, dut_ingress_sc_table, dut_egress_sa_table, dut_ingress_sa_table = get_appl_db(
-        duthost, dut_ctrl_port_name, nbrhost, nbr_ctrl_port_name)
-    nbr_port_table, nbr_egress_sc_table, nbr_ingress_sc_table, nbr_egress_sa_table, nbr_ingress_sa_table = get_appl_db(
-        nbrhost, nbr_ctrl_port_name, duthost, dut_ctrl_port_name)
-    assert dut_port_table and nbr_port_table
-    for port_table in (dut_port_table, nbr_port_table):
-        assert port_table["enable"] == "true"
-        assert port_table["cipher_suite"] == cipher_suite
-        assert port_table["enable_protect"] == "true"
-        if policy == "security":
-            assert port_table["enable_encrypt"] == "true"
-        else:
-            assert port_table["enable_encrypt"] == "false"
-        assert port_table["send_sci"] == send_sci
+def __macsec_table_keys(host, table, port_name):
+    """Return the APPL_DB keys of ``table`` for ``port_name``, whatever the SCI.
 
-    # Check MACsec SC table
-    assert dut_ingress_sc_table and nbr_ingress_sc_table
-    assert dut_egress_sc_table and nbr_egress_sc_table
+    The ingress tables are keyed by the *peer's* SCI, and for an EOS peer
+    ``get_appl_db`` can only guess that SCI from the interface name. A wildcard
+    lookup answers "is anything installed" without depending on that guess.
+    """
+    cmd = QUERY_MACSEC_TABLE_KEYS.format(getns_prefix(host, port_name), table, port_name)
+    return [line for line in host.shell(cmd)["stdout_lines"] if line.strip()]
+
+
+def __check_macsec_port_table(port_table, host_name, port_name, policy, cipher_suite, send_sci):
+    assert port_table, \
+        "No MACSEC_PORT_TABLE for {} on {}".format(port_name, host_name)
+    assert port_table["enable"] == "true", \
+        "MACsec not enabled on {} {}".format(host_name, port_name)
+    assert port_table["cipher_suite"] == cipher_suite, \
+        "Cipher suite on {} {} is {}, expected {}".format(
+            host_name, port_name, port_table["cipher_suite"], cipher_suite)
+    assert port_table["enable_protect"] == "true", \
+        "Protection not enabled on {} {}".format(host_name, port_name)
+    if policy == "security":
+        assert port_table["enable_encrypt"] == "true", \
+            "Encryption not enabled on {} {} under the security policy".format(host_name, port_name)
+    else:
+        assert port_table["enable_encrypt"] == "false", \
+            "Encryption enabled on {} {} under the {} policy".format(host_name, port_name, policy)
+    assert port_table["send_sci"] == send_sci, \
+        "send_sci on {} {} is {}, expected {}".format(
+            host_name, port_name, port_table["send_sci"], send_sci)
+
+
+def __check_sas_installed(host, port_name, egress_sc_table, egress_sa_table):
+    """Assert the link has SAs, not just SCs.
+
+    This is the failure this gate exists to catch. MKA can form the CA and
+    create both SCs while no SAK is ever installed, and in that state the port
+    still reports STATE_DB ``MACSEC_PORT_TABLE`` state ``ok`` and the peer still
+    reports a live session -- so every cheaper check passes while the link
+    carries nothing. Recovering it needs the per-port wpa_supplicant KaY
+    participant rebuilt (``config macsec -n <ns> port del/add <port>``); a link
+    bounce does not clear it.
+
+    The ingress side is looked up by wildcard rather than by the peer SCI that
+    ``get_appl_db`` computes, because that SCI is guessed from the interface
+    name when the peer is an EOS host and a wrong guess would fail every link.
+    """
+    host_name = host.hostname
+    assert egress_sc_table, \
+        "No egress SC on {} {}".format(host_name, port_name)
+
+    encoding_an = int(egress_sc_table["encoding_an"])
+    assert encoding_an in egress_sa_table, \
+        "Egress SC on {} {} is up but has no SA at its encoding_an {} (installed ANs: {})".format(
+            host_name, port_name, encoding_an, sorted(egress_sa_table) or "none")
+
+    assert __macsec_table_keys(host, "MACSEC_INGRESS_SC_TABLE", port_name), \
+        "No ingress SC on {} {}".format(host_name, port_name)
+    assert __macsec_table_keys(host, "MACSEC_INGRESS_SA_TABLE", port_name), \
+        "Ingress SC on {} {} is up but no ingress SA is installed".format(host_name, port_name)
+
+
+def __check_appl_db(duthost, dut_ctrl_port_name, nbrhost, nbr_ctrl_port_name, policy, cipher_suite, send_sci):
+    """Validate both halves of a link whose peer is also a SONiC host."""
+    dut_port_table, dut_egress_sc_table, _, dut_egress_sa_table, dut_ingress_sa_table = get_appl_db(
+        duthost, dut_ctrl_port_name, nbrhost, nbr_ctrl_port_name)
+    nbr_port_table, nbr_egress_sc_table, _, nbr_egress_sa_table, nbr_ingress_sa_table = get_appl_db(
+        nbrhost, nbr_ctrl_port_name, duthost, dut_ctrl_port_name)
+
+    __check_macsec_port_table(dut_port_table, duthost.hostname, dut_ctrl_port_name,
+                              policy, cipher_suite, send_sci)
+    __check_macsec_port_table(nbr_port_table, nbrhost.hostname, nbr_ctrl_port_name,
+                              policy, cipher_suite, send_sci)
+
+    __check_sas_installed(duthost, dut_ctrl_port_name, dut_egress_sc_table, dut_egress_sa_table)
+    __check_sas_installed(nbrhost, nbr_ctrl_port_name, nbr_egress_sc_table, nbr_egress_sa_table)
 
     # Check MACsec SA Table.  Only the active encoding_an SA needs to be
     # consistent between egress and peer ingress.  Non-encoding ANs may linger
@@ -191,8 +257,8 @@ def __check_appl_db(duthost, dut_ctrl_port_name, nbrhost, nbr_ctrl_port_name, po
             ((dut_egress_sc_table, dut_egress_sa_table, nbr_ingress_sa_table),
              (nbr_egress_sc_table, nbr_egress_sa_table, dut_ingress_sa_table)):
         encoding_an = int(egress_sc["encoding_an"])
-        assert encoding_an in egress_sa_table
-        assert encoding_an in peer_ingress_sa_table
+        assert encoding_an in peer_ingress_sa_table, \
+            "Peer has not installed an ingress SA for the active AN {}".format(encoding_an)
         egress_sa = egress_sa_table[encoding_an]
         ingress_sa = peer_ingress_sa_table[encoding_an]
         assert egress_sa["sak"] == ingress_sa["sak"]
@@ -200,23 +266,59 @@ def __check_appl_db(duthost, dut_ctrl_port_name, nbrhost, nbr_ctrl_port_name, po
         assert egress_sa["next_pn"] >= ingress_sa["lowest_acceptable_pn"]
 
 
+def __check_appl_db_dut_side(duthost, dut_ctrl_port_name, nbrhost, nbr_ctrl_port_name,
+                             policy, cipher_suite, send_sci):
+    """Validate a link whose peer keeps no APPL_DB to compare against.
+
+    An EOS neighbour has no SONiC APPL_DB, so the peer half of the comparison in
+    ``__check_appl_db`` cannot be made. The DUT half is still fully readable and
+    is where the interesting failures land, so it is checked in full; the peer
+    contributes the one health signal it does expose, its own MACsec state.
+    """
+    dut_port_table, dut_egress_sc_table, _, dut_egress_sa_table, _ = get_appl_db(
+        duthost, dut_ctrl_port_name, nbrhost, nbr_ctrl_port_name)
+
+    __check_macsec_port_table(dut_port_table, duthost.hostname, dut_ctrl_port_name,
+                              policy, cipher_suite, send_sci)
+    __check_sas_installed(duthost, dut_ctrl_port_name, dut_egress_sc_table, dut_egress_sa_table)
+
+    assert nbrhost.iface_macsec_ok(nbr_ctrl_port_name), \
+        "MACsec is not up on peer {} {}".format(nbrhost.hostname, nbr_ctrl_port_name)
+
+
 def check_appl_db(duthost, ctrl_links, policy, cipher_suite, send_sci):
+    """Return True only when every control link is fully converged.
+
+    Returns False instead of raising so that the caller's ``wait_until`` retries:
+    ``wait_until`` swallows exceptions from its predicate, so an assert raised
+    here would be turned into a silent retry until the whole timeout expired
+    rather than a reported failure.
+    """
     logger.info("Check appl_db start")
-    procs = []
+    if not ctrl_links:
+        logger.error("Check appl_db: no control links to check")
+        return False
+
+    procs = {}
     for port_name, nbr in list(ctrl_links.items()):
         if isinstance(nbr["host"], EosHost):
-            assert wait_until(300, 3, 0,
-                              lambda: duthost.iface_macsec_ok(port_name) and
-                              nbr["host"].iface_macsec_ok(nbr["port"]))
-            continue
-        proc = submit_async_task(
-            __check_appl_db,
+            target = __check_appl_db_dut_side
+        else:
+            target = __check_appl_db
+        procs[port_name] = submit_async_task(
+            target,
             (duthost, port_name, nbr["host"], nbr["port"], policy, cipher_suite, send_sci))
-        procs.append(proc)
-    wait_all_complete(timeout=180)
-    failed = [p.exitcode for p in procs if p.exitcode != 0]
+
+    try:
+        wait_all_complete(timeout=180)
+    except RuntimeError as e:
+        logger.info("Check appl_db: timed out waiting for the per-link checks: %s", e)
+        return False
+
+    failed = sorted(port for port, proc in procs.items() if proc.exitcode != 0)
     if failed:
-        logger.info("Check appl_db: %d/%d port pair(s) not yet ready", len(failed), len(procs))
+        logger.info("Check appl_db: %d/%d link(s) not converged: %s",
+                    len(failed), len(procs), ", ".join(failed))
         return False
     logger.info("Check appl_db finished")
     return True
