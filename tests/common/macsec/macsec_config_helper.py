@@ -1,3 +1,4 @@
+import ast
 import logging
 import secrets
 import time
@@ -99,31 +100,49 @@ def set_macsec_profile(host, profile_name, priority, cipher_suite,
 
 
 def is_macsec_configured(host, mac_profile, ctrl_links):
-    is_profile_present = False
-    is_port_profile_present = False
+    """Check the DUT already carries exactly the profile the tests want.
+
+    Two things are verified: the profile exists in every ASIC namespace with the
+    key material we are about to use, and every control link is bound to it.
+    Matching on the name alone is not enough -- a profile left behind by an
+    earlier deployment can carry different keys, which would silently skip
+    setup and then fail deep inside a test.
+    """
     profile_name = mac_profile['name']
+    # Only compare fields that are written verbatim into CONFIG_DB by
+    # set_macsec_profile(); priority is per-link and send_sci/policy are
+    # encoded as flags, so they are not directly comparable here.
+    expected = {}
+    for field in ('cipher_suite', 'primary_cak', 'primary_ckn'):
+        if mac_profile.get(field):
+            expected[field] = str(mac_profile[field])
 
-    # Check macsec profile is configured in all namespaces
-    if host.is_multi_asic:
-        for ns in host.get_asic_namespace_list():
-            CMD_PREFIX = "-n {}".format(ns) if ns is not None else " "
-            cmd = "sonic-db-cli {} CONFIG_DB KEYS 'MACSEC_PROFILE|{}'".format(CMD_PREFIX, profile_name)
-            output = host.command(cmd)['stdout'].strip()
-            profile = output.split('|')[1] if output else None
-            is_profile_present = (profile == profile_name)
-    else:
-        cmd = "sonic-db-cli CONFIG_DB KEYS 'MACSEC_PROFILE|{}'".format(profile_name)
+    namespaces = host.get_asic_namespace_list() if host.is_multi_asic else [None]
+    for ns in namespaces:
+        ns_prefix = "-n {}".format(ns) if ns is not None else ""
+        cmd = "sonic-db-cli {} CONFIG_DB HGETALL 'MACSEC_PROFILE|{}'".format(ns_prefix, profile_name)
         output = host.command(cmd)['stdout'].strip()
-        profile = output.split('|')[1] if output else None
-        is_profile_present = (profile == profile_name)
+        if not output or output == "{}":
+            logger.info("Profile %s is not configured in namespace %s", profile_name, ns)
+            return False
+        try:
+            configured = ast.literal_eval(output)
+        except (ValueError, SyntaxError):
+            logger.warning("Could not parse profile %s in namespace %s: %s", profile_name, ns, output)
+            return False
+        for field, value in expected.items():
+            if str(configured.get(field, "")) != value:
+                logger.info("Profile %s in namespace %s has unexpected %s, needs reconfiguring",
+                            profile_name, ns, field)
+                return False
 
-    # Check if macsec profile is configured on interfaces
-    for port, nbr in ctrl_links.items():
-        cmd = "sonic-db-cli {} CONFIG_DB HGET 'PORT|{}' 'macsec' ".format(getns_prefix(host, port), port)
-        output = host.command(cmd)['stdout'].strip()
-        is_port_profile_present = (output == profile_name)
+    for port in ctrl_links:
+        cmd = "sonic-db-cli {} CONFIG_DB HGET 'PORT|{}' 'macsec'".format(getns_prefix(host, port), port)
+        if host.command(cmd)['stdout'].strip() != profile_name:
+            logger.info("Port %s is not bound to profile %s", port, profile_name)
+            return False
 
-    return is_profile_present and is_port_profile_present
+    return True
 
 
 def delete_macsec_profile(host, profile_name):
