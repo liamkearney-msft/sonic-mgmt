@@ -4,7 +4,7 @@ import json
 import logging
 import time
 from collections import defaultdict, deque
-from multiprocessing import Process
+from multiprocessing import Process, Queue
 
 import cryptography.exceptions
 import ptf
@@ -286,6 +286,34 @@ def __check_appl_db_dut_side(duthost, dut_ctrl_port_name, nbrhost, nbr_ctrl_port
         "MACsec is not up on peer {} {}".format(nbrhost.hostname, nbr_ctrl_port_name)
 
 
+#: How many per-link checks may run at once.  Each check runs in a forked
+#: process and issues ansible commands to both the DUT and the neighbour, and
+#: the inherited connection state does not survive an unbounded fan-out: on a
+#: 32-link testbed the later children fail with "Host unreachable in the
+#: inventory" and their request/reply records interleave, so a converged link
+#: reads as down.  Failures following iteration order rather than anything about
+#: the links is what distinguishes this from a real convergence failure.
+CHECK_APPL_DB_CONCURRENCY = 8
+
+#: Budget for one batch.  Callers poll this function through a 300s wait_until,
+#: so all batches together have to fit inside that window.
+CHECK_APPL_DB_BATCH_TIMEOUT = 60
+
+
+def __run_link_check(target, args, port_name, result_queue):
+    """Run one per-link check, reporting why it failed rather than only that it did.
+
+    The check runs in its own process, so a failure reaches the parent only as an
+    exit code.  Push the reason back before re-raising so the caller can log which
+    invariant the link actually broke.
+    """
+    try:
+        target(*args)
+    except Exception as e:
+        result_queue.put((port_name, "{}: {}".format(type(e).__name__, e)))
+        raise
+
+
 def check_appl_db(duthost, ctrl_links, policy, cipher_suite, send_sci):
     """Return True only when every control link is fully converged.
 
@@ -299,26 +327,54 @@ def check_appl_db(duthost, ctrl_links, policy, cipher_suite, send_sci):
         logger.error("Check appl_db: no control links to check")
         return False
 
-    procs = {}
-    for port_name, nbr in list(ctrl_links.items()):
-        if isinstance(nbr["host"], EosHost):
-            target = __check_appl_db_dut_side
-        else:
-            target = __check_appl_db
-        procs[port_name] = submit_async_task(
-            target,
-            (duthost, port_name, nbr["host"], nbr["port"], policy, cipher_suite, send_sci))
+    links = list(ctrl_links.items())
+    result_queue = Queue()
+    reasons = {}
+    failed = []
 
-    try:
-        wait_all_complete(timeout=180)
-    except RuntimeError as e:
-        logger.info("Check appl_db: timed out waiting for the per-link checks: %s", e)
-        return False
+    for batch_start in range(0, len(links), CHECK_APPL_DB_CONCURRENCY):
+        batch = links[batch_start:batch_start + CHECK_APPL_DB_CONCURRENCY]
+        procs = {}
+        for port_name, nbr in batch:
+            if isinstance(nbr["host"], EosHost):
+                target = __check_appl_db_dut_side
+            else:
+                target = __check_appl_db
+            procs[port_name] = submit_async_task(
+                __run_link_check,
+                (target,
+                 (duthost, port_name, nbr["host"], nbr["port"], policy, cipher_suite, send_sci),
+                 port_name, result_queue))
 
-    failed = sorted(port for port, proc in procs.items() if proc.exitcode != 0)
+        try:
+            wait_all_complete(timeout=CHECK_APPL_DB_BATCH_TIMEOUT)
+        except RuntimeError as e:
+            # Swallowed on purpose: the caller polls this through wait_until,
+            # which discards exceptions from its predicate, so letting this
+            # escape would turn a reported failure into a silent retry.
+            logger.info("Check appl_db: batch timed out: %s", e)
+            for proc in procs.values():
+                proc.join(5)
+
+        batch_failed = [port for port, proc in procs.items() if proc.exitcode != 0]
+        failed.extend(batch_failed)
+
+        # Read exactly the number of messages this batch should have produced.
+        # Queue.empty() can report empty while a child's data is still in flight.
+        for _ in range(len([port for port in batch_failed if port not in reasons])):
+            try:
+                port_name, reason = result_queue.get(timeout=5)
+            except Exception:
+                break
+            reasons.setdefault(port_name, reason)
+
     if failed:
+        failed = sorted(set(failed))
         logger.info("Check appl_db: %d/%d link(s) not converged: %s",
-                    len(failed), len(procs), ", ".join(failed))
+                    len(failed), len(links), ", ".join(failed))
+        for port_name in failed:
+            logger.info("Check appl_db: %s: %s", port_name,
+                        reasons.get(port_name, "no reason reported"))
         return False
     logger.info("Check appl_db finished")
     return True
