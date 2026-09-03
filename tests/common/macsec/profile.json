@@ -64,11 +64,31 @@
         "send_sci": "true",
         "rekey_period": 240
     },
+    "128_INTEGRITY_FALLBACK": {
+        "priority": 64,
+        "cipher_suite": "GCM-AES-128",
+        "primary_cak": "35045f514b420c0e000b0b7476287f23210806564052510d5c5e56006e6d2d3c23",
+        "primary_ckn": "6162636465666768696A6B6C6D6E6F70",
+        "fallback_cak": "3106080a00005b554f4e007975707670725b0a54540c0252445e5d7a29252b046a",
+        "fallback_ckn": "30313233343536373839414243444546",
+        "policy": "integrity_only",
+        "send_sci": "true"
+    },
     "MACSEC_PROFILE": {
         "priority": 64,
         "cipher_suite": "GCM-AES-XPN-256",
         "primary_cak": "207b757a60617745504e5a20747a7c76725e524a450d0d01040a0c75297822227e07554155500e5d5157786d6c2a3d2031425a5e577e7e727f6b6c033124322627",
         "primary_ckn": "6162636465666768696A6B6C6D6E6F707172737475767778797A303132333435",
+        "policy": "security",
+        "send_sci": "true"
+    },
+    "MACSEC_PROFILE_FALLBACK": {
+        "priority": 64,
+        "cipher_suite": "GCM-AES-XPN-256",
+        "primary_cak": "207b757a60617745504e5a20747a7c76725e524a450d0d01040a0c75297822227e07554155500e5d5157786d6c2a3d2031425a5e577e7e727f6b6c033124322627",
+        "primary_ckn": "6162636465666768696A6B6C6D6E6F707172737475767778797A303132333435",
+        "fallback_cak": "1108495642410E0A547879757867657A4602435304525D5C02015D5541440100000A0202010A0F545E5E045D4152005D09505B274A180D1A0313135E0F577C2D21",
+        "fallback_ckn": "3031323334353637383941424344454630313233343536373839414243444546",
         "policy": "security",
         "send_sci": "true"
     }

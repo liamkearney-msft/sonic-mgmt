@@ -44,6 +44,13 @@ class TestPerInterfaceProfile():
                 assert profile_list[i]["primary_ckn"] != profile_list[j]["primary_ckn"], \
                     "CKN collision between {} and {}".format(
                         profile_list[i]["name"], profile_list[j]["name"])
+                if "fallback_cak" in profile_list[i]:
+                    assert profile_list[i]["fallback_cak"] != profile_list[j]["fallback_cak"], \
+                        "Fallback CAK collision between {} and {}".format(
+                            profile_list[i]["name"], profile_list[j]["name"])
+                    assert profile_list[i]["fallback_ckn"] != profile_list[j]["fallback_ckn"], \
+                        "Fallback CKN collision between {} and {}".format(
+                            profile_list[i]["name"], profile_list[j]["name"])
 
     @pytest.mark.disable_loganalyzer
     def test_profile_isolation(self, duthost, ctrl_links, upstream_links,

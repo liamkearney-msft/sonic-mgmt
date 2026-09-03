@@ -7,7 +7,9 @@ from tests.common.macsec.recovery_helpers import (
     assert_one_egress_sa_per_sc,
     dirty_kill_macsec_container,
     get_egress_encoding_ans,
+    get_macsec_profile_field,
     graceful_restart_macsec,
+    set_macsec_profile_fields,
     set_rekey_period,
     snapshot_appl_db_saks,
     wait_for_macsec_container,
@@ -71,24 +73,14 @@ def force_dut_key_server(macsec_duthost, profile_name, ctrl_links,
     """
     duthost = macsec_duthost
 
-    orig_priority = duthost.shell(
-        "sonic-db-cli CONFIG_DB HGET 'MACSEC_PROFILE|{}' priority".format(
-            profile_name),
-        module_ignore_errors=True,
-    )["stdout"].strip() or "64"
-    orig_rekey = duthost.shell(
-        "sonic-db-cli CONFIG_DB HGET 'MACSEC_PROFILE|{}' rekey_period".format(
-            profile_name),
-        module_ignore_errors=True,
-    )["stdout"].strip() or "0"
+    orig_priority = get_macsec_profile_field(
+        duthost, profile_name, "priority", default="64")
+    orig_rekey = get_macsec_profile_field(
+        duthost, profile_name, "rekey_period", default="0")
     logger.info("force_dut_key_server: original priority=%s rekey_period=%s, "
                 "forcing priority to 0", orig_priority, orig_rekey)
 
-    duthost.shell(
-        "sonic-db-cli CONFIG_DB HSET 'MACSEC_PROFILE|{}' priority 0".format(
-            profile_name),
-        module_ignore_errors=False,
-    )
+    set_macsec_profile_fields(duthost, profile_name, priority=0)
     graceful_restart_macsec(duthost)
     assert wait_for_mka_converged(
         duthost, ctrl_links, policy, cipher_suite, send_sci), \
@@ -98,11 +90,9 @@ def force_dut_key_server(macsec_duthost, profile_name, ctrl_links,
 
     logger.info("force_dut_key_server teardown: restoring priority=%s "
                 "rekey_period=%s", orig_priority, orig_rekey)
-    duthost.shell(
-        "sonic-db-cli CONFIG_DB HSET 'MACSEC_PROFILE|{}' priority {} "
-        "rekey_period {}".format(profile_name, orig_priority, orig_rekey),
-        module_ignore_errors=False,
-    )
+    set_macsec_profile_fields(duthost, profile_name,
+                              priority=orig_priority,
+                              rekey_period=orig_rekey)
     graceful_restart_macsec(duthost)
 
 

@@ -68,6 +68,9 @@ mac security
    profile {{ profile.macsec_profile }}
       cipher {{ profile.cipher_suite }}
       key {{ profile.primary_ckn }} 7 {{ profile.primary_cak }}
+{% if profile.fallback_ckn is defined and profile.fallback_cak is defined %}
+      key {{ profile.fallback_ckn }} 7 {{ profile.fallback_cak }} fallback
+{% endif %}
       traffic unprotected drop
       sci
 {% endif %}

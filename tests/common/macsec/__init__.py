@@ -77,7 +77,8 @@ class MacsecPlugin(object):
         When ``--per_interface_macsec`` is set, generates a unique
         ``MACSEC_PROFILE_<port>`` for every controlled port using the same
         cipher_suite, policy, send_sci, priority, and rekey_period as the base
-        ``--macsec_profile``, but with unique CAK/CKN per port.
+        ``--macsec_profile``, but with unique primary and fallback key pairs per
+        port when the base profile carries a fallback CA.
         """
         if not request.config.getoption("per_interface_macsec", default=False):
             return None
@@ -92,6 +93,9 @@ class MacsecPlugin(object):
                 policy=macsec_profile["policy"],
                 send_sci=macsec_profile["send_sci"],
                 rekey_period=macsec_profile["rekey_period"],
+                include_fallback=bool(
+                    macsec_profile.get("fallback_cak")
+                    and macsec_profile.get("fallback_ckn")),
             )
         return profiles
 
@@ -108,10 +112,23 @@ class MacsecPlugin(object):
         return __stop_macsec_service
 
     @pytest.fixture(scope="module")
-    def macsec_feature(self, start_macsec_service, stop_macsec_service):
+    def macsec_feature(self, macsec_duthost, macsec_profile, ctrl_links,
+                       start_macsec_service, stop_macsec_service):
+        # If macsec was already configured on the DUT before the test session
+        # started (e.g. deployed by deploy-mg), leave the feature enabled on
+        # teardown. Disabling it would stop macsecmgrd while macsec config
+        # remains in CONFIG_DB, which strands every macsec link down and
+        # breaks the testbed for subsequent runs.
+        macsec_preconfigured = is_macsec_configured(
+            macsec_duthost, macsec_profile, ctrl_links)
         start_macsec_service()
         yield
-        stop_macsec_service()
+        if not macsec_preconfigured:
+            stop_macsec_service()
+        else:
+            logger.info(
+                "Macsec is preconfigured on %s, leaving the macsec feature enabled",
+                macsec_duthost.hostname)
 
     @pytest.fixture(scope="module")
     def startup_macsec(self, request, macsec_duthost, ctrl_links, macsec_profile, port_profiles, tbinfo):
@@ -120,6 +137,10 @@ class MacsecPlugin(object):
         def __startup_macsec():
             profile = macsec_profile
             if request.config.getoption("neighbor_type") == "eos":
+                if profile["policy"] == "integrity_only":
+                    pytest.skip(
+                        "The EOS MACsec helper does not configure integrity-only "
+                        "profiles; use a SONiC neighbor to validate this policy")
                 if macsec_duthost.facts["asic_type"] == "vs" and profile['send_sci'] == "false":
                     # On EOS, portchannel mac is not same as the member port mac (being as SCI),
                     # then src mac is not equal to SCI in its sending packet. The receiver of vSONIC
@@ -150,7 +171,8 @@ class MacsecPlugin(object):
                 setup_macsec_configuration(macsec_duthost, ctrl_links,
                                            profile['name'], profile['priority'], profile['cipher_suite'],
                                            profile['primary_cak'], profile['primary_ckn'], profile['policy'],
-                                           profile['send_sci'], profile['rekey_period'], tbinfo)
+                                           profile['send_sci'], profile['rekey_period'], tbinfo,
+                                           profile.get('fallback_cak'), profile.get('fallback_ckn'))
             logger.info(
                 "Setup MACsec configuration with arguments:\n{}".format(locals()))
 

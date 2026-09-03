@@ -1,5 +1,17 @@
 {
 {%- set asic_cnt = asic_cnt|int -%}
+{%- macro macsec_profile_body() -%}
+        "priority": "{{priority}}",
+        "cipher_suite": "{{cipher_suite}}",
+        "primary_cak": "{{primary_cak}}",
+        "primary_ckn": "{{primary_ckn}}",
+{% if fallback_cak is defined and fallback_ckn is defined %}
+        "fallback_cak": "{{fallback_cak}}",
+        "fallback_ckn": "{{fallback_ckn}}",
+{% endif %}
+        "policy": "{{policy}}",
+        "send_sci": "{{send_sci}}"
+{%- endmacro -%}
 {% if asic_cnt > 1 %}
   "localhost": {
     "MACSEC_PROFILE": {}
@@ -8,12 +20,7 @@
   "asic{{ns}}": {
     "MACSEC_PROFILE": {
       "{{macsec_profile}}": {
-        "priority": "{{priority}}",
-        "cipher_suite": "{{cipher_suite}}",
-        "primary_cak": "{{primary_cak}}",
-        "primary_ckn": "{{primary_ckn}}",
-        "policy": "{{policy}}",
-        "send_sci": "{{send_sci}}"
+{{ macsec_profile_body() }}
       }
     }
 {% if ns == asic_cnt-1 %}
@@ -25,12 +32,7 @@
 {% else %}
   "MACSEC_PROFILE": {
       "{{macsec_profile}}": {
-        "priority": "{{priority}}",
-        "cipher_suite": "{{cipher_suite}}",
-        "primary_cak": "{{primary_cak}}",
-        "primary_ckn": "{{primary_ckn}}",
-        "policy": "{{policy}}",
-        "send_sci": "{{send_sci}}"
+{{ macsec_profile_body() }}
       }
     }
 {%- endif -%}

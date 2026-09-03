@@ -815,9 +815,18 @@ class EosHost(AnsibleHostBase):
         """
         Gets the MAC address of specified interface.
 
+        The answer is cached. EOS only reports physicalAddress on a switched
+        interface, so reading a routed one means toggling ``switchport``, which
+        tears the L3 interface -- and anything bound to it, MACsec included --
+        down for several seconds. A burned-in address does not change, so that
+        disruption is worth paying at most once per interface.
+
         Returns:
             str: The MAC address of the specified interface, or None if it is not found.
         """
+        cache = self.__dict__.setdefault('_iface_mac_cache', {})
+        if interface_name in cache:
+            return cache[interface_name]
         try:
             command = 'show interfaces {} | json'.format(interface_name)
             output = self.eos_command(commands=[command])['stdout'][0]
@@ -831,6 +840,7 @@ class EosHost(AnsibleHostBase):
                     lines=['no switchport'],
                     parents=['interface {}'.format(interface_name)])
             mac = output["interfaces"][interface_name]["physicalAddress"]
+            cache[interface_name] = mac
             return mac
         except Exception as e:
             logger.error('Failed to get MAC address for interface "{}", exception: {}'.format(interface_name, repr(e)))

@@ -248,7 +248,14 @@ class GenerateGoldenConfigDBModule(object):
                 continue
             target = ns_cfg
             for part in path_parts:
-                target = target.setdefault(part, {})
+                # Don't create missing entries: override_config replaces a table key
+                # wholesale, so a partial entry would wipe minigraph-derived fields.
+                if part not in target:
+                    target = None
+                    break
+                target = target[part]
+            if target is None:
+                continue
             target.update(value)
         return config
 

@@ -10,6 +10,7 @@ from tests.common.helpers.dut_utils import (
 )
 from tests.common.macsec.macsec_helper import (
     check_appl_db,
+    get_macsec_container,
     get_sci,
     getns_prefix,
 )
@@ -29,6 +30,134 @@ CONTAINER_UP_TIMEOUT = 120
 MKA_CONVERGE_TIMEOUT = 300
 MKA_CONVERGE_INTERVAL = 6
 MKA_CONVERGE_DELAY = 12
+# Maximum seconds to wait for orchagent/syncd to program a freshly negotiated
+# SAK into SAI.  ASIC_DB is written asynchronously, well after APPL_DB and
+# after MKA reports converged, so the SAK comparison has to be given time to
+# settle or a programming lag is indistinguishable from the stale-SAK bug.
+SAK_PROGRAM_TIMEOUT = 120
+SAK_PROGRAM_INTERVAL = 5
+
+
+# ---------------------------------------------------------------------------
+# MACSEC_PROFILE CONFIG_DB access (namespace aware)
+# ---------------------------------------------------------------------------
+
+def macsec_profile_namespaces(duthost, profile_name):
+    """
+    Return the namespaces whose CONFIG_DB actually holds ``profile_name``.
+
+    On a multi-ASIC chassis the MACsec profile is provisioned once per ASIC
+    namespace and is deliberately absent from the host namespace.  A bare
+    ``sonic-db-cli CONFIG_DB HSET`` therefore does not update the profile at
+    all -- it *creates* a new one in the host namespace containing only the
+    field being written.  That partial entry has no ``primary_cak``, which is
+    a mandatory node in the sonic-macsec YANG model, so every subsequent
+    config validation on the DUT fails with::
+
+        Mandatory node "primary_cak" instance does not exist.
+
+    which errors out unrelated test modules for the rest of the run.  Callers
+    must only ever touch namespaces where the profile already exists.
+    """
+    namespaces = []
+    for ns in duthost.get_asic_namespace_list():
+        prefix = "-n {}".format(ns) if ns is not None else ""
+        keys = duthost.shell(
+            "sonic-db-cli {} CONFIG_DB KEYS 'MACSEC_PROFILE|{}'".format(
+                prefix, profile_name),
+            module_ignore_errors=True,
+        )["stdout"].strip()
+        if keys:
+            namespaces.append(ns)
+    return namespaces
+
+
+def get_macsec_profile_field(duthost, profile_name, field, default=None):
+    """Read ``field`` from the MACsec profile, from whichever namespace has it."""
+    for ns in macsec_profile_namespaces(duthost, profile_name):
+        prefix = "-n {}".format(ns) if ns is not None else ""
+        value = duthost.shell(
+            "sonic-db-cli {} CONFIG_DB HGET 'MACSEC_PROFILE|{}' {}".format(
+                prefix, profile_name, field),
+            module_ignore_errors=True,
+        )["stdout"].strip()
+        if value:
+            return value
+    return default
+
+
+def set_macsec_profile_fields(duthost, profile_name, **fields):
+    """
+    Set one or more fields on the MACsec profile in every namespace that
+    already defines it, so both ASICs of a multi-ASIC DUT stay consistent.
+
+    This deliberately keeps writing CONFIG_DB directly, which is *not* how
+    config changes should normally be made -- new code should go through
+    ``config macsec`` (see ``DedicatedLink`` and ``replace_macsec_profile``).
+    It is kept here because the CLI has no in-place field update:
+    ``profile update`` only rotates a CAK/CKN, ``profile add`` refuses a
+    profile that already exists and ``profile del`` refuses one a port is
+    still bound to.  Changing ``priority`` or ``rekey_period`` through the
+    CLI therefore means moving every bound port -- on the DUT *and* on each
+    neighbor -- onto a replacement profile and back again.  The recovery
+    tests do one of these changes while the macsec container is deliberately
+    dead, and that port churn would disturb the surviving SA they exist to
+    observe.
+
+    What this wrapper does fix is the namespace: upstream issued a bare
+    ``sonic-db-cli ... HSET``, which lands in the host namespace where a
+    multi-ASIC chassis has no profile at all.  See
+    ``macsec_profile_namespaces`` for why that silently poisons the rest of
+    the run.
+    """
+    namespaces = macsec_profile_namespaces(duthost, profile_name)
+    pytest_assert(
+        namespaces,
+        "MACSEC_PROFILE|{} does not exist in any namespace; refusing to "
+        "create a partial profile".format(profile_name))
+    assignments = " ".join(
+        "{} {}".format(key, value) for key, value in fields.items())
+    for ns in namespaces:
+        prefix = "-n {}".format(ns) if ns is not None else ""
+        duthost.shell(
+            "sonic-db-cli {} CONFIG_DB HSET 'MACSEC_PROFILE|{}' {}".format(
+                prefix, profile_name, assignments),
+            module_ignore_errors=False,
+        )
+
+
+# ---------------------------------------------------------------------------
+# macsec container/service instances (namespace aware)
+# ---------------------------------------------------------------------------
+
+def _macsec_service_for_container(container_name):
+    """Map a macsec container name to the systemd unit that manages it."""
+    suffix = container_name[len("macsec"):]
+    return "macsec@{}".format(suffix) if suffix else "macsec"
+
+
+def macsec_instances(duthost):
+    """
+    Return ``[(container_name, systemd_service_name), ...]`` for every macsec
+    instance on ``duthost``.
+
+    A multi-ASIC DUT runs one macsec container per ASIC -- ``macsec0``,
+    ``macsec1``, ... driven by the templated units ``macsec@0``, ``macsec@1``,
+    ... and the un-suffixed ``macsec.service`` is masked there. Acting on the
+    bare name therefore fails outright, and hardcoding instance 0 silently
+    leaves every other ASIC's container untouched, so a disruption test would
+    report success while never having disturbed most of the links it checks.
+    """
+    if not duthost.is_multi_asic:
+        return [("macsec", "macsec")]
+    return [("macsec{}".format(asic_id), "macsec@{}".format(asic_id))
+            for asic_id in duthost.get_frontend_asic_ids()]
+
+
+def macsec_instance_for_port(duthost, port_name):
+    """Return ``(container_name, service_name)`` of the macsec instance owning ``port_name``."""
+    container_name = get_macsec_container(duthost, port_name)
+    return (container_name, _macsec_service_for_container(container_name))
 
 
 # ---------------------------------------------------------------------------
@@ -36,36 +165,42 @@ MKA_CONVERGE_DELAY = 12
 # ---------------------------------------------------------------------------
 
 def graceful_restart_macsec(duthost):
-    """`systemctl restart macsec` via the startlimit-aware helper."""
-    logger.info("Graceful restart of macsec on %s", duthost.hostname)
-    restart_service_with_startlimit_guard(
-        duthost, "macsec",
-        backoff_seconds=35,
-        verify_timeout=CONTAINER_UP_TIMEOUT,
-    )
+    """`systemctl restart macsec` via the startlimit-aware helper, on every ASIC."""
+    for container_name, service_name in macsec_instances(duthost):
+        logger.info("Graceful restart of %s on %s", service_name, duthost.hostname)
+        restart_service_with_startlimit_guard(
+            duthost, service_name,
+            backoff_seconds=35,
+            verify_timeout=CONTAINER_UP_TIMEOUT,
+            container_name=container_name,
+        )
 
 
 def dirty_kill_macsec_container(duthost):
     """`docker kill -s 9 macsec` — bypasses macsecmgrd's per-port disable loop."""
-    logger.info("Sending SIGKILL to macsec container on %s", duthost.hostname)
-    duthost.shell("docker kill -s 9 macsec", module_ignore_errors=False)
+    containers = [container for container, _ in macsec_instances(duthost)]
+    logger.info("Sending SIGKILL to macsec container(s) %s on %s",
+                ", ".join(containers), duthost.hostname)
+    duthost.shell("docker kill -s 9 {}".format(" ".join(containers)),
+                  module_ignore_errors=False)
 
 
 def dirty_kill_macsecmgrd(duthost, signal=9):
     """
-    Send a signal to macsecmgrd inside the macsec container.
+    Send a signal to macsecmgrd inside every macsec container.
 
     signal=9 (SIGKILL) skips graceful shutdown; signal=6 (SIGABRT) generates a
     core dump.  supervisord inside the container respawns macsecmgrd; the
     container itself stays up, as do the per-port wpa_supplicant processes
     and their UNIX control sockets.
     """
-    logger.info("Sending signal %d to macsecmgrd inside macsec container on %s",
-                signal, duthost.hostname)
-    duthost.shell(
-        "docker exec macsec pkill -{} -x macsecmgrd".format(signal),
-        module_ignore_errors=False,
-    )
+    for container_name, _ in macsec_instances(duthost):
+        logger.info("Sending signal %d to macsecmgrd inside %s on %s",
+                    signal, container_name, duthost.hostname)
+        duthost.shell(
+            "docker exec {} pkill -{} -x macsecmgrd".format(container_name, signal),
+            module_ignore_errors=False,
+        )
 
 
 def dirty_kill_wpa_supplicant(duthost, port_name):
@@ -75,12 +210,14 @@ def dirty_kill_wpa_supplicant(duthost, port_name):
     The wpa_supplicant command line includes the per-port control socket
     path (/var/run/Ethernet<N>), so we use that to scope the pkill to one
     instance.  macsecmgrd respawns it; other ports' wpa_supplicants are
-    untouched.
+    untouched.  The process lives in the macsec container of the port's own
+    ASIC, so the port has to be mapped to its instance first.
     """
-    logger.info("SIGKILL wpa_supplicant for %s on %s",
-                port_name, duthost.hostname)
+    container_name, _ = macsec_instance_for_port(duthost, port_name)
+    logger.info("SIGKILL wpa_supplicant for %s in %s on %s",
+                port_name, container_name, duthost.hostname)
     duthost.shell(
-        "docker exec macsec pkill -9 -f '/var/run/{}'".format(port_name),
+        "docker exec {} pkill -9 -f '/var/run/{}'".format(container_name, port_name),
         module_ignore_errors=False,
     )
 
@@ -91,7 +228,7 @@ def dirty_kill_wpa_supplicant(duthost, port_name):
 
 def wait_for_macsec_container(duthost):
     """
-    Wait for systemd to *auto-respawn* the macsec container after a dirty
+    Wait for systemd to *auto-respawn* the macsec container(s) after a dirty
     kill.  Deliberately does NOT issue `systemctl restart`: the macsec
     service has a Restart= policy, so after SIGKILL systemd brings the
     container back on its own.  A `systemctl restart` here would graceful-
@@ -99,7 +236,7 @@ def wait_for_macsec_container(duthost):
     clean per-port teardown that wipes orchagent's stale SA state — which
     converts the dirty restart into a graceful one.
 
-    Fallback: if the container hasn't come back within CONTAINER_UP_TIMEOUT
+    Fallback: if a container hasn't come back within CONTAINER_UP_TIMEOUT
     (e.g. rapid repeated kills tripped systemd's StartLimitHit so auto-
     respawn is suppressed), clear the failure counter and `start` it — a
     start, never a restart, so a still-running container is never gracefully
@@ -107,24 +244,29 @@ def wait_for_macsec_container(duthost):
     """
     time.sleep(KILL_SETTLE_SECONDS)
 
-    if wait_until(CONTAINER_UP_TIMEOUT, 2, 0,
-                  is_container_running, duthost, "macsec"):
-        logger.info("macsec container auto-respawned on %s", duthost.hostname)
-        return
+    for container_name, service_name in macsec_instances(duthost):
+        if wait_until(CONTAINER_UP_TIMEOUT, 2, 0,
+                      is_container_running, duthost, container_name):
+            logger.info("%s container auto-respawned on %s",
+                        container_name, duthost.hostname)
+            continue
 
-    logger.warning(
-        "macsec did not auto-respawn on %s (StartLimitHit=%s); "
-        "clearing failure counter and starting",
-        duthost.hostname, is_hitting_start_limit(duthost, "macsec"))
-    duthost.shell("sudo systemctl reset-failed macsec.service",
-                  module_ignore_errors=True)
-    duthost.shell("sudo systemctl start macsec.service",
-                  module_ignore_errors=True)
-    pytest_assert(
-        wait_until(CONTAINER_UP_TIMEOUT, 2, 0,
-                   is_container_running, duthost, "macsec"),
-        "macsec container did not come up after dirty kill + fallback start")
-    logger.info("macsec container started via fallback on %s", duthost.hostname)
+        logger.warning(
+            "%s did not auto-respawn on %s (StartLimitHit=%s); "
+            "clearing failure counter and starting",
+            container_name, duthost.hostname,
+            is_hitting_start_limit(duthost, service_name))
+        duthost.shell("sudo systemctl reset-failed {}.service".format(service_name),
+                      module_ignore_errors=True)
+        duthost.shell("sudo systemctl start {}.service".format(service_name),
+                      module_ignore_errors=True)
+        pytest_assert(
+            wait_until(CONTAINER_UP_TIMEOUT, 2, 0,
+                       is_container_running, duthost, container_name),
+            "{} container did not come up after dirty kill + fallback start".format(
+                container_name))
+        logger.info("%s container started via fallback on %s",
+                    container_name, duthost.hostname)
 
 
 def wait_for_mka_converged(duthost, ctrl_links, policy, cipher_suite, send_sci):
@@ -205,27 +347,26 @@ def _asic_db_macsec_saks(duthost, ctrl_links):
     return saks
 
 
-def assert_appl_db_sak_programmed_in_asic(duthost, ctrl_links):
+def _sak_programming_gaps(duthost, ctrl_links):
     """
-    For every MACsec SA in APPL_DB, assert its SAK is actually present in
-    ASIC_DB — i.e. the key orchagent advertises was really programmed into
-    SAI/the chip.
+    Compare APPL_DB against ASIC_DB once and return
+    ``(failures, asic_sak_count)``.
 
-    After a dirty restart wpa renegotiates a new SAK at the same (port,
-    sci, AN), but the stale SA object survives in orchagent's
-    MACsecSC::m_sa_ids, so createMACsecSA short-circuits and never
-    reprograms SAI.  SAI_MACSEC_SA_ATTR_SAK is CREATE-ONLY, so the chip
-    keeps the prior cycle's key while APPL_DB carries the fresh one.
-
-    Raises AssertionError listing every APPL_DB SAK absent from ASIC_DB.
+    ``failures`` is a list of human-readable descriptions, one per APPL_DB SA
+    whose SAK is absent from ASIC_DB.  An empty list means every advertised
+    SAK is programmed into SAI.  This is a single sample: callers that need a
+    verdict should poll it via assert_appl_db_sak_programmed_in_asic, since
+    ASIC_DB lags APPL_DB.
     """
     appl_saks = snapshot_appl_db_saks(duthost, ctrl_links)
     asic_saks = _asic_db_macsec_saks(duthost, ctrl_links)
 
-    pytest_assert(
-        asic_saks,
-        "ASIC_DB has no MACSEC_SA objects at all — cannot validate SAK "
-        "programming (macsec not converged in hardware?)")
+    if not asic_saks:
+        # Reported as a gap rather than raised: this runs inside a wait_until
+        # predicate, which swallows exceptions, so raising here would turn a
+        # real "nothing is programmed" into a silent retry with no diagnosis.
+        return ["ASIC_DB has no MACSEC_SA objects at all — macsec is not "
+                "programmed in hardware"], 0
 
     # SAI_MACSEC_SA_ATTR_SAK is always a 256-bit (64 hex chars) field in
     # ASIC_DB regardless of cipher suite.  For GCM-AES-128 the APPL_DB SAK
@@ -242,12 +383,56 @@ def assert_appl_db_sak_programmed_in_asic(duthost, ctrl_links):
                 "SAI after re-key)".format(
                     port_name, sci, an, direction, appl_sak))
 
-    if failures:
+    return failures, len(asic_saks)
+
+
+def assert_appl_db_sak_programmed_in_asic(duthost, ctrl_links,
+                                          timeout=SAK_PROGRAM_TIMEOUT,
+                                          interval=SAK_PROGRAM_INTERVAL):
+    """
+    For every MACsec SA in APPL_DB, assert its SAK is actually present in
+    ASIC_DB — i.e. the key orchagent advertises was really programmed into
+    SAI/the chip.
+
+    After a dirty restart wpa renegotiates a new SAK at the same (port,
+    sci, AN), but the stale SA object survives in orchagent's
+    MACsecSC::m_sa_ids, so createMACsecSA short-circuits and never
+    reprograms SAI.  SAI_MACSEC_SA_ATTR_SAK is CREATE-ONLY, so the chip
+    keeps the prior cycle's key while APPL_DB carries the fresh one.
+
+    The comparison is retried until ``timeout``.  ASIC_DB is written
+    asynchronously by orchagent/syncd, so it lags APPL_DB by an unbounded
+    amount even after MKA reports converged; sampling it once turns that
+    ordinary lag into an indistinguishable false positive.  Retrying makes
+    a reported failure mean the SAK never arrived, rather than that it had
+    not arrived yet.
+
+    Raises AssertionError listing every APPL_DB SAK still absent from
+    ASIC_DB once the timeout expires.
+    """
+    state = {}
+
+    def _programmed():
+        state["failures"], state["asic_count"] = _sak_programming_gaps(
+            duthost, ctrl_links)
+        if state["failures"]:
+            logger.info("SAK programming incomplete: %d entry/entries still "
+                        "absent from ASIC_DB; retrying", len(state["failures"]))
+        return not state["failures"]
+
+    if wait_until(timeout, interval, 0, _programmed):
+        return
+
+    failures = state.get("failures")
+    if failures is None:
         raise AssertionError(
-            "APPL_DB->ASIC_DB SAK mismatch ({} entry/entries); ASIC_DB holds "
-            "{} distinct SAK(s):\n{}".format(
-                len(failures), len(asic_saks),
-                "\n".join("  * " + f for f in failures)))
+            "Could not sample APPL_DB/ASIC_DB SAK state within {}s".format(
+                timeout))
+    raise AssertionError(
+        "APPL_DB->ASIC_DB SAK mismatch ({} entry/entries) still present after "
+        "{}s; ASIC_DB holds {} distinct SAK(s):\n{}".format(
+            len(failures), timeout, state.get("asic_count", 0),
+            "\n".join("  * " + f for f in failures)))
 
 
 # ---------------------------------------------------------------------------
@@ -292,11 +477,7 @@ def advance_egress_encoding_an(duthost, profile_name, ctrl_links,
 
     Returns the {(port, sci): encoding_an} map observed after the advance.
     """
-    duthost.shell(
-        "sonic-db-cli CONFIG_DB HSET 'MACSEC_PROFILE|{}' rekey_period {}".format(
-            profile_name, rekey_period),
-        module_ignore_errors=False,
-    )
+    set_macsec_profile_fields(duthost, profile_name, rekey_period=rekey_period)
     graceful_restart_macsec(duthost)
     pytest_assert(
         wait_for_mka_converged(duthost, ctrl_links, policy, cipher_suite, send_sci),
@@ -316,11 +497,7 @@ def advance_egress_encoding_an(duthost, profile_name, ctrl_links,
 
 def set_rekey_period(duthost, profile_name, rekey_period):
     """Set rekey_period on the DUT MACSEC_PROFILE (does not restart macsec)."""
-    duthost.shell(
-        "sonic-db-cli CONFIG_DB HSET 'MACSEC_PROFILE|{}' rekey_period {}".format(
-            profile_name, rekey_period),
-        module_ignore_errors=False,
-    )
+    set_macsec_profile_fields(duthost, profile_name, rekey_period=rekey_period)
 
 
 def _asic_db_egress_sa_ans_by_sc(duthost, ctrl_links):

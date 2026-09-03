@@ -3,9 +3,15 @@ import logging
 
 from tests.common.utilities import wait_until
 from tests.common import config_reload
-from tests.common.macsec.macsec_helper import check_appl_db, get_appl_db
+from tests.common.reboot import reboot
+from tests.common.macsec.macsec_helper import (
+    check_appl_db,
+    get_appl_db,
+    wait_for_ckn_live,
+)
 from time import sleep
 logger = logging.getLogger(__name__)
+CONFIG_BACKUP_DIR = "/var/tmp/macsec_test_config_backup"
 
 pytestmark = [
     pytest.mark.macsec_required,
@@ -13,19 +19,69 @@ pytestmark = [
 ]
 
 
+def _assert_cas_live_after(duthost, ctrl_links, get_port_profile, action):
+    for dut_port, nbr in ctrl_links.items():
+        profile = get_port_profile(dut_port)
+        if not profile.get("fallback_ckn"):
+            continue
+        for host, port in (
+                (duthost, dut_port), (nbr["host"], nbr["port"])):
+            assert wait_for_ckn_live(
+                host, port, profile["primary_ckn"], timeout=120), \
+                "Primary CA did not recover after {} on {} {}".format(
+                    action, host.hostname, port)
+            assert wait_for_ckn_live(
+                host, port, profile["fallback_ckn"], timeout=120), \
+                "Fallback CA did not recover after {} on {} {}".format(
+                    action, host.hostname, port)
+
+
+def _backup_config(duthost):
+    duthost.shell(
+        "sudo mkdir -p {0} && sudo rm -f {0}/config_db*.json && "
+        "sudo cp /etc/sonic/config_db*.json {0}".format(CONFIG_BACKUP_DIR))
+
+
+def _restore_config(duthost):
+    duthost.shell(
+        "sudo cp {0}/config_db*.json /etc/sonic && "
+        "sudo rm -f {0}/config_db*.json && sudo rmdir {0}".format(
+            CONFIG_BACKUP_DIR))
+
+
 class TestDeployment():
     MKA_TIMEOUT = 6
 
     @pytest.mark.disable_loganalyzer
-    def test_config_reload(self, duthost, ctrl_links, policy, cipher_suite, send_sci, wait_mka_establish):
-        # Save the original config file
-        duthost.shell("cp /etc/sonic/config_db*.json /tmp")
-        # Save the current config file
-        duthost.shell("config save -y")
-        config_reload(duthost)
-        assert wait_until(300, 6, 12, check_appl_db, duthost, ctrl_links, policy, cipher_suite, send_sci)
-        # Recover the original config file
-        duthost.shell("sudo mv /tmp/config_db*.json /etc/sonic")
+    def test_config_reload(self, duthost, ctrl_links, get_port_profile,
+                           policy, cipher_suite, send_sci,
+                           wait_mka_establish):
+        _backup_config(duthost)
+        try:
+            # Save the current config file
+            duthost.shell("config save -y")
+            config_reload(duthost)
+            assert wait_until(300, 6, 12, check_appl_db, duthost, ctrl_links, policy, cipher_suite, send_sci)
+            _assert_cas_live_after(
+                duthost, ctrl_links, get_port_profile, "config reload")
+        finally:
+            _restore_config(duthost)
+
+    @pytest.mark.disable_loganalyzer
+    def test_reboot(self, duthost, localhost, ctrl_links, get_port_profile,
+                    policy, cipher_suite, send_sci, wait_mka_establish):
+        """Primary and fallback CAs recover after a cold DUT reboot."""
+        _backup_config(duthost)
+        try:
+            duthost.shell("config save -y")
+            reboot(duthost, localhost)
+            assert wait_until(
+                300, 6, 12, check_appl_db, duthost, ctrl_links,
+                policy, cipher_suite, send_sci)
+            _assert_cas_live_after(
+                duthost, ctrl_links, get_port_profile, "DUT reboot")
+        finally:
+            _restore_config(duthost)
 
     @pytest.mark.disable_loganalyzer
     def test_scale_rekey(self, duthost, ctrl_links, rekey_period, wait_mka_establish):
