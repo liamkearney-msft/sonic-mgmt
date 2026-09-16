@@ -150,7 +150,8 @@ class MacsecPlugin(object):
                 setup_macsec_configuration(macsec_duthost, ctrl_links,
                                            profile['name'], profile['priority'], profile['cipher_suite'],
                                            profile['primary_cak'], profile['primary_ckn'], profile['policy'],
-                                           profile['send_sci'], profile['rekey_period'], tbinfo)
+                                           profile['send_sci'], profile['rekey_period'], tbinfo,
+                                           profile.get('fallback_cak'), profile.get('fallback_ckn'))
             logger.info(
                 "Setup MACsec configuration with arguments:\n{}".format(locals()))
 

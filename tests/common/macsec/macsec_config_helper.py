@@ -22,6 +22,7 @@ __all__ = [
     'get_macsec_enable_status',
     'get_macsec_profile',
     'wait_for_macsec_cleanup',
+    'generate_macsec_key_pair',
     'generate_macsec_profile',
     'setup_macsec_multi_profile_configuration',
     'cleanup_macsec_multi_profile_configuration',
@@ -42,9 +43,44 @@ def get_macsec_profile(host):
     return request.config.getoption("--macsec_profile", default=None)
 
 
+def _build_macsec_profile_options(priority, cipher_suite, primary_cak,
+                                  primary_ckn, policy, send_sci,
+                                  rekey_period=0, fallback_cak=None,
+                                  fallback_ckn=None):
+    """Build ``config macsec profile add`` options."""
+    if bool(fallback_cak) != bool(fallback_ckn):
+        raise ValueError(
+            "fallback_cak and fallback_ckn must be supplied together")
+    if fallback_ckn and fallback_ckn.lower() == primary_ckn.lower():
+        raise ValueError("primary and fallback CKNs must differ")
+
+    macsec_profile = {
+        "priority": priority,
+        "cipher_suite": cipher_suite,
+        "primary_cak": primary_cak,
+        "primary_ckn": primary_ckn,
+        "policy": policy,
+        "send_sci" if send_sci == "true" else "no_send_sci": "",
+        "rekey_period": rekey_period,
+    }
+    if fallback_cak:
+        macsec_profile.update({
+            "fallback_cak": fallback_cak,
+            "fallback_ckn": fallback_ckn,
+        })
+
+    return "".join(
+        " --{} {}".format(name, value)
+        for name, value in macsec_profile.items()
+    )
+
+
 def set_macsec_profile(host, profile_name, priority, cipher_suite,
-                       primary_cak, primary_ckn, policy, send_sci, rekey_period=0):
+                       primary_cak, primary_ckn, policy, send_sci,
+                       rekey_period=0, fallback_cak=None, fallback_ckn=None):
     if isinstance(host, EosHost):
+        if fallback_cak or fallback_ckn:
+            raise ValueError("Fallback CAKs require a SONiC neighbor")
         eos_cipher_suite = {
             "GCM-AES-128": "aes128-gcm",
             "GCM-AES-256": "aes256-gcm",
@@ -65,19 +101,9 @@ def set_macsec_profile(host, profile_name, priority, cipher_suite,
             parents=['mac security', 'profile {}'.format(profile_name)])
         return
 
-    macsec_profile = {
-        "priority": priority,
-        "cipher_suite": cipher_suite,
-        "primary_cak": primary_cak,
-        "primary_ckn": primary_ckn,
-        "policy": policy,
-        "send_sci" if send_sci == "true" else "no_send_sci": "",
-        "rekey_period": rekey_period,
-    }
-
-    opts = ""
-    for k, v in list(macsec_profile.items()):
-        opts += " --{} {}".format(k, v)
+    opts = _build_macsec_profile_options(
+        priority, cipher_suite, primary_cak, primary_ckn, policy, send_sci,
+        rekey_period, fallback_cak, fallback_ckn)
 
     if host.is_multi_asic:
         for ns in host.get_asic_namespace_list():
@@ -305,14 +331,16 @@ def cleanup_macsec_configuration(duthost, ctrl_links, profile_name):
         assert wait_until(30, 1, 0, lambda d=d: not get_mka_session(d))
 
 
-def setup_macsec_configuration(duthost, ctrl_links, profile_name, default_priority,
-                               cipher_suite, primary_cak, primary_ckn, policy, send_sci, rekey_period, tbinfo):
+def setup_macsec_configuration(
+        duthost, ctrl_links, profile_name, default_priority, cipher_suite,
+        primary_cak, primary_ckn, policy, send_sci, rekey_period, tbinfo,
+        fallback_cak=None, fallback_ckn=None):
     logger.info("Setup macsec configuration step1: set macsec profile")
     # 1. Set macsec profile. The profile is host-wide (no port arg), so the
     # DUT-side set runs once outside the per-link loop.
     submit_async_task(set_macsec_profile, (duthost, profile_name, default_priority,
                       cipher_suite, primary_cak, primary_ckn, policy,
-                      send_sci, rekey_period))
+                      send_sci, rekey_period, fallback_cak, fallback_ckn))
     i = 0
     for dut_port, nbr in ctrl_links.items():
         if i % 2 == 0:
@@ -321,7 +349,8 @@ def setup_macsec_configuration(duthost, ctrl_links, profile_name, default_priori
             priority = default_priority + 1
         submit_async_task(set_macsec_profile,
                           (nbr["host"], profile_name, priority,
-                           cipher_suite, primary_cak, primary_ckn, policy, send_sci, rekey_period))
+                           cipher_suite, primary_cak, primary_ckn, policy,
+                           send_sci, rekey_period, fallback_cak, fallback_ckn))
         i += 1
     wait_all_complete(timeout=180)
 
@@ -345,13 +374,23 @@ def setup_macsec_configuration(duthost, ctrl_links, profile_name, default_priori
     logger.info("Setup macsec configuration finished")
 
 
+def generate_macsec_key_pair(cipher_suite):
+    """Generate one encoded CAK and CKN for *cipher_suite*."""
+    key_bytes = 16 if "128" in cipher_suite else 32
+    cak = cisco_type7.hash(secrets.token_hex(key_bytes))
+    ckn = secrets.token_hex(key_bytes)
+    return cak, ckn
+
+
 def generate_macsec_profile(port_name, cipher_suite="GCM-AES-128", priority=64,
-                            policy="security", send_sci="true", rekey_period=0):
-    """Generate a MACsec profile with random CAK/CKN for a specific port.
+                            policy="security", send_sci="true", rekey_period=0,
+                            include_fallback=False):
+    """Generate a MACsec profile with random CAK/CKN pairs for a port.
 
     The profile is named ``MACSEC_PROFILE_<port_name>`` and the pre-shared keys
     are generated using ``secrets.token_hex`` so that every port receives a
-    unique key pair.
+    unique key pair. When *include_fallback* is true, a distinct fallback pair
+    is included for dual-participant MKA testing.
 
     Args:
         port_name: Interface name (e.g. "Ethernet0"). Used in the profile name.
@@ -360,33 +399,16 @@ def generate_macsec_profile(port_name, cipher_suite="GCM-AES-128", priority=64,
         policy: "security" (encrypt) or "integrity" (auth only).
         send_sci: "true" or "false".
         rekey_period: Seconds between rekeying (0 = disabled).
+        include_fallback: Include a fallback CAK/CKN pair.
 
     Returns:
         dict: A profile dict compatible with set_macsec_profile().
     """
 
-    # CAK length: AES-128 variants use 32 bytes (66 hex chars),
-    #             AES-256 variants use 64 bytes (130 hex chars).
-    # CKN length: AES-128 variants use 16 bytes (32 hex chars),
-    #             AES-256 variants use 32 bytes (64 hex chars).
-    if "128" in cipher_suite:
-        cak = secrets.token_hex(16)
-        # token_hex produces a string of n*2 chars (as each hex num is 2 chars)
-        # For CKN, this is interpreted as the literal password, so when passed to
-        # the type7 encoder each hex char is treated as its own byte.
-        # This is why the number passed to token hex is half the expected number of bytes,
-        # because the length of the string generated is double
-        ckn = secrets.token_hex(16)
-    else:
-        cak = secrets.token_hex(32)
-        ckn = secrets.token_hex(32)
-
-    # CAK is expected to be in "type7" encoding format
-    # This adds the extra byte to the cak / ckn length
-    cak = cisco_type7.hash(cak)
+    cak, ckn = generate_macsec_key_pair(cipher_suite)
 
     profile_name = "MACSEC_PROFILE_{}".format(port_name)
-    return {
+    profile = {
         "name": profile_name,
         "priority": priority,
         "cipher_suite": cipher_suite,
@@ -396,6 +418,13 @@ def generate_macsec_profile(port_name, cipher_suite="GCM-AES-128", priority=64,
         "send_sci": send_sci,
         "rekey_period": rekey_period,
     }
+    if include_fallback:
+        fallback_cak, fallback_ckn = generate_macsec_key_pair(cipher_suite)
+        profile.update({
+            "fallback_cak": fallback_cak,
+            "fallback_ckn": fallback_ckn,
+        })
+    return profile
 
 
 def setup_macsec_multi_profile_configuration(duthost, ctrl_links, port_profiles, tbinfo):
@@ -421,7 +450,8 @@ def setup_macsec_multi_profile_configuration(duthost, ctrl_links, port_profiles,
             duthost, profile["name"], profile["priority"],
             profile["cipher_suite"], profile["primary_cak"],
             profile["primary_ckn"], profile["policy"],
-            profile["send_sci"], profile["rekey_period"])
+            profile["send_sci"], profile["rekey_period"],
+            profile.get("fallback_cak"), profile.get("fallback_ckn"))
     i = 0
     for dut_port, nbr in ctrl_links.items():
         profile = port_profiles[dut_port]
@@ -434,7 +464,8 @@ def setup_macsec_multi_profile_configuration(duthost, ctrl_links, port_profiles,
             nbr["host"], profile["name"], nbr_priority,
             profile["cipher_suite"], profile["primary_cak"],
             profile["primary_ckn"], profile["policy"],
-            profile["send_sci"], profile["rekey_period"])
+            profile["send_sci"], profile["rekey_period"],
+            profile.get("fallback_cak"), profile.get("fallback_ckn"))
         i += 1
         time.sleep(3)
 

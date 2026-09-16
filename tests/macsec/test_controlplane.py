@@ -9,6 +9,12 @@ from tests.common.macsec.macsec_helper import check_wpa_supplicant_process, chec
                            get_mka_session, get_sci, get_appl_db, get_ipnetns_prefix
 from tests.common.macsec.macsec_config_helper import setup_macsec_configuration, delete_macsec_profile
 from tests.common.macsec.macsec_platform_helper import get_platform, get_macsec_ifname
+from tests.common.macsec.mka_state_helper import (
+    find_secret_fields,
+    get_mka_state,
+    mka_state_cli_supported,
+    validate_mka_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,6 +68,35 @@ class TestControlPlane():
                                   policy, cipher_suite, send_sci)
             return True
         assert wait_until(300, 5, 3, _test_mka_session)
+
+    def test_mka_operational_state_primary_only(
+            self, duthost, ctrl_links, macsec_profile, port_profiles,
+            wait_mka_establish):
+        """Verify primary-only profiles publish one secret-free participant."""
+        if not mka_state_cli_supported(duthost):
+            pytest.skip("SONiC image does not expose MKA operational state")
+
+        for port_name in ctrl_links:
+            profile = (
+                port_profiles[port_name]
+                if port_profiles else macsec_profile
+            )
+
+            def _state_is_healthy():
+                session, participants = get_mka_state(duthost, port_name)
+                return not validate_mka_snapshot(
+                    session, participants, profile,
+                    profile["primary_ckn"])
+
+            assert wait_until(60, 3, 0, _state_is_healthy), (
+                "Primary-only MKA state did not become healthy on {}"
+            ).format(port_name)
+            session, participants = get_mka_state(duthost, port_name)
+            assert len(participants) == 1
+            assert not find_secret_fields({
+                "session": session,
+                "participants": participants,
+            })
 
     def test_rekey_by_period(self, duthost, ctrl_links, upstream_links, rekey_period, wait_mka_establish):
         if rekey_period == 0:
