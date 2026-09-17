@@ -67,6 +67,16 @@ def primary_cak(macsec_profile):
 
 
 @pytest.fixture(scope="module")
+def fallback_ckn(macsec_profile):
+    return macsec_profile.get('fallback_ckn')
+
+
+@pytest.fixture(scope="module")
+def fallback_cak(macsec_profile):
+    return macsec_profile.get('fallback_cak')
+
+
+@pytest.fixture(scope="module")
 def policy(macsec_profile):
     return macsec_profile['policy']
 

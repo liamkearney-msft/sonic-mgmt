@@ -13,6 +13,7 @@ SPEC.loader.exec_module(MKA_STATE_HELPER)
 
 find_secret_fields = MKA_STATE_HELPER.find_secret_fields
 parse_db_hash = MKA_STATE_HELPER.parse_db_hash
+parse_eos_mka_participants = MKA_STATE_HELPER.parse_eos_mka_participants
 validate_mka_snapshot = MKA_STATE_HELPER.validate_mka_snapshot
 
 
@@ -116,3 +117,47 @@ def test_find_secret_fields_is_allowlist_safe():
         "participant.sak",
         "participant.auth_key",
     ]
+
+
+def test_parse_eos_mka_participants_normalizes_roles_and_peers():
+    """Normalize established EOS participant field spellings."""
+    output = {
+        "interfaces": {
+            "Ethernet1": {
+                "participants": {
+                    "AABB": {
+                        "success": True,
+                        "electedSelf": False,
+                        "defaultActor": True,
+                        "principalActor": True,
+                        "details": {
+                            "livePeerList": ["peer"],
+                            "sakTransmit": True,
+                        },
+                    },
+                    "CCDD": {
+                        "Success": "Yes",
+                        "Elected-Self": "No",
+                        "Default": "No",
+                        "Principal": "No",
+                        "Details": {
+                            "Live Peers": 1,
+                            "SAK Transmit": "No",
+                        },
+                    },
+                }
+            }
+        }
+    }
+    participants = parse_eos_mka_participants(output, "ethernet1")
+    assert participants["aabb"] == {
+        "active": True,
+        "is_principal": True,
+        "is_primary": True,
+        "is_key_server": False,
+        "live_peers": 1,
+        "sak_transmit": True,
+    }
+    assert participants["ccdd"]["active"]
+    assert not participants["ccdd"]["is_primary"]
+    assert participants["ccdd"]["live_peers"] == 1

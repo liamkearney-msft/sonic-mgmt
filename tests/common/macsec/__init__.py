@@ -19,6 +19,7 @@ from .macsec_config_helper import cleanup_macsec_configuration
 from .macsec_config_helper import is_macsec_configured
 from .macsec_config_helper import get_macsec_enable_status, get_macsec_profile
 from .macsec_config_helper import generate_macsec_profile
+from .macsec_config_helper import macsec_profile_has_fallback
 from .macsec_config_helper import setup_macsec_multi_profile_configuration
 from .macsec_config_helper import cleanup_macsec_multi_profile_configuration
 from .macsec_config_helper import enable_macsec_port
@@ -92,6 +93,7 @@ class MacsecPlugin(object):
                 policy=macsec_profile["policy"],
                 send_sci=macsec_profile["send_sci"],
                 rekey_period=macsec_profile["rekey_period"],
+                include_fallback=macsec_profile_has_fallback(macsec_profile),
             )
         return profiles
 
@@ -153,7 +155,12 @@ class MacsecPlugin(object):
                                            profile['send_sci'], profile['rekey_period'], tbinfo,
                                            profile.get('fallback_cak'), profile.get('fallback_ckn'))
             logger.info(
-                "Setup MACsec configuration with arguments:\n{}".format(locals()))
+                "Setup MACsec configuration profile=%s ports=%s "
+                "per_interface=%s",
+                profile["name"],
+                sorted(ctrl_links),
+                bool(port_profiles),
+            )
 
         return __startup_macsec
 

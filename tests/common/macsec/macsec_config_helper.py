@@ -22,8 +22,11 @@ __all__ = [
     'get_macsec_enable_status',
     'get_macsec_profile',
     'wait_for_macsec_cleanup',
+    'macsec_profile_has_fallback',
+    'ensure_macsec_profile_fallback',
     'generate_macsec_key_pair',
     'generate_macsec_profile',
+    'update_macsec_profile_key',
     'setup_macsec_multi_profile_configuration',
     'cleanup_macsec_multi_profile_configuration',
 ]
@@ -41,6 +44,30 @@ def get_macsec_profile(host):
     # Retrieve the macsec_profile passed by user for this testrun
     request = host.duthosts.request
     return request.config.getoption("--macsec_profile", default=None)
+
+
+def macsec_profile_has_fallback(profile):
+    """Return whether *profile* contains a complete fallback CAK/CKN pair."""
+    has_cak = bool(profile.get("fallback_cak"))
+    has_ckn = bool(profile.get("fallback_ckn"))
+    if has_cak != has_ckn:
+        raise ValueError(
+            "fallback_cak and fallback_ckn must be supplied together")
+    return has_cak
+
+
+def ensure_macsec_profile_fallback(profile):
+    """Return a profile with a fallback pair, preserving one already present."""
+    profile = dict(profile)
+    if macsec_profile_has_fallback(profile):
+        return profile, False
+    fallback_cak, fallback_ckn = generate_macsec_key_pair(
+        profile["cipher_suite"])
+    profile.update({
+        "fallback_cak": fallback_cak,
+        "fallback_ckn": fallback_ckn,
+    })
+    return profile, True
 
 
 def _build_macsec_profile_options(priority, cipher_suite, primary_cak,
@@ -75,27 +102,44 @@ def _build_macsec_profile_options(priority, cipher_suite, primary_cak,
     )
 
 
+def _build_eos_macsec_profile_lines(
+        priority, cipher_suite, primary_cak, primary_ckn, send_sci,
+        rekey_period=0, fallback_cak=None, fallback_ckn=None):
+    if bool(fallback_cak) != bool(fallback_ckn):
+        raise ValueError(
+            "fallback_cak and fallback_ckn must be supplied together")
+    if fallback_ckn and fallback_ckn.lower() == primary_ckn.lower():
+        raise ValueError("primary and fallback CKNs must differ")
+
+    eos_cipher_suite = {
+        "GCM-AES-128": "aes128-gcm",
+        "GCM-AES-256": "aes256-gcm",
+        "GCM-AES-XPN-128": "aes128-gcm-xpn",
+        "GCM-AES-XPN-256": "aes256-gcm-xpn"
+    }
+    lines = [
+        'cipher {}'.format(eos_cipher_suite[cipher_suite]),
+        'key {} 7 {}'.format(primary_ckn, primary_cak),
+    ]
+    if fallback_cak:
+        lines.append(
+            'key {} 7 {} fallback'.format(
+                fallback_ckn, fallback_cak))
+    lines.append('mka key-server priority {}'.format(priority))
+    if rekey_period:
+        lines.append('mka session rekey-period {}'.format(rekey_period))
+    if send_sci == 'true':
+        lines.append('sci')
+    return lines
+
+
 def set_macsec_profile(host, profile_name, priority, cipher_suite,
                        primary_cak, primary_ckn, policy, send_sci,
                        rekey_period=0, fallback_cak=None, fallback_ckn=None):
     if isinstance(host, EosHost):
-        if fallback_cak or fallback_ckn:
-            raise ValueError("Fallback CAKs require a SONiC neighbor")
-        eos_cipher_suite = {
-            "GCM-AES-128": "aes128-gcm",
-            "GCM-AES-256": "aes256-gcm",
-            "GCM-AES-XPN-128": "aes128-gcm-xpn",
-            "GCM-AES-XPN-256": "aes256-gcm-xpn"
-        }
-        lines = [
-            'cipher {}'.format(eos_cipher_suite[cipher_suite]),
-            'key {} 7 {}'.format(primary_ckn, primary_cak),
-            'mka key-server priority {}'.format(priority)
-            ]
-        if rekey_period:
-            lines.append('mka session rekey-period {}'.format(rekey_period))
-        if send_sci == 'true':
-            lines.append('sci')
+        lines = _build_eos_macsec_profile_lines(
+            priority, cipher_suite, primary_cak, primary_ckn, send_sci,
+            rekey_period, fallback_cak, fallback_ckn)
         host.eos_config(
             lines=lines,
             parents=['mac security', 'profile {}'.format(profile_name)])
@@ -108,10 +152,10 @@ def set_macsec_profile(host, profile_name, priority, cipher_suite,
     if host.is_multi_asic:
         for ns in host.get_asic_namespace_list():
             cmd = "config macsec -n {} profile add {} {}".format(ns, profile_name, opts)
-            host.command(cmd)
+            host.command(cmd, verbose=False)
     else:
         cmd = "config macsec profile add {} {}".format(profile_name, opts)
-        host.command(cmd)
+        host.command(cmd, verbose=False)
 
     if send_sci == "false":
         # The MAC address of SONiC host is locally administrated
@@ -124,24 +168,107 @@ def set_macsec_profile(host, profile_name, priority, cipher_suite,
         host.command("lldpcli configure system bond-slave-src-mac-type real")
 
 
+def _eos_macsec_key_line(ckn, cak, is_fallback=False, remove=False):
+    line = "key {} 7 {}".format(ckn, cak)
+    if is_fallback:
+        line += " fallback"
+    if remove:
+        line = "no " + line
+    return line
+
+
+def update_macsec_profile_key(
+        host, profile_name, old_cak, old_ckn, new_cak, new_ckn,
+        is_fallback=False, namespace_option=None, expect_success=True):
+    """Rotate one primary or fallback CAK/CKN pair without detaching ports."""
+    if isinstance(host, EosHost):
+        result = host.eos_config(
+            lines=[
+                _eos_macsec_key_line(
+                    new_ckn, new_cak, is_fallback=is_fallback),
+                _eos_macsec_key_line(
+                    old_ckn, old_cak, is_fallback=is_fallback, remove=True),
+            ],
+            parents=['mac security', 'profile {}'.format(profile_name)])
+        failed = result.get("failed", False)
+        assert failed != expect_success, (
+            "Unexpected EOS MACsec key rotation result on {}"
+        ).format(host.hostname)
+        return [result]
+
+    if namespace_option is None:
+        namespace_options = [""]
+        if host.is_multi_asic:
+            namespace_options = [
+                "-n {}".format(namespace)
+                for namespace in host.get_asic_namespace_list()
+            ]
+    else:
+        namespace_options = [namespace_option]
+
+    results = []
+    for option in namespace_options:
+        command = (
+            "config macsec {} profile update {} "
+            "--old_ckn {} --new_ckn {} --new_cak {}"
+        ).format(option, profile_name, old_ckn, new_ckn, new_cak)
+        result = host.command(
+            command, module_ignore_errors=True, verbose=False)
+        results.append(result)
+        failed = result.get("failed", False)
+        assert failed != expect_success, (
+            "Unexpected SONiC MACsec key rotation result on {}"
+        ).format(host.hostname)
+    return results
+
+
 def is_macsec_configured(host, mac_profile, ctrl_links):
     is_profile_present = False
     is_port_profile_present = False
     profile_name = mac_profile['name']
 
-    # Check macsec profile is configured in all namespaces
+    expected_fallback_cak = mac_profile.get("fallback_cak", "")
+    expected_fallback_ckn = mac_profile.get("fallback_ckn", "")
+
+    # Check macsec profile is configured in all namespaces.
     if host.is_multi_asic:
         for ns in host.get_asic_namespace_list():
             CMD_PREFIX = "-n {}".format(ns) if ns is not None else " "
             cmd = "sonic-db-cli {} CONFIG_DB KEYS 'MACSEC_PROFILE|{}'".format(CMD_PREFIX, profile_name)
             output = host.command(cmd)['stdout'].strip()
             profile = output.split('|')[1] if output else None
-            is_profile_present = (profile == profile_name)
+            fallback_cak = host.command(
+                "sonic-db-cli {} CONFIG_DB HGET "
+                "'MACSEC_PROFILE|{}' fallback_cak".format(
+                    CMD_PREFIX, profile_name))["stdout"].strip()
+            fallback_ckn = host.command(
+                "sonic-db-cli {} CONFIG_DB HGET "
+                "'MACSEC_PROFILE|{}' fallback_ckn".format(
+                    CMD_PREFIX, profile_name))["stdout"].strip()
+            is_profile_present = (
+                profile == profile_name
+                and fallback_cak == expected_fallback_cak
+                and fallback_ckn.lower() == expected_fallback_ckn.lower()
+            )
+            if not is_profile_present:
+                break
     else:
         cmd = "sonic-db-cli CONFIG_DB KEYS 'MACSEC_PROFILE|{}'".format(profile_name)
         output = host.command(cmd)['stdout'].strip()
         profile = output.split('|')[1] if output else None
-        is_profile_present = (profile == profile_name)
+        fallback_cak = host.command(
+            "sonic-db-cli CONFIG_DB HGET "
+            "'MACSEC_PROFILE|{}' fallback_cak".format(
+                profile_name))["stdout"].strip()
+        fallback_ckn = host.command(
+            "sonic-db-cli CONFIG_DB HGET "
+            "'MACSEC_PROFILE|{}' fallback_ckn".format(
+                profile_name))["stdout"].strip()
+        is_profile_present = (
+            profile == profile_name
+            and fallback_cak == expected_fallback_cak
+            and fallback_ckn.lower() == expected_fallback_ckn.lower()
+        )
 
     # Check if macsec profile is configured on interfaces
     for port, nbr in ctrl_links.items():

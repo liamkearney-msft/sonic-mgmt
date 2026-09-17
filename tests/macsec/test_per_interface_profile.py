@@ -44,6 +44,17 @@ class TestPerInterfaceProfile():
                 assert profile_list[i]["primary_ckn"] != profile_list[j]["primary_ckn"], \
                     "CKN collision between {} and {}".format(
                         profile_list[i]["name"], profile_list[j]["name"])
+                if profile_list[i].get("fallback_cak"):
+                    assert profile_list[i]["fallback_cak"] != profile_list[j]["fallback_cak"], \
+                        "Fallback CAK collision between {} and {}".format(
+                            profile_list[i]["name"], profile_list[j]["name"])
+                    assert profile_list[i]["fallback_ckn"] != profile_list[j]["fallback_ckn"], \
+                        "Fallback CKN collision between {} and {}".format(
+                            profile_list[i]["name"], profile_list[j]["name"])
+            if profile_list[i].get("fallback_ckn"):
+                assert profile_list[i]["primary_ckn"] != profile_list[i]["fallback_ckn"], \
+                    "Primary/fallback CKN collision in {}".format(
+                        profile_list[i]["name"])
 
     @pytest.mark.disable_loganalyzer
     def test_profile_isolation(self, duthost, ctrl_links, upstream_links,
@@ -124,6 +135,7 @@ class TestPerInterfaceProfile():
         ports.remove(target_port)
         other_port = random.choice(ports)
         target_nbr = ctrl_links[target_port]
+        target_profile = port_profiles[target_port]
         other_nbr = ctrl_links[other_port]
 
         _, _, _, orig_target_esa, _ = get_appl_db(
@@ -138,6 +150,11 @@ class TestPerInterfaceProfile():
             rekey_period=rekey_period,
         )
         new_profile["name"] = "MACSEC_PROFILE_{}_NEW".format(target_port)
+        if target_profile.get("fallback_cak"):
+            new_profile.update({
+                "fallback_cak": target_profile["fallback_cak"],
+                "fallback_ckn": target_profile["fallback_ckn"],
+            })
 
         new_port_profiles = {target_port: new_profile}
         setup_macsec_multi_profile_configuration(

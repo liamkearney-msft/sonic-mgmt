@@ -1,4 +1,5 @@
 import ast
+import json
 import secrets
 from pathlib import Path
 
@@ -9,6 +10,7 @@ from passlib.hash import cisco_type7
 HELPER_PATH = (
     Path(__file__).resolve().parents[2] / "macsec" / "macsec_config_helper.py"
 )
+PROFILE_PATH = HELPER_PATH.with_name("profile.json")
 
 
 def _load_profile_helpers():
@@ -16,6 +18,10 @@ def _load_profile_helpers():
     tree = ast.parse(source)
     names = {
         "_build_macsec_profile_options",
+        "_build_eos_macsec_profile_lines",
+        "_eos_macsec_key_line",
+        "macsec_profile_has_fallback",
+        "ensure_macsec_profile_fallback",
         "generate_macsec_key_pair",
         "generate_macsec_profile",
     }
@@ -35,6 +41,13 @@ def _load_profile_helpers():
 PROFILE_HELPERS = _load_profile_helpers()
 _build_macsec_profile_options = PROFILE_HELPERS[
     "_build_macsec_profile_options"]
+_build_eos_macsec_profile_lines = PROFILE_HELPERS[
+    "_build_eos_macsec_profile_lines"]
+_eos_macsec_key_line = PROFILE_HELPERS["_eos_macsec_key_line"]
+macsec_profile_has_fallback = PROFILE_HELPERS[
+    "macsec_profile_has_fallback"]
+ensure_macsec_profile_fallback = PROFILE_HELPERS[
+    "ensure_macsec_profile_fallback"]
 generate_macsec_profile = PROFILE_HELPERS["generate_macsec_profile"]
 
 
@@ -89,3 +102,65 @@ def test_generate_fallback_profile_key_lengths(
     assert len(profile["fallback_cak"]) == cak_length
     assert profile["primary_ckn"] != profile["fallback_ckn"]
     assert profile["primary_cak"] != profile["fallback_cak"]
+
+
+def test_ensure_fallback_profile_reuses_existing_pair():
+    """Preserve an existing fallback pair without generating a replacement."""
+    profile = {
+        "cipher_suite": "GCM-AES-128",
+        "fallback_cak": "existing-cak",
+        "fallback_ckn": "existing-ckn",
+    }
+    ensured, generated = ensure_macsec_profile_fallback(profile)
+    assert not generated
+    assert ensured == profile
+    assert ensured is not profile
+
+
+def test_ensure_fallback_profile_adds_only_missing_pair():
+    """Add a fallback pair while preserving all existing profile fields."""
+    profile = {
+        "name": "profile",
+        "cipher_suite": "GCM-AES-128",
+        "primary_cak": "primary-cak",
+        "primary_ckn": "primary-ckn",
+    }
+    ensured, generated = ensure_macsec_profile_fallback(profile)
+    assert generated
+    assert ensured["primary_cak"] == profile["primary_cak"]
+    assert ensured["primary_ckn"] == profile["primary_ckn"]
+    assert macsec_profile_has_fallback(ensured)
+
+
+def test_eos_fallback_key_rotation_lines_are_exact():
+    """Build EOS add-first and full-form key deletion commands."""
+    assert _eos_macsec_key_line(
+        "new-ckn", "new-cak", is_fallback=True
+    ) == "key new-ckn 7 new-cak fallback"
+    assert _eos_macsec_key_line(
+        "old-ckn", "old-cak", is_fallback=True, remove=True
+    ) == "no key old-ckn 7 old-cak fallback"
+
+
+def test_build_eos_profile_lines_with_fallback():
+    """Render primary and fallback keys using EOS encrypted-key syntax."""
+    assert _build_eos_macsec_profile_lines(
+        64, "GCM-AES-XPN-256", "primary-cak", "primary-ckn", "true",
+        rekey_period=60, fallback_cak="fallback-cak",
+        fallback_ckn="fallback-ckn",
+    ) == [
+        "cipher aes256-gcm-xpn",
+        "key primary-ckn 7 primary-cak",
+        "key fallback-ckn 7 fallback-cak fallback",
+        "mka key-server priority 64",
+        "mka session rekey-period 60",
+        "sci",
+    ]
+
+
+def test_static_fallback_profile_runs_in_normal_profile_sweep():
+    """Keep an explicit dual-CA profile in the ordinary profile catalog."""
+    profiles = json.loads(PROFILE_PATH.read_text())
+    profile = profiles["MACSEC_PROFILE_FALLBACK"]
+    assert macsec_profile_has_fallback(profile)
+    assert profile["primary_ckn"].lower() != profile["fallback_ckn"].lower()

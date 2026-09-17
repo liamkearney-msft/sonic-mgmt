@@ -140,7 +140,9 @@ class TestFaultHandling():
     @pytest.mark.disable_loganalyzer
     def test_mismatch_macsec_configuration(self, duthost, unctrl_links, port_profiles,
                                            profile_name, default_priority, cipher_suite,
-                                           primary_cak, primary_ckn, policy, send_sci, wait_mka_establish):
+                                           primary_cak, primary_ckn, fallback_cak,
+                                           fallback_ckn, policy, send_sci,
+                                           wait_mka_establish):
         if port_profiles:
             pytest.skip("Mismatch test uses single-profile CAK/CKN fixtures")
         # Only pick one uncontrolled link for mismatch macsec configuration test
@@ -156,9 +158,13 @@ class TestFaultHandling():
 
         # Set a wrong cak to the profile
         primary_cak = "0" * len(primary_cak)
+        if fallback_cak:
+            fallback_cak = "0" * len(fallback_cak)
         enable_macsec_port(duthost, port_name, profile_name)
         set_macsec_profile(nbr["host"], profile_name, default_priority,
-                           cipher_suite, primary_cak, primary_ckn, policy, send_sci)
+                           cipher_suite, primary_cak, primary_ckn, policy,
+                           send_sci, fallback_cak=fallback_cak,
+                           fallback_ckn=fallback_ckn)
         enable_macsec_port(nbr["host"], nbr["port"], profile_name)
 
         def check_mka_establishment():

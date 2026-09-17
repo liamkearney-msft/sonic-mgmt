@@ -50,6 +50,84 @@ SECRET_FIELD_NAMES = {
 }
 
 
+def _normalized_mapping(mapping):
+    return {
+        "".join(char for char in str(key).lower() if char.isalnum()): value
+        for key, value in mapping.items()
+    }
+
+
+def _mapping_value(mapping, *names):
+    normalized = _normalized_mapping(mapping)
+    for name in names:
+        value = normalized.get(
+            "".join(char for char in name.lower() if char.isalnum()))
+        if value is not None:
+            return value
+    return None
+
+
+def _as_bool(value):
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("true", "yes", "1")
+
+
+def parse_eos_mka_participants(output, interface):
+    """Normalize cEOS participant JSON across established field spellings."""
+    interfaces = _mapping_value(output, "interfaces")
+    if not isinstance(interfaces, dict):
+        return {}
+
+    interface_state = next(
+        (
+            state for name, state in interfaces.items()
+            if name.lower() == interface.lower()
+        ),
+        None,
+    )
+    if not isinstance(interface_state, dict):
+        return {}
+
+    raw_participants = _mapping_value(interface_state, "participants")
+    if not isinstance(raw_participants, dict):
+        return {}
+
+    participants = {}
+    for ckn, participant in raw_participants.items():
+        if not isinstance(participant, dict):
+            continue
+        details = _mapping_value(participant, "details")
+        if not isinstance(details, dict):
+            details = {}
+        live_peers = _mapping_value(
+            participant, "livePeers", "livePeerList")
+        if live_peers is None:
+            live_peers = _mapping_value(
+                details, "livePeers", "livePeerList")
+        if isinstance(live_peers, (list, tuple, dict)):
+            live_peers = len(live_peers)
+        try:
+            live_peers = int(live_peers or 0)
+        except (TypeError, ValueError):
+            live_peers = 0
+
+        participants[str(ckn).lower()] = {
+            "active": _as_bool(_mapping_value(
+                participant, "success", "active")),
+            "is_principal": _as_bool(_mapping_value(
+                participant, "principalActor", "principal")),
+            "is_primary": _as_bool(_mapping_value(
+                participant, "defaultActor", "default")),
+            "is_key_server": _as_bool(_mapping_value(
+                participant, "electedSelf", "isKeyServer")),
+            "live_peers": live_peers,
+            "sak_transmit": _as_bool(_mapping_value(
+                details, "sakTransmit")),
+        }
+    return participants
+
+
 def mka_state_cli_supported(host):
     """Return whether the image exposes MKA operational-state CLI."""
     profile_help = host.command(
