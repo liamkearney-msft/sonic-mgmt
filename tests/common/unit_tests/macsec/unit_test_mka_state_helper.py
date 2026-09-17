@@ -14,6 +14,7 @@ SPEC.loader.exec_module(MKA_STATE_HELPER)
 find_secret_fields = MKA_STATE_HELPER.find_secret_fields
 parse_db_hash = MKA_STATE_HELPER.parse_db_hash
 parse_eos_mka_participants = MKA_STATE_HELPER.parse_eos_mka_participants
+parse_wpa_mka_participants = MKA_STATE_HELPER.parse_wpa_mka_participants
 validate_mka_snapshot = MKA_STATE_HELPER.validate_mka_snapshot
 
 
@@ -161,3 +162,34 @@ def test_parse_eos_mka_participants_normalizes_roles_and_peers():
     assert participants["ccdd"]["active"]
     assert not participants["ccdd"]["is_primary"]
     assert participants["ccdd"]["live_peers"] == 1
+
+
+def test_parse_wpa_mka_participants():
+    """Parse primary/fallback roles from runtime supplicant output."""
+    output = """
+participant_idx=0
+ckn=AABB
+active=Yes participant=Yes retain=No
+is_principal=No is_primary=Yes
+live_peers=0 potential_peers=0
+
+participant_idx=1
+ckn=CCDD
+active=Yes participant=Yes retain=No
+is_principal=Yes is_primary=No
+live_peers=1 potential_peers=0
+"""
+    assert parse_wpa_mka_participants(output) == {
+        "aabb": {
+            "active": True,
+            "is_principal": False,
+            "is_primary": True,
+            "live_peers": 0,
+        },
+        "ccdd": {
+            "active": True,
+            "is_principal": True,
+            "is_primary": False,
+            "live_peers": 1,
+        },
+    }

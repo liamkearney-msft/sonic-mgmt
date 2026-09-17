@@ -81,5 +81,15 @@
         "fallback_ckn": "3031323334353637383941424344454647484950515253545556575859606162",
         "policy": "security",
         "send_sci": "true"
+    },
+    "MACSEC_PROFILE_FALLBACK_INTEGRITY": {
+        "priority": 64,
+        "cipher_suite": "GCM-AES-128",
+        "primary_cak": "3106080a00005b554f4e007975707670725b0a54540c0252445e5d7a29252b046a",
+        "primary_ckn": "6162636465666768696A6B6C6D6E6F70",
+        "fallback_cak": "43030307075f0e5050000e253125207e2d565e731f1a5c4f524f4b2a2e270e0e02",
+        "fallback_ckn": "30313233343536373839414243444546",
+        "policy": "integrity",
+        "send_sci": "true"
     }
 }

@@ -1,5 +1,6 @@
 import ast
 import json
+import re
 import secrets
 from pathlib import Path
 
@@ -20,6 +21,7 @@ def _load_profile_helpers():
         "_build_macsec_profile_options",
         "_build_eos_macsec_profile_lines",
         "_eos_macsec_key_line",
+        "_parse_wpa_global_socket",
         "macsec_profile_has_fallback",
         "ensure_macsec_profile_fallback",
         "generate_macsec_key_pair",
@@ -31,6 +33,7 @@ def _load_profile_helpers():
     ]
     module = ast.Module(body=nodes, type_ignores=[])
     namespace = {
+        "re": re,
         "secrets": secrets,
         "cisco_type7": cisco_type7,
     }
@@ -44,6 +47,7 @@ _build_macsec_profile_options = PROFILE_HELPERS[
 _build_eos_macsec_profile_lines = PROFILE_HELPERS[
     "_build_eos_macsec_profile_lines"]
 _eos_macsec_key_line = PROFILE_HELPERS["_eos_macsec_key_line"]
+_parse_wpa_global_socket = PROFILE_HELPERS["_parse_wpa_global_socket"]
 macsec_profile_has_fallback = PROFILE_HELPERS[
     "macsec_profile_has_fallback"]
 ensure_macsec_profile_fallback = PROFILE_HELPERS[
@@ -164,3 +168,23 @@ def test_static_fallback_profile_runs_in_normal_profile_sweep():
     profile = profiles["MACSEC_PROFILE_FALLBACK"]
     assert macsec_profile_has_fallback(profile)
     assert profile["primary_ckn"].lower() != profile["fallback_ckn"].lower()
+    integrity_profile = profiles["MACSEC_PROFILE_FALLBACK_INTEGRITY"]
+    assert integrity_profile["policy"] == "integrity"
+    assert macsec_profile_has_fallback(integrity_profile)
+
+
+@pytest.mark.parametrize(
+    "socket_output, process_output, expected",
+    [
+        ("/run/wpa/global\n", "", "/run/wpa/global"),
+        ("", "wpa_supplicant -g /run/wpa/global -i Ethernet0",
+         "/run/wpa/global"),
+        ("", "wpa_supplicant -g/run/wpa/global -iEthernet0",
+         "/run/wpa/global"),
+        ("", "wpa_supplicant -iEthernet0", ""),
+    ],
+)
+def test_parse_wpa_global_socket(socket_output, process_output, expected):
+    """Discover the runtime control socket without a hard-coded path."""
+    assert _parse_wpa_global_socket(
+        socket_output, process_output) == expected

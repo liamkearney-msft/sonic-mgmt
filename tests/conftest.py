@@ -301,6 +301,8 @@ def pytest_addoption(parser):
     parser.addoption("--per_interface_macsec", action="store_true", default=False,
                      help="Layer per-interface MACsec profiles (unique CAK/CKN per port) "
                           "on top of the base profile for testing")
+    parser.addoption("--macsec_all_links", action="store_true", default=False,
+                     help="Use every eligible neighbor link for opt-in MACsec scale testing")
 
     ############################
     #   QoS options         #

@@ -128,6 +128,41 @@ def parse_eos_mka_participants(output, interface):
     return participants
 
 
+def parse_wpa_mka_participants(output):
+    """Parse ``macsec_mka_list`` output into role and liveness fields."""
+    blocks = []
+    current = {}
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            if current:
+                blocks.append(current)
+                current = {}
+            continue
+        if line.startswith("participant_idx=") and current:
+            blocks.append(current)
+            current = {}
+        for field in line.split():
+            if "=" in field:
+                key, value = field.split("=", 1)
+                current[key] = value
+    if current:
+        blocks.append(current)
+
+    participants = {}
+    for block in blocks:
+        ckn = block.get("ckn", "").lower()
+        if not ckn:
+            continue
+        participants[ckn] = {
+            "active": _as_bool(block.get("active")),
+            "is_principal": _as_bool(block.get("is_principal")),
+            "is_primary": _as_bool(block.get("is_primary")),
+            "live_peers": int(block.get("live_peers", "0")),
+        }
+    return participants
+
+
 def mka_state_cli_supported(host):
     """Return whether the image exposes MKA operational-state CLI."""
     profile_help = host.command(

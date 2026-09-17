@@ -61,6 +61,10 @@ class MacsecPlugin(object):
                                  ids=profiles,
                                  scope="module")
 
+    def use_all_links(self, macsec_duthost):
+        return macsec_duthost.duthosts.request.config.getoption(
+            "--macsec_all_links", default=False)
+
     def get_ctrl_nbr_names(self, macsec_duthost, nbrhosts, tbinfo):
         return NotImplementedError()
 
@@ -340,6 +344,8 @@ class MacsecPluginT0(MacsecPlugin):
         super(MacsecPluginT0, self).__init__()
 
     def get_ctrl_nbr_names(self, macsec_duthost, nbrhosts, tbinfo):
+        if self.use_all_links(macsec_duthost):
+            return natsort.natsorted(nbrhosts.keys())
         ctrl_nbr_names = natsort.natsorted(nbrhosts.keys())[:2]
         return ctrl_nbr_names
 
@@ -363,6 +369,8 @@ class MacsecPluginT2(MacsecPlugin):
         super(MacsecPluginT2, self).__init__()
 
     def get_ctrl_nbr_names(self, macsec_duthost, nbrhosts, tbinfo):
+        if self.use_all_links(macsec_duthost):
+            return natsort.natsorted(nbrhosts.keys())
         ctrl_nbr_names = []
         mg_facts = macsec_duthost.get_extended_minigraph_facts(tbinfo)
         if 'macsec_neighbors' in mg_facts:
