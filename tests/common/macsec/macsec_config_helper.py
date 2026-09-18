@@ -28,6 +28,8 @@ __all__ = [
     'ensure_macsec_profile_fallback',
     'generate_macsec_key_pair',
     'generate_macsec_profile',
+    'generate_per_interface_macsec_profile',
+    'generate_per_interface_macsec_profiles',
     'update_macsec_profile_key',
     'add_runtime_macsec_key',
     'delete_runtime_macsec_key',
@@ -650,6 +652,61 @@ def generate_macsec_profile(port_name, cipher_suite="GCM-AES-128", priority=64,
             "fallback_ckn": fallback_ckn,
         })
     return profile
+
+
+def generate_per_interface_macsec_profile(
+        port_name, base_profile, existing_profile=None):
+    """Generate a unique dual-CA profile while preserving existing fallback."""
+    macsec_profile_has_fallback(base_profile)
+    profile = generate_macsec_profile(
+        port_name=port_name,
+        cipher_suite=base_profile["cipher_suite"],
+        priority=base_profile["priority"],
+        policy=base_profile["policy"],
+        send_sci=base_profile["send_sci"],
+        rekey_period=base_profile.get("rekey_period", 0),
+        include_fallback=True,
+    )
+
+    if existing_profile is not None:
+        if macsec_profile_has_fallback(existing_profile):
+            profile.update({
+                "fallback_cak": existing_profile["fallback_cak"],
+                "fallback_ckn": existing_profile["fallback_ckn"],
+            })
+    return profile
+
+
+def generate_per_interface_macsec_profiles(
+        port_names, base_profile, existing_profiles=None):
+    """Generate collision-free dual-CA profiles for all selected interfaces."""
+    existing_profiles = existing_profiles or {}
+    profiles = {}
+    used_caks = set()
+    used_ckns = set()
+
+    for port_name in port_names:
+        existing_profile = existing_profiles.get(port_name)
+        while True:
+            profile = generate_per_interface_macsec_profile(
+                port_name, base_profile, existing_profile)
+            caks = {profile["primary_cak"], profile["fallback_cak"]}
+            ckns = {profile["primary_ckn"], profile["fallback_ckn"]}
+            if len(caks) != 2 or len(ckns) != 2:
+                if existing_profile is not None:
+                    raise ValueError(
+                        "Existing primary/fallback keys must be distinct")
+                continue
+            if caks.isdisjoint(used_caks) and ckns.isdisjoint(used_ckns):
+                break
+            if existing_profile is not None:
+                raise ValueError(
+                    "Existing per-interface keys collide with another profile")
+
+        profiles[port_name] = profile
+        used_caks.update(caks)
+        used_ckns.update(ckns)
+    return profiles
 
 
 def setup_macsec_multi_profile_configuration(duthost, ctrl_links, port_profiles, tbinfo):

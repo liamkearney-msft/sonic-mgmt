@@ -26,6 +26,8 @@ def _load_profile_helpers():
         "ensure_macsec_profile_fallback",
         "generate_macsec_key_pair",
         "generate_macsec_profile",
+        "generate_per_interface_macsec_profile",
+        "generate_per_interface_macsec_profiles",
     }
     nodes = [
         node for node in tree.body
@@ -53,6 +55,10 @@ macsec_profile_has_fallback = PROFILE_HELPERS[
 ensure_macsec_profile_fallback = PROFILE_HELPERS[
     "ensure_macsec_profile_fallback"]
 generate_macsec_profile = PROFILE_HELPERS["generate_macsec_profile"]
+generate_per_interface_macsec_profile = PROFILE_HELPERS[
+    "generate_per_interface_macsec_profile"]
+generate_per_interface_macsec_profiles = PROFILE_HELPERS[
+    "generate_per_interface_macsec_profiles"]
 
 
 def test_build_profile_options_with_fallback():
@@ -106,6 +112,143 @@ def test_generate_fallback_profile_key_lengths(
     assert len(profile["fallback_cak"]) == cak_length
     assert profile["primary_ckn"] != profile["fallback_ckn"]
     assert profile["primary_cak"] != profile["fallback_cak"]
+
+
+@pytest.mark.parametrize("base_has_fallback", [False, True])
+def test_per_interface_profile_has_unique_fallback_by_default(
+        base_has_fallback):
+    """Generate dual-CA per-interface profiles for every base profile."""
+    base_profile = {
+        "cipher_suite": "GCM-AES-128",
+        "priority": 64,
+        "policy": "security",
+        "send_sci": "true",
+        "rekey_period": 30,
+    }
+    if base_has_fallback:
+        base_profile.update({
+            "fallback_cak": "static-fallback-cak",
+            "fallback_ckn": "static-fallback-ckn",
+        })
+
+    first = generate_per_interface_macsec_profile(
+        "Ethernet0", base_profile)
+    second = generate_per_interface_macsec_profile(
+        "Ethernet4", base_profile)
+
+    for profile in (first, second):
+        assert macsec_profile_has_fallback(profile)
+        assert profile["primary_ckn"] != profile["fallback_ckn"]
+        for field in (
+                "cipher_suite", "priority", "policy", "send_sci",
+                "rekey_period"):
+            assert profile[field] == base_profile[field]
+
+    all_caks = {
+        first["primary_cak"], first["fallback_cak"],
+        second["primary_cak"], second["fallback_cak"],
+    }
+    all_ckns = {
+        first["primary_ckn"], first["fallback_ckn"],
+        second["primary_ckn"], second["fallback_ckn"],
+    }
+    assert len(all_caks) == 4
+    assert len(all_ckns) == 4
+    if base_has_fallback:
+        assert first["fallback_cak"] != base_profile["fallback_cak"]
+        assert second["fallback_ckn"] != base_profile["fallback_ckn"]
+
+
+def test_per_interface_profile_set_is_collision_free():
+    """Generate unique primary/fallback CAK and CKN values for every port."""
+    profiles = generate_per_interface_macsec_profiles(
+        ["Ethernet0", "Ethernet4", "Ethernet8"],
+        {
+            "cipher_suite": "GCM-AES-128",
+            "priority": 64,
+            "policy": "security",
+            "send_sci": "true",
+        },
+    )
+    caks = [
+        profile[field]
+        for profile in profiles.values()
+        for field in ("primary_cak", "fallback_cak")
+    ]
+    ckns = [
+        profile[field]
+        for profile in profiles.values()
+        for field in ("primary_ckn", "fallback_ckn")
+    ]
+    assert len(caks) == len(set(caks)) == 6
+    assert len(ckns) == len(set(ckns)) == 6
+
+
+def test_per_interface_profile_reuses_existing_fallback_pair():
+    """Preserve a complete fallback pair when replacing one port profile."""
+    base_profile = {
+        "cipher_suite": "GCM-AES-128",
+        "priority": 64,
+        "policy": "integrity",
+        "send_sci": "false",
+        "rekey_period": 0,
+    }
+    existing_profile = {
+        "fallback_cak": "existing-fallback-cak",
+        "fallback_ckn": "existing-fallback-ckn",
+    }
+    profile = generate_per_interface_macsec_profile(
+        "Ethernet0", base_profile, existing_profile)
+    assert profile["fallback_cak"] == existing_profile["fallback_cak"]
+    assert profile["fallback_ckn"] == existing_profile["fallback_ckn"]
+    assert profile["primary_cak"] != profile["fallback_cak"]
+    assert profile["primary_ckn"] != profile["fallback_ckn"]
+
+
+@pytest.mark.parametrize(
+    "existing_profile",
+    [
+        {"fallback_cak": "partial"},
+        {"fallback_ckn": "partial"},
+    ],
+)
+def test_per_interface_profile_rejects_partial_existing_fallback(
+        existing_profile):
+    """Reject a partially configured existing per-interface fallback."""
+    base_profile = {
+        "cipher_suite": "GCM-AES-128",
+        "priority": 64,
+        "policy": "security",
+        "send_sci": "true",
+    }
+    with pytest.raises(ValueError):
+        generate_per_interface_macsec_profile(
+            "Ethernet0", base_profile, existing_profile)
+
+
+@pytest.mark.parametrize(
+    "base_profile",
+    [
+        {
+            "cipher_suite": "GCM-AES-128",
+            "priority": 64,
+            "policy": "security",
+            "send_sci": "true",
+            "fallback_cak": "partial",
+        },
+        {
+            "cipher_suite": "GCM-AES-128",
+            "priority": 64,
+            "policy": "security",
+            "send_sci": "true",
+            "fallback_ckn": "partial",
+        },
+    ],
+)
+def test_per_interface_profile_rejects_partial_base_fallback(base_profile):
+    """Reject partially configured static fallback input."""
+    with pytest.raises(ValueError):
+        generate_per_interface_macsec_profile("Ethernet0", base_profile)
 
 
 def test_ensure_fallback_profile_reuses_existing_pair():

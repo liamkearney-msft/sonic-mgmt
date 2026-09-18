@@ -18,8 +18,7 @@ from .macsec_config_helper import setup_macsec_configuration
 from .macsec_config_helper import cleanup_macsec_configuration
 from .macsec_config_helper import is_macsec_configured
 from .macsec_config_helper import get_macsec_enable_status, get_macsec_profile
-from .macsec_config_helper import generate_macsec_profile
-from .macsec_config_helper import macsec_profile_has_fallback
+from .macsec_config_helper import generate_per_interface_macsec_profiles
 from .macsec_config_helper import setup_macsec_multi_profile_configuration
 from .macsec_config_helper import cleanup_macsec_multi_profile_configuration
 from .macsec_config_helper import enable_macsec_port
@@ -82,24 +81,14 @@ class MacsecPlugin(object):
         When ``--per_interface_macsec`` is set, generates a unique
         ``MACSEC_PROFILE_<port>`` for every controlled port using the same
         cipher_suite, policy, send_sci, priority, and rekey_period as the base
-        ``--macsec_profile``, but with unique CAK/CKN per port.
+        ``--macsec_profile``, with unique primary and fallback CAK/CKN pairs.
         """
         if not request.config.getoption("per_interface_macsec", default=False):
             return None
         if len(ctrl_links) < 2:
             pytest.skip("Per-interface profile tests require at least 2 controlled links")
-        profiles = {}
-        for dut_port in ctrl_links:
-            profiles[dut_port] = generate_macsec_profile(
-                port_name=dut_port,
-                cipher_suite=macsec_profile["cipher_suite"],
-                priority=macsec_profile["priority"],
-                policy=macsec_profile["policy"],
-                send_sci=macsec_profile["send_sci"],
-                rekey_period=macsec_profile["rekey_period"],
-                include_fallback=macsec_profile_has_fallback(macsec_profile),
-            )
-        return profiles
+        return generate_per_interface_macsec_profiles(
+            ctrl_links, macsec_profile)
 
     @pytest.fixture(scope="module")
     def start_macsec_service(self, macsec_duthost, macsec_nbrhosts):

@@ -6,7 +6,7 @@ import random
 from tests.common.utilities import wait_until
 from tests.common.macsec.macsec_helper import get_appl_db, get_ipnetns_prefix, load_all_macsec_info, check_appl_db
 from tests.common.macsec.macsec_config_helper import (
-    generate_macsec_profile,
+    generate_per_interface_macsec_profile,
     setup_macsec_multi_profile_configuration,
     disable_macsec_port,
     enable_macsec_port,
@@ -36,7 +36,21 @@ class TestPerInterfaceProfile():
         if not port_profiles:
             pytest.skip("Requires --per_interface_macsec")
         profile_list = list(port_profiles.values())
+        all_caks = []
+        all_ckns = []
         for i in range(len(profile_list)):
+            assert profile_list[i].get("fallback_cak"), \
+                "Missing fallback CAK in {}".format(profile_list[i]["name"])
+            assert profile_list[i].get("fallback_ckn"), \
+                "Missing fallback CKN in {}".format(profile_list[i]["name"])
+            all_caks.extend([
+                profile_list[i]["primary_cak"],
+                profile_list[i]["fallback_cak"],
+            ])
+            all_ckns.extend([
+                profile_list[i]["primary_ckn"],
+                profile_list[i]["fallback_ckn"],
+            ])
             for j in range(i + 1, len(profile_list)):
                 assert profile_list[i]["primary_cak"] != profile_list[j]["primary_cak"], \
                     "CAK collision between {} and {}".format(
@@ -55,6 +69,10 @@ class TestPerInterfaceProfile():
                 assert profile_list[i]["primary_ckn"] != profile_list[i]["fallback_ckn"], \
                     "Primary/fallback CKN collision in {}".format(
                         profile_list[i]["name"])
+        assert len(all_caks) == len(set(all_caks)), \
+            "CAK collision across per-interface primary/fallback pairs"
+        assert len(all_ckns) == len(set(all_ckns)), \
+            "CKN collision across per-interface primary/fallback pairs"
 
     @pytest.mark.disable_loganalyzer
     def test_profile_isolation(self, duthost, ctrl_links, upstream_links,
@@ -141,20 +159,20 @@ class TestPerInterfaceProfile():
         _, _, _, orig_target_esa, _ = get_appl_db(
             duthost, target_port, target_nbr["host"], target_nbr["port"])
 
-        new_profile = generate_macsec_profile(
-            port_name=target_port,
-            cipher_suite=cipher_suite,
-            priority=default_priority,
-            policy=policy,
-            send_sci=send_sci,
-            rekey_period=rekey_period,
+        new_profile = generate_per_interface_macsec_profile(
+            target_port,
+            {
+                "cipher_suite": cipher_suite,
+                "priority": default_priority,
+                "policy": policy,
+                "send_sci": send_sci,
+                "rekey_period": rekey_period,
+            },
+            existing_profile=target_profile,
         )
         new_profile["name"] = "MACSEC_PROFILE_{}_NEW".format(target_port)
-        if target_profile.get("fallback_cak"):
-            new_profile.update({
-                "fallback_cak": target_profile["fallback_cak"],
-                "fallback_ckn": target_profile["fallback_ckn"],
-            })
+        assert new_profile["fallback_cak"] == target_profile["fallback_cak"]
+        assert new_profile["fallback_ckn"] == target_profile["fallback_ckn"]
 
         new_port_profiles = {target_port: new_profile}
         setup_macsec_multi_profile_configuration(
