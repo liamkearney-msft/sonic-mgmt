@@ -275,7 +275,7 @@ def validate_mka_snapshot(session, participants, profile,
     expected_session = {
         "profile": profile["name"],
         "kay_status": "active",
-        "authenticated": "true",
+        "authenticated": "false",
         "secured": "true",
         "failed": "false",
         "query_status": "ok",

@@ -42,7 +42,7 @@ def _session():
     return {
         "profile": "MACSEC_PROFILE_FALLBACK",
         "kay_status": "active",
-        "authenticated": "true",
+        "authenticated": "false",
         "secured": "true",
         "failed": "false",
         "actor_sci": "0011223344550001",
@@ -149,13 +149,52 @@ def test_parse_db_hash_rejects_partial_pair():
 
 
 def test_validate_primary_fallback_snapshot():
-    """Accept a healthy two-participant snapshot with primary ownership."""
+    """Accept the protected Controlled Port tuple with primary ownership."""
     participants = {
         "aabb": _participant("true", "true"),
         "ccdd": _participant("false", "false"),
     }
     assert validate_mka_snapshot(
         _session(), participants, _profile(), "AABB") == []
+
+
+@pytest.mark.parametrize(
+    "updates, expected_error",
+    [
+        (
+            {"authenticated": "true", "secured": "false"},
+            "authenticated='true', expected 'false'",
+        ),
+        (
+            {"authenticated": "true", "secured": "true"},
+            "authenticated='true', expected 'false'",
+        ),
+        (
+            {"authenticated": "false", "secured": "false"},
+            "secured='false', expected 'true'",
+        ),
+        (
+            {"kay_status": "not-active"},
+            "kay_status='not-active', expected 'active'",
+        ),
+        (
+            {"failed": "true"},
+            "failed='true', expected 'false'",
+        ),
+    ],
+)
+def test_validate_snapshot_rejects_unhealthy_controlled_port(
+        updates, expected_error):
+    """Reject unprotected, contradictory, inactive, and failed CP states."""
+    session = _session()
+    session.update(updates)
+    participants = {
+        "aabb": _participant("true", "true"),
+        "ccdd": _participant("false", "false"),
+    }
+    errors = validate_mka_snapshot(
+        session, participants, _profile(), "AABB")
+    assert expected_error in errors
 
 
 def test_validate_snapshot_reports_role_and_liveness_errors():
