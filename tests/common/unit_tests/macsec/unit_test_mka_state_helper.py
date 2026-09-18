@@ -12,10 +12,22 @@ MKA_STATE_HELPER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MKA_STATE_HELPER)
 
 find_secret_fields = MKA_STATE_HELPER.find_secret_fields
+_mka_show_result_supported = MKA_STATE_HELPER._mka_show_result_supported
+_mka_state_cli_supported = MKA_STATE_HELPER.mka_state_cli_supported
 parse_db_hash = MKA_STATE_HELPER.parse_db_hash
 parse_eos_mka_participants = MKA_STATE_HELPER.parse_eos_mka_participants
 parse_wpa_mka_participants = MKA_STATE_HELPER.parse_wpa_mka_participants
 validate_mka_snapshot = MKA_STATE_HELPER.validate_mka_snapshot
+
+
+class _FakeHost:
+    def __init__(self, result):
+        self.result = result
+        self.commands = []
+
+    def command(self, command, **kwargs):
+        self.commands.append((command, kwargs))
+        return self.result
 
 
 def _profile():
@@ -76,6 +88,58 @@ def _participant(is_primary, is_principal):
 def test_parse_db_hash(output, expected):
     """Parse JSON, Python-literal, line-pair, and empty DB output."""
     assert parse_db_hash(output) == expected
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {
+            "failed": False,
+            "rc": 0,
+            "stdout": "Interface  KaY  Secured  Principal CKN\n",
+            "stderr": "",
+        },
+        {"failed": False, "rc": 0, "stdout": "", "stderr": ""},
+    ],
+)
+def test_mka_state_cli_supported(result):
+    """Accept successful populated and empty canonical MKA show output."""
+    host = _FakeHost(result)
+    assert _mka_state_cli_supported(host)
+    assert host.commands == [
+        (
+            "show macsec --mka",
+            {"module_ignore_errors": True, "verbose": False},
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        {
+            "failed": True,
+            "rc": 127,
+            "stdout": "",
+            "stderr": "show: command not found",
+        },
+        {
+            "failed": False,
+            "rc": 0,
+            "stdout": "",
+            "stderr": "Error: No such option: --mka",
+        },
+        {
+            "failed": False,
+            "rc": 2,
+            "stdout": "Usage: show macsec [OPTIONS]",
+            "stderr": "",
+        },
+    ],
+)
+def test_mka_state_cli_unsupported(result):
+    """Reject command-not-found, unsupported-option, and nonzero results."""
+    assert not _mka_show_result_supported(result)
 
 
 def test_parse_db_hash_rejects_partial_pair():

@@ -163,16 +163,33 @@ def parse_wpa_mka_participants(output):
     return participants
 
 
+def _mka_show_result_supported(result):
+    """Return whether canonical MKA output comes from a recognized command."""
+    if result.get("failed", False) or result.get("rc", 0) != 0:
+        return False
+
+    output = "{}\n{}".format(
+        result.get("stdout", ""), result.get("stderr", "")).lower()
+    unsupported_markers = (
+        "command not found",
+        "invalid option",
+        "no such option",
+        "unrecognized option",
+        "unrecognized arguments",
+        "unknown option",
+        "unknown command",
+    )
+    return not any(marker in output for marker in unsupported_markers)
+
+
 def mka_state_cli_supported(host):
-    """Return whether the image exposes MKA operational-state CLI."""
-    profile_help = host.command(
-        "config macsec profile add --help", module_ignore_errors=True)
-    show_help = host.command(
-        "show macsec --help", module_ignore_errors=True)
-    text = "{}\n{}\n{}\n{}".format(
-        profile_help.get("stdout", ""), profile_help.get("stderr", ""),
-        show_help.get("stdout", ""), show_help.get("stderr", ""))
-    return "--fallback_cak" in text and "--mka" in text
+    """Return whether the canonical MKA state command is supported."""
+    result = host.command(
+        "show macsec --mka",
+        module_ignore_errors=True,
+        verbose=False,
+    )
+    return _mka_show_result_supported(result)
 
 
 def parse_db_hash(output):
