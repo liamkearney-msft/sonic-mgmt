@@ -17,6 +17,9 @@ _mka_state_cli_supported = MKA_STATE_HELPER.mka_state_cli_supported
 parse_db_hash = MKA_STATE_HELPER.parse_db_hash
 parse_eos_mka_participants = MKA_STATE_HELPER.parse_eos_mka_participants
 parse_wpa_mka_participants = MKA_STATE_HELPER.parse_wpa_mka_participants
+validate_eos_mka_participants = (
+    MKA_STATE_HELPER.validate_eos_mka_participants
+)
 validate_mka_snapshot = MKA_STATE_HELPER.validate_mka_snapshot
 
 
@@ -224,7 +227,7 @@ def test_find_secret_fields_is_allowlist_safe():
 
 
 def test_parse_eos_mka_participants_normalizes_roles_and_peers():
-    """Normalize established EOS participant field spellings."""
+    """Preserve principal/default state without inferring configured role."""
     output = {
         "interfaces": {
             "Ethernet1": {
@@ -232,7 +235,7 @@ def test_parse_eos_mka_participants_normalizes_roles_and_peers():
                     "AABB": {
                         "success": True,
                         "electedSelf": False,
-                        "defaultActor": True,
+                        "defaultActor": False,
                         "principalActor": True,
                         "details": {
                             "livePeerList": ["peer"],
@@ -242,7 +245,7 @@ def test_parse_eos_mka_participants_normalizes_roles_and_peers():
                     "CCDD": {
                         "Success": "Yes",
                         "Elected-Self": "No",
-                        "Default": "No",
+                        "Default": "Yes",
                         "Principal": "No",
                         "Details": {
                             "Live Peers": 1,
@@ -257,14 +260,66 @@ def test_parse_eos_mka_participants_normalizes_roles_and_peers():
     assert participants["aabb"] == {
         "active": True,
         "is_principal": True,
-        "is_primary": True,
+        "default_actor": False,
         "is_key_server": False,
         "live_peers": 1,
         "sak_transmit": True,
     }
     assert participants["ccdd"]["active"]
-    assert not participants["ccdd"]["is_primary"]
+    assert participants["ccdd"]["default_actor"]
     assert participants["ccdd"]["live_peers"] == 1
+
+
+def test_validate_eos_roles_from_local_profile_ckns():
+    """Derive configured primary/fallback from local CKNs, not defaultActor."""
+    participants = {
+        "aabb": {
+            "active": True,
+            "is_principal": True,
+            "default_actor": False,
+            "live_peers": 1,
+        },
+        "ccdd": {
+            "active": True,
+            "is_principal": False,
+            "default_actor": True,
+            "live_peers": 1,
+        },
+    }
+    assert validate_eos_mka_participants(
+        participants,
+        {
+            "primary_ckn": "AABB",
+            "fallback_ckn": "CCDD",
+        },
+        "AABB",
+    ) == []
+
+
+def test_validate_eos_crossed_roles_keep_principal_distinct():
+    """Allow principal CKN to differ from the peer's configured primary."""
+    participants = {
+        "aabb": {
+            "active": True,
+            "is_principal": True,
+            "default_actor": False,
+            "live_peers": 1,
+        },
+        "ccdd": {
+            "active": True,
+            "is_principal": False,
+            "default_actor": True,
+            "live_peers": 1,
+        },
+    }
+    assert validate_eos_mka_participants(
+        participants,
+        {
+            "primary_ckn": "CCDD",
+            "fallback_ckn": "AABB",
+        },
+        "AABB",
+    ) == []
 
 
 def test_parse_wpa_mka_participants():

@@ -36,6 +36,7 @@ from tests.common.macsec.mka_state_helper import (
     mka_state_cli_supported,
     parse_eos_mka_participants,
     parse_wpa_mka_participants,
+    validate_eos_mka_participants,
     validate_mka_snapshot,
 )
 from tests.common.utilities import wait_until
@@ -261,26 +262,9 @@ def _peer_state_is_healthy(
 
     if isinstance(host, EosHost):
         participants = _get_eos_participants(host, port)
-        expected = {
-            profile["primary_ckn"].lower(): True,
-            profile["fallback_ckn"].lower(): False,
-        }
-        if set(participants) != set(expected):
-            return False
-        for ckn, is_primary in expected.items():
-            participant = participants[ckn]
-            if participant["is_primary"] != is_primary:
-                return False
-            if not participant["active"]:
-                return False
-            if ((require_all_live or ckn == principal_ckn.lower())
-                    and participant["live_peers"] < 1):
-                return False
-        principals = [
-            ckn for ckn, participant in participants.items()
-            if participant["is_principal"]
-        ]
-        return principals == [principal_ckn.lower()]
+        return not validate_eos_mka_participants(
+            participants, profile, principal_ckn,
+            require_all_live=require_all_live)
 
     peer_profile = dict(profile, name=profile_name)
     session, participants = get_mka_state(host, port)

@@ -117,7 +117,7 @@ def parse_eos_mka_participants(output, interface):
                 participant, "success", "active")),
             "is_principal": _as_bool(_mapping_value(
                 participant, "principalActor", "principal")),
-            "is_primary": _as_bool(_mapping_value(
+            "default_actor": _as_bool(_mapping_value(
                 participant, "defaultActor", "default")),
             "is_key_server": _as_bool(_mapping_value(
                 participant, "electedSelf", "isKeyServer")),
@@ -126,6 +126,37 @@ def parse_eos_mka_participants(output, interface):
                 details, "sakTransmit")),
         }
     return participants
+
+
+def validate_eos_mka_participants(
+        participants, profile, expected_principal_ckn,
+        require_all_live=True):
+    """Validate EOS state using local profile CKNs for configured roles."""
+    errors = []
+    primary_ckn = profile["primary_ckn"].lower()
+    fallback_ckn = profile["fallback_ckn"].lower()
+    expected_ckns = {primary_ckn, fallback_ckn}
+
+    if set(participants) != expected_ckns:
+        errors.append("participant CKNs {}, expected {}".format(
+            sorted(participants), sorted(expected_ckns)))
+
+    principal_ckns = []
+    expected_principal_ckn = expected_principal_ckn.lower()
+    for ckn in expected_ckns:
+        participant = participants.get(ckn, {})
+        if not participant.get("active"):
+            errors.append("{} is not active".format(ckn))
+        if ((require_all_live or ckn == expected_principal_ckn)
+                and participant.get("live_peers", 0) < 1):
+            errors.append("{} has no live peer".format(ckn))
+        if participant.get("is_principal"):
+            principal_ckns.append(ckn)
+
+    if set(principal_ckns) != {expected_principal_ckn}:
+        errors.append("principal CKNs {}, expected {}".format(
+            sorted(principal_ckns), expected_principal_ckn))
+    return errors
 
 
 def parse_wpa_mka_participants(output):
