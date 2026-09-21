@@ -1,4 +1,5 @@
 import ast
+import hashlib
 import json
 import math
 import re
@@ -9,6 +10,8 @@ MKA_PARTICIPANT_TABLE = "MACSEC_MKA_PARTICIPANT_TABLE"
 MACSEC_PORT_TABLE = "MACSEC_PORT_TABLE"
 MACSEC_INGRESS_SC_TABLE = "MACSEC_INGRESS_SC_TABLE"
 MACSEC_INGRESS_SA_TABLE = "MACSEC_INGRESS_SA_TABLE"
+MACSEC_EGRESS_SA_TABLE = "MACSEC_EGRESS_SA_TABLE"
+MACSEC_APPL_PORT_TABLE = "MACSEC_PORT_TABLE"
 
 REQUIRED_SESSION_FIELDS = {
     "profile",
@@ -260,6 +263,33 @@ def eos_key_replacement_status(
     return errors
 
 
+def eos_key_deletion_status(
+        configured_ckns, participants, deleted_ckn,
+        remaining_ckns, controlled_port=True):
+    """Validate that one EOS actor was deleted and survivors stay operational."""
+    deleted_ckn = deleted_ckn.lower()
+    remaining_ckns = {ckn.lower() for ckn in remaining_ckns}
+    errors = []
+    if configured_ckns != remaining_ckns:
+        errors.append("configured CKNs {}, expected {}".format(
+            sorted(configured_ckns), sorted(remaining_ckns)))
+    if deleted_ckn in participants:
+        errors.append("deleted CKN remains in runtime participants")
+    if remaining_ckns and not controlled_port:
+        errors.append("controlled port is not open")
+    for ckn in remaining_ckns:
+        participant = participants.get(ckn, {})
+        if not participant.get("success"):
+            errors.append("{} is not successful".format(ckn))
+        if not participant.get("active"):
+            errors.append("{} is not active".format(ckn))
+        if participant.get("failed"):
+            errors.append("{} is failed".format(ckn))
+        if participant.get("live_peers", 0) < 1:
+            errors.append("{} has no live peer".format(ckn))
+    return errors
+
+
 def _mka_show_result_supported(result):
     """Return whether canonical MKA output comes from a recognized command."""
     if result.get("failed", False) or result.get("rc", 0) != 0:
@@ -426,6 +456,10 @@ def validate_point_to_point_ingress_sc(entries):
 def active_key_state(
         session, participants, egress_sc, egress_sas, ingress_scs):
     """Normalize stable key/AN identity while excluding cumulative counters."""
+    def _fingerprint(*values):
+        material = "|".join(str(value or "") for value in values)
+        return hashlib.sha256(material.encode()).hexdigest()
+
     principals = sorted(
         ckn for ckn, participant in participants.items()
         if participant.get("is_principal") == "true")
@@ -445,9 +479,9 @@ def active_key_state(
             if sa.get("active") == "true":
                 active_sas.append({
                     "an": str(an),
-                    "sak": sa.get("sak"),
-                    "auth_key": sa.get("auth_key"),
-                    "salt": sa.get("salt"),
+                    "key_fingerprint": _fingerprint(
+                        sa.get("sak"), sa.get("auth_key"),
+                        sa.get("salt"), sa.get("ssci")),
                     "ssci": sa.get("ssci"),
                 })
         ingress.append({
@@ -461,9 +495,11 @@ def active_key_state(
         "egress_encoding_an": encoding_an,
         "egress_all_ans": sorted(str(an) for an in egress_sas),
         "egress_active": {
-            "sak": active_egress.get("sak"),
-            "auth_key": active_egress.get("auth_key"),
-            "salt": active_egress.get("salt"),
+            "key_fingerprint": _fingerprint(
+                active_egress.get("sak"),
+                active_egress.get("auth_key"),
+                active_egress.get("salt"),
+                active_egress.get("ssci")),
             "ssci": active_egress.get("ssci"),
         },
         "ingress": ingress,
@@ -513,6 +549,16 @@ def crossed_role_peer_key_server_supported(max_sa_per_sc):
     return max_sa_per_sc == 4
 
 
+def select_independent_port_pair(ports, scope_by_port):
+    """Pick two ports with distinct peer/profile scopes."""
+    ports = list(ports)
+    for index, unsafe_port in enumerate(ports):
+        for safe_port in ports[index + 1:]:
+            if scope_by_port[unsafe_port] != scope_by_port[safe_port]:
+                return unsafe_port, safe_port
+    return None
+
+
 def validate_multi_port_alternate_state(
         participants_by_port, alternate_ckn, unsafe_port, safe_ports):
     """Validate one unsafe and independently healthy safe alternate set."""
@@ -520,10 +566,12 @@ def validate_multi_port_alternate_state(
     alternate_ckn = alternate_ckn.lower()
     unsafe = participants_by_port.get(unsafe_port, {}).get(
         alternate_ckn, {})
-    if (unsafe.get("active") == "true"
-            and int(unsafe.get("live_peers", "0")) > 0):
+    if unsafe.get("active") == "true":
         errors.append(
-            "{} alternate remains active/live".format(unsafe_port))
+            "{} alternate remains active".format(unsafe_port))
+    if int(unsafe.get("live_peers", "0")) > 0:
+        errors.append(
+            "{} alternate retains a live peer".format(unsafe_port))
     for port in safe_ports:
         participant = participants_by_port.get(port, {}).get(
             alternate_ckn, {})
@@ -547,6 +595,56 @@ def macsecmgrd_restart_command(container):
     """Build the deterministic supervisor restart command."""
     return "docker exec {} supervisorctl restart macsecmgrd".format(
         container)
+
+
+def quiescence_budget_seconds(
+        settle_seconds, snapshot_seconds, poll_seconds, stable_polls=2):
+    """Budget settle time plus enough measured time for stable snapshots."""
+    sample_seconds = max(snapshot_seconds, poll_seconds)
+    return max(1, int(math.ceil(
+        settle_seconds + (stable_polls + 1) * sample_seconds)))
+
+
+def get_macsec_teardown_state(host, interface):
+    """Return non-secret port enable and SA-key state for teardown checks."""
+    namespace_option = get_namespace_option(host, interface)
+    port = _read_hash(
+        host, namespace_option, "APPL_DB",
+        "{}:{}".format(MACSEC_APPL_PORT_TABLE, interface))
+    state = {"port_enable": port.get("enable"), "egress_sa_keys": [],
+             "ingress_sa_keys": []}
+    for direction, table in (
+            ("egress_sa_keys", MACSEC_EGRESS_SA_TABLE),
+            ("ingress_sa_keys", MACSEC_INGRESS_SA_TABLE)):
+        result = host.command(
+            "sonic-db-cli {} APPL_DB KEYS '{}:{}:*'".format(
+                namespace_option, table, interface),
+            module_ignore_errors=True,
+            verbose=False,
+        )
+        state[direction] = sorted(
+            key.strip() for key in result.get("stdout_lines", [])
+            if key.strip())
+    return state
+
+
+def classify_macsec_teardown(
+        participants, port_enable, egress_sa_keys, ingress_sa_keys,
+        teardown_log_seen):
+    """Classify the first failed layer in no-live-CA teardown."""
+    live = {
+        ckn: int(participant.get("live_peers", "0"))
+        for ckn, participant in participants.items()
+    }
+    if any(count > 0 for count in live.values()):
+        return "live-peers-remain"
+    if not teardown_log_seen:
+        return "missing-wpa-teardown"
+    if port_enable != "false":
+        return "controlled-port-propagation"
+    if egress_sa_keys or ingress_sa_keys:
+        return "secy-orch-sa-teardown"
+    return "complete"
 
 
 def cleanup_all(items, cleanup):
@@ -622,8 +720,8 @@ def validate_mka_snapshot(session, participants, profile,
         if len(principals) != 1:
             errors.append("principal CKNs {}, expected exactly one".format(
                 principals))
-        if (expected_principal_ckn is not None and
-                principals != [expected_principal_ckn.lower()]):
+        if (expected_principal_ckn is not None
+                and principals != [expected_principal_ckn.lower()]):
             errors.append("principal CKNs {}, expected {}".format(
                 principals, expected_principal_ckn.lower()))
     return errors
