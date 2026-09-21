@@ -257,20 +257,21 @@ def _peer_state_is_healthy(
         require_all_live=True):
     host = neighbor["host"]
     port = neighbor["port"]
-    if not host.iface_macsec_ok(port):
-        return False
+    controlled_port = host.iface_macsec_ok(port)
 
     if isinstance(host, EosHost):
         participants = _get_eos_participants(host, port)
         return not validate_eos_mka_participants(
-            participants, profile, principal_ckn,
-            require_all_live=require_all_live)
+            participants, profile, controlled_port)
 
+    if not controlled_port:
+        return False
     peer_profile = dict(profile, name=profile_name)
     session, participants = get_mka_state(host, port)
     return not validate_mka_snapshot(
         session, participants, peer_profile, principal_ckn,
-        require_all_live=require_all_live)
+        require_all_live=require_all_live,
+        require_principal=False)
 
 
 def _participant_is_principal(host, port, ckn):
@@ -282,6 +283,23 @@ def _participant_is_principal(host, port, ckn):
         and participant.get("is_principal") == "true"
         and participant.get("live_peers", "0").isdigit()
         and int(participant["live_peers"]) >= 1
+    )
+
+
+def _peer_ckn_transition_is_operational(
+        neighbor, expected_ckn, absent_ckn=None):
+    host = neighbor["host"]
+    port = neighbor["port"]
+    participants = _direct_participants(host, port)
+    if absent_ckn and absent_ckn.lower() in participants:
+        return False
+    expected = participants.get(expected_ckn.lower(), {})
+    return (
+        host.iface_macsec_ok(port)
+        and expected.get("active")
+        and expected.get("live_peers", 0) >= 1
+        and expected.get("success", True)
+        and not expected.get("failed", False)
     )
 
 
@@ -538,17 +556,10 @@ def test_fallback_operational_state_and_show(
                 neighbor["host"], neighbor["port"])
             eos_participants = parse_eos_mka_participants(
                 eos_output, neighbor["port"])
-            assert set(eos_participants) == {
-                profile["primary_ckn"].lower(),
-                profile["fallback_ckn"].lower(),
-            }
-            assert sum(
-                participant["is_principal"]
-                for participant in eos_participants.values()
-            ) == 1
-            assert all(
-                participant["active"]
-                for participant in eos_participants.values()
+            assert not validate_eos_mka_participants(
+                eos_participants,
+                profile,
+                neighbor["host"].iface_macsec_ok(neighbor["port"]),
             )
             _assert_key_material_absent(json.dumps(eos_output), profile)
 
@@ -594,11 +605,8 @@ def test_primary_failure_rotation_and_recovery_are_hitless(
                     and participants.get(
                         profile["fallback_ckn"].lower(), {}
                     ).get("is_principal")
-                    and _peer_state_is_healthy(
-                        neighbor, profile,
-                        environment["neighbor_profiles"][port],
-                        profile["fallback_ckn"],
-                        require_all_live=False)
+                    and _peer_ckn_transition_is_operational(
+                        neighbor, profile["fallback_ckn"])
                     and duthost.iface_macsec_ok(port)
                 )
 
@@ -616,10 +624,8 @@ def test_primary_failure_rotation_and_recovery_are_hitless(
                 return (
                     participants.get(old_ckn.lower(), {}).get(
                         "is_principal")
-                    and _peer_state_is_healthy(
-                        neighbor, profile,
-                        environment["neighbor_profiles"][port],
-                        old_ckn)
+                    and _peer_ckn_transition_is_operational(
+                        neighbor, old_ckn)
                 )
 
             assert wait_until(
@@ -650,17 +656,13 @@ def test_primary_failure_rotation_and_recovery_are_hitless(
             peer_primary_removed = True
 
             def _peer_fallback_owns_remove_only_interval():
-                participants = _direct_participants(
-                    neighbor["host"], neighbor["port"])
                 return (
-                    old_ckn.lower() not in participants
-                    and participants.get(
-                        profile["fallback_ckn"].lower(), {}
-                    ).get("is_principal")
+                    _peer_ckn_transition_is_operational(
+                        neighbor,
+                        profile["fallback_ckn"],
+                        absent_ckn=old_ckn)
                     and _participant_is_principal(
                         duthost, port, profile["fallback_ckn"])
-                    and neighbor["host"].iface_macsec_ok(
-                        neighbor["port"])
                 )
 
             assert wait_until(
@@ -675,11 +677,9 @@ def test_primary_failure_rotation_and_recovery_are_hitless(
             peer_primary_removed = False
 
             def _peer_primary_reclaims_after_add():
-                participants = _direct_participants(
-                    neighbor["host"], neighbor["port"])
                 return (
-                    participants.get(old_ckn.lower(), {}).get(
-                        "is_principal")
+                    _peer_ckn_transition_is_operational(
+                        neighbor, old_ckn)
                     and _participant_is_principal(
                         duthost, port, old_ckn)
                 )

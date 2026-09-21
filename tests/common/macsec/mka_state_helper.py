@@ -100,6 +100,12 @@ def parse_eos_mka_participants(output, interface):
         details = _mapping_value(participant, "details")
         if not isinstance(details, dict):
             details = {}
+        success_value = _mapping_value(participant, "success")
+        active_value = _mapping_value(participant, "active")
+        success = _as_bool(
+            success_value if success_value is not None else active_value)
+        active = _as_bool(
+            active_value if active_value is not None else success_value)
         live_peers = _mapping_value(
             participant, "livePeers", "livePeerList")
         if live_peers is None:
@@ -113,8 +119,10 @@ def parse_eos_mka_participants(output, interface):
             live_peers = 0
 
         participants[str(ckn).lower()] = {
-            "active": _as_bool(_mapping_value(
-                participant, "success", "active")),
+            "success": success,
+            "active": active,
+            "failed": _as_bool(_mapping_value(
+                participant, "failed", "failure")),
             "is_principal": _as_bool(_mapping_value(
                 participant, "principalActor", "principal")),
             "default_actor": _as_bool(_mapping_value(
@@ -129,33 +137,30 @@ def parse_eos_mka_participants(output, interface):
 
 
 def validate_eos_mka_participants(
-        participants, profile, expected_principal_ckn,
-        require_all_live=True):
-    """Validate EOS state using local profile CKNs for configured roles."""
+        participants, profile, controlled_port):
+    """Validate operational EOS peer state without ownership flags."""
     errors = []
     primary_ckn = profile["primary_ckn"].lower()
     fallback_ckn = profile["fallback_ckn"].lower()
     expected_ckns = {primary_ckn, fallback_ckn}
 
+    if not controlled_port:
+        errors.append("controlled port is not open")
+
     if set(participants) != expected_ckns:
         errors.append("participant CKNs {}, expected {}".format(
             sorted(participants), sorted(expected_ckns)))
 
-    principal_ckns = []
-    expected_principal_ckn = expected_principal_ckn.lower()
     for ckn in expected_ckns:
         participant = participants.get(ckn, {})
+        if not participant.get("success"):
+            errors.append("{} is not successful".format(ckn))
         if not participant.get("active"):
             errors.append("{} is not active".format(ckn))
-        if ((require_all_live or ckn == expected_principal_ckn)
-                and participant.get("live_peers", 0) < 1):
+        if participant.get("failed"):
+            errors.append("{} is failed".format(ckn))
+        if participant.get("live_peers", 0) < 1:
             errors.append("{} has no live peer".format(ckn))
-        if participant.get("is_principal"):
-            principal_ckns.append(ckn)
-
-    if set(principal_ckns) != {expected_principal_ckn}:
-        errors.append("principal CKNs {}, expected {}".format(
-            sorted(principal_ckns), expected_principal_ckn))
     return errors
 
 
@@ -295,7 +300,8 @@ def get_mka_state(host, interface):
 
 def validate_mka_snapshot(session, participants, profile,
                           expected_principal_ckn=None,
-                          require_all_live=True):
+                          require_all_live=True,
+                          require_principal=True):
     """Return validation errors for a healthy primary/fallback snapshot."""
     errors = []
     missing_session = REQUIRED_SESSION_FIELDS.difference(session)
@@ -348,13 +354,14 @@ def validate_mka_snapshot(session, participants, profile,
         if participant.get("is_principal") == "true":
             principals.append(ckn)
 
-    if len(principals) != 1:
-        errors.append("principal CKNs {}, expected exactly one".format(
-            principals))
-    if (expected_principal_ckn is not None and
-            principals != [expected_principal_ckn.lower()]):
-        errors.append("principal CKNs {}, expected {}".format(
-            principals, expected_principal_ckn.lower()))
+    if require_principal:
+        if len(principals) != 1:
+            errors.append("principal CKNs {}, expected exactly one".format(
+                principals))
+        if (expected_principal_ckn is not None and
+                principals != [expected_principal_ckn.lower()]):
+            errors.append("principal CKNs {}, expected {}".format(
+                principals, expected_principal_ckn.lower()))
     return errors
 
 

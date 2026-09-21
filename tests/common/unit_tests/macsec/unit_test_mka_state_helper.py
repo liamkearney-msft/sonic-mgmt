@@ -214,6 +214,28 @@ def test_validate_snapshot_reports_role_and_liveness_errors():
     assert any("principal CKNs" in error for error in errors)
 
 
+def test_dut_principal_mismatch_remains_strict():
+    """Reject a DUT snapshot whose principal differs from the expectation."""
+    participants = {
+        "aabb": _participant("true", "false"),
+        "ccdd": _participant("false", "true"),
+    }
+    errors = validate_mka_snapshot(
+        _session(), participants, _profile(), "AABB")
+    assert "principal CKNs ['ccdd'], expected aabb" in errors
+
+
+def test_peer_snapshot_can_ignore_principal_flags():
+    """Validate peer connectivity without using peer ownership flags."""
+    participants = {
+        "aabb": _participant("true", "false"),
+        "ccdd": _participant("false", "false"),
+    }
+    assert validate_mka_snapshot(
+        _session(), participants, _profile(), "AABB",
+        require_principal=False) == []
+
+
 def test_find_secret_fields_is_allowlist_safe():
     """Detect key material fields without flagging key-server metadata."""
     state = {
@@ -258,7 +280,9 @@ def test_parse_eos_mka_participants_normalizes_roles_and_peers():
     }
     participants = parse_eos_mka_participants(output, "ethernet1")
     assert participants["aabb"] == {
+        "success": True,
         "active": True,
+        "failed": False,
         "is_principal": True,
         "default_actor": False,
         "is_key_server": False,
@@ -270,18 +294,26 @@ def test_parse_eos_mka_participants_normalizes_roles_and_peers():
     assert participants["ccdd"]["live_peers"] == 1
 
 
-def test_validate_eos_roles_from_local_profile_ckns():
-    """Derive configured primary/fallback from local CKNs, not defaultActor."""
+@pytest.mark.parametrize(
+    "principal_ckns",
+    [set(), {"aabb"}, {"aabb", "ccdd"}],
+)
+def test_validate_eos_operational_ignores_ownership_flags(principal_ckns):
+    """Accept zero, one, or multiple diagnostic EOS principal flags."""
     participants = {
         "aabb": {
+            "success": True,
             "active": True,
-            "is_principal": True,
+            "failed": False,
+            "is_principal": "aabb" in principal_ckns,
             "default_actor": False,
             "live_peers": 1,
         },
         "ccdd": {
+            "success": True,
             "active": True,
-            "is_principal": False,
+            "failed": False,
+            "is_principal": "ccdd" in principal_ckns,
             "default_actor": True,
             "live_peers": 1,
         },
@@ -292,34 +324,107 @@ def test_validate_eos_roles_from_local_profile_ckns():
             "primary_ckn": "AABB",
             "fallback_ckn": "CCDD",
         },
-        "AABB",
+        controlled_port=True,
     ) == []
 
 
-def test_validate_eos_crossed_roles_keep_principal_distinct():
-    """Allow principal CKN to differ from the peer's configured primary."""
-    participants = {
-        "aabb": {
-            "active": True,
-            "is_principal": True,
-            "default_actor": False,
-            "live_peers": 1,
-        },
-        "ccdd": {
-            "active": True,
-            "is_principal": False,
-            "default_actor": True,
-            "live_peers": 1,
-        },
-    }
-    assert validate_eos_mka_participants(
+@pytest.mark.parametrize(
+    "participants, controlled_port, expected_error",
+    [
+        (
+            {
+                "aabb": {
+                    "success": True, "active": True, "failed": False,
+                    "live_peers": 1,
+                },
+            },
+            True,
+            "participant CKNs ['aabb'], expected ['aabb', 'ccdd']",
+        ),
+        (
+            {
+                "aabb": {
+                    "success": False, "active": True, "failed": False,
+                    "live_peers": 1,
+                },
+                "ccdd": {
+                    "success": True, "active": True, "failed": False,
+                    "live_peers": 1,
+                },
+            },
+            True,
+            "aabb is not successful",
+        ),
+        (
+            {
+                "aabb": {
+                    "success": True, "active": False, "failed": False,
+                    "live_peers": 1,
+                },
+                "ccdd": {
+                    "success": True, "active": True, "failed": False,
+                    "live_peers": 1,
+                },
+            },
+            True,
+            "aabb is not active",
+        ),
+        (
+            {
+                "aabb": {
+                    "success": True, "active": True, "failed": True,
+                    "live_peers": 1,
+                },
+                "ccdd": {
+                    "success": True, "active": True, "failed": False,
+                    "live_peers": 1,
+                },
+            },
+            True,
+            "aabb is failed",
+        ),
+        (
+            {
+                "aabb": {
+                    "success": True, "active": True, "failed": False,
+                    "live_peers": 0,
+                },
+                "ccdd": {
+                    "success": True, "active": True, "failed": False,
+                    "live_peers": 1,
+                },
+            },
+            True,
+            "aabb has no live peer",
+        ),
+        (
+            {
+                "aabb": {
+                    "success": True, "active": True, "failed": False,
+                    "live_peers": 1,
+                },
+                "ccdd": {
+                    "success": True, "active": True, "failed": False,
+                    "live_peers": 1,
+                },
+            },
+            False,
+            "controlled port is not open",
+        ),
+    ],
+)
+def test_validate_eos_operational_rejects_unhealthy_state(
+        participants, controlled_port, expected_error):
+    """Reject wrong CKN, unsuccessful, no-live, or closed cEOS state."""
+    errors = validate_eos_mka_participants(
         participants,
         {
-            "primary_ckn": "CCDD",
-            "fallback_ckn": "AABB",
+            "primary_ckn": "AABB",
+            "fallback_ckn": "CCDD",
         },
-        "AABB",
-    ) == []
+        controlled_port=controlled_port,
+    )
+    assert expected_error in errors
 
 
 def test_parse_wpa_mka_participants():
