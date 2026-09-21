@@ -12,13 +12,33 @@ MKA_STATE_HELPER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MKA_STATE_HELPER)
 
 find_secret_fields = MKA_STATE_HELPER.find_secret_fields
+active_key_state = MKA_STATE_HELPER.active_key_state
+cleanup_all = MKA_STATE_HELPER.cleanup_all
+crossed_role_peer_key_server_supported = (
+    MKA_STATE_HELPER.crossed_role_peer_key_server_supported
+)
+eos_key_replacement_status = MKA_STATE_HELPER.eos_key_replacement_status
+get_macsec_ingress_sc_state = (
+    MKA_STATE_HELPER.get_macsec_ingress_sc_state
+)
+get_macsec_max_sa_per_sc = MKA_STATE_HELPER.get_macsec_max_sa_per_sc
 _mka_show_result_supported = MKA_STATE_HELPER._mka_show_result_supported
 _mka_state_cli_supported = MKA_STATE_HELPER.mka_state_cli_supported
+macsecmgrd_restart_ready = MKA_STATE_HELPER.macsecmgrd_restart_ready
+macsecmgrd_restart_command = MKA_STATE_HELPER.macsecmgrd_restart_command
+mka_hello_timeout_seconds = MKA_STATE_HELPER.mka_hello_timeout_seconds
 parse_db_hash = MKA_STATE_HELPER.parse_db_hash
+parse_eos_profile_ckns = MKA_STATE_HELPER.parse_eos_profile_ckns
 parse_eos_mka_participants = MKA_STATE_HELPER.parse_eos_mka_participants
 parse_wpa_mka_participants = MKA_STATE_HELPER.parse_wpa_mka_participants
+validate_multi_port_alternate_state = (
+    MKA_STATE_HELPER.validate_multi_port_alternate_state
+)
 validate_eos_mka_participants = (
     MKA_STATE_HELPER.validate_eos_mka_participants
+)
+validate_point_to_point_ingress_sc = (
+    MKA_STATE_HELPER.validate_point_to_point_ingress_sc
 )
 validate_mka_snapshot = MKA_STATE_HELPER.validate_mka_snapshot
 
@@ -31,6 +51,24 @@ class _FakeHost:
     def command(self, command, **kwargs):
         self.commands.append((command, kwargs))
         return self.result
+
+
+class _CommandHost:
+    def __init__(self, results, multi_asic=False):
+        self.results = results
+        self.is_multi_asic = multi_asic
+        self.commands = []
+
+    def get_port_asic_instance(self, interface):
+        return type("Asic", (), {"asic_index": 0})()
+
+    def get_namespace_from_asic_id(self, asic_index):
+        return "asic{}".format(asic_index)
+
+    def command(self, command, **kwargs):
+        self.commands.append(command)
+        return self.results.get(
+            command, {"failed": False, "stdout": "", "stdout_lines": []})
 
 
 def _profile():
@@ -456,3 +494,234 @@ live_peers=1 potential_peers=0
             "live_peers": 1,
         },
     }
+
+
+@pytest.mark.parametrize(
+    "entries, expected_error",
+    [
+        ([], "expected one ingress SC, found 0: []"),
+        (
+            [
+                {"key": "one", "sci": "0011", "sas": {}},
+                {"key": "two", "sci": "0022", "sas": {}},
+            ],
+            "expected one ingress SC, found 2: ['one', 'two']",
+        ),
+    ],
+)
+def test_validate_ingress_sc_count(entries, expected_error):
+    """Reject zero or multiple point-to-point ingress SCs."""
+    assert validate_point_to_point_ingress_sc(entries) == [expected_error]
+
+
+def test_enumerate_actual_ingress_sc_and_active_sa():
+    """Enumerate the actual APPL_DB SCI rather than synthesizing a peer SCI."""
+    keys_cmd = (
+        "sonic-db-cli -n asic0 APPL_DB KEYS "
+        "'MACSEC_INGRESS_SC_TABLE:Ethernet0:*'"
+    )
+    sc_key = "MACSEC_INGRESS_SC_TABLE:Ethernet0:aabbccdd00000001"
+    host = _CommandHost(
+        {
+            keys_cmd: {
+                "failed": False,
+                "stdout_lines": [sc_key],
+            },
+            "sonic-db-cli -n asic0 APPL_DB HGETALL '{}'".format(sc_key): {
+                "failed": False,
+                "stdout": "{'encoding_an': '0'}",
+            },
+            "sonic-db-cli -n asic0 APPL_DB HGETALL "
+            "'MACSEC_INGRESS_SA_TABLE:Ethernet0:aabbccdd00000001:0'": {
+                "failed": False,
+                "stdout": "{'active': 'true', 'sak': 'redacted'}",
+            },
+        },
+        multi_asic=True,
+    )
+    entries = get_macsec_ingress_sc_state(host, "Ethernet0")
+    assert entries[0]["sci"] == "aabbccdd00000001"
+    assert entries[0]["sas"][0]["active"] == "true"
+    assert validate_point_to_point_ingress_sc(entries) == []
+
+
+def test_active_key_state_excludes_cumulative_counters():
+    """Keep quiescence stable when only cumulative MKA counters change."""
+    participants = {
+        "aabb": {"is_principal": "true"},
+        "ccdd": {"is_principal": "false"},
+    }
+    egress_sc = {"encoding_an": "1"}
+    egress_sas = {
+        0: {"sak": "old"},
+        1: {"sak": "active", "salt": "salt", "ssci": "1"},
+    }
+    ingress_scs = [{
+        "sci": "peer",
+        "sas": {1: {"active": "true", "sak": "active"}},
+    }]
+    first = active_key_state(
+        {"keys_distributed": "1", "keys_received": "2",
+         "kay_status": "active", "secured": "true"},
+        participants, egress_sc, egress_sas, ingress_scs)
+    second = active_key_state(
+        {"keys_distributed": "99", "keys_received": "100",
+         "kay_status": "active", "secured": "true"},
+        participants, egress_sc, egress_sas, ingress_scs)
+    assert first == second
+    changed = active_key_state(
+        {"kay_status": "active", "secured": "true"},
+        participants, {"encoding_an": "0"}, egress_sas, ingress_scs)
+    assert changed != first
+
+
+@pytest.mark.parametrize(
+    "session, intervals, expected",
+    [
+        ({"mka_hello_time_ms": "2000"}, 4, 8),
+        ({"mka_hello_time_ms": "2000"}, 6, 12),
+        ({}, 4, 8),
+    ],
+)
+def test_mka_hello_timeout_seconds(session, intervals, expected):
+    """Derive four/six-hello protocol bounds with a safe default."""
+    assert mka_hello_timeout_seconds(session, intervals) == expected
+
+
+@pytest.mark.parametrize("value", ["bad", "0", "-1"])
+def test_mka_hello_timeout_rejects_malformed(value):
+    """Use the default only for a missing field, not malformed state."""
+    with pytest.raises(ValueError):
+        mka_hello_timeout_seconds(
+            {"mka_hello_time_ms": value}, 4)
+
+
+def test_eos_key_replacement_status_and_rebind_decision():
+    """Require new config/runtime CKN and old actor absence before expiry."""
+    participants = {
+        "new": {
+            "success": False, "active": False, "failed": False,
+            "live_peers": 0,
+        },
+        "fallback": {
+            "success": True, "active": True, "failed": False,
+            "live_peers": 1,
+        },
+    }
+    assert eos_key_replacement_status(
+        {"new", "fallback"}, participants, "old", "new",
+        required_live_ckns={"fallback"}, controlled_port=True,
+        expected_configured_ckns={"new", "fallback"}) == []
+    errors = eos_key_replacement_status(
+        {"old", "fallback"}, {"old": {}, "fallback": participants["fallback"]},
+        "old", "new", required_live_ckns={"fallback"},
+        controlled_port=True,
+        expected_configured_ckns={"new", "fallback"})
+    assert "old CKN remains in runtime participants" in errors
+
+
+def test_multi_port_preconditions_are_independent():
+    """Require unsafe alternate down and every safe alternate active/live."""
+    states = {
+        "Ethernet0": {"ccdd": {"active": "true", "live_peers": "0"}},
+        "Ethernet4": {"ccdd": {"active": "true", "live_peers": "1"}},
+    }
+    assert validate_multi_port_alternate_state(
+        states, "CCDD", "Ethernet0", ["Ethernet4"]) == []
+    states["Ethernet4"]["ccdd"]["live_peers"] = "0"
+    assert "Ethernet4 alternate has no live peer" in \
+        validate_multi_port_alternate_state(
+            states, "CCDD", "Ethernet0", ["Ethernet4"])
+
+
+@pytest.mark.parametrize(
+    "old_pids, new_pids, status, expected",
+    [
+        (["10"], ["11"], "macsecmgrd RUNNING pid 11", True),
+        (["10"], ["10"], "macsecmgrd RUNNING pid 10", False),
+        (["10"], ["11"], "macsecmgrd STOPPED", False),
+    ],
+)
+def test_macsecmgrd_restart_ready(old_pids, new_pids, status, expected):
+    """Require supervisor RUNNING and a different process identity."""
+    assert macsecmgrd_restart_ready(
+        old_pids, new_pids, status) is expected
+
+
+def test_macsecmgrd_restart_command():
+    """Use supervisor restart in the selected namespace-local container."""
+    assert macsecmgrd_restart_command(
+        "macsec0") == "docker exec macsec0 supervisorctl restart macsecmgrd"
+
+
+def test_cleanup_all_runs_every_cleanup_before_raising():
+    """Always clean every traffic stream even when one cleanup fails."""
+    cleaned = []
+
+    def _cleanup(item):
+        cleaned.append(item)
+        if item == "first":
+            raise AssertionError("loss")
+
+    with pytest.raises(AssertionError, match="loss"):
+        cleanup_all(["first", "second"], _cleanup)
+    assert cleaned == ["first", "second"]
+
+
+@pytest.mark.parametrize(
+    "row, expected",
+    [
+        ({"state": "ok", "max_sa_per_sc": "2"}, 2),
+        ({"state": "ok", "max_sa_per_sc": "4"}, 4),
+        ({"state": "ok"}, 4),
+    ],
+)
+def test_get_max_sa_per_sc(row, expected):
+    """Read local capability and apply WPA's missing-field default."""
+    command = (
+        "sonic-db-cli -n asic0 STATE_DB HGETALL "
+        "'MACSEC_PORT_TABLE|Ethernet0'"
+    )
+    host = _CommandHost({
+        command: {"failed": False, "stdout": repr(row)}
+    }, multi_asic=True)
+    assert get_macsec_max_sa_per_sc(host, "Ethernet0") == expected
+
+
+@pytest.mark.parametrize("value", ["bad", ""])
+def test_get_max_sa_per_sc_rejects_unready_or_malformed(value):
+    """Reject malformed values and rows that are not ready."""
+    row = (
+        {"state": "ok", "max_sa_per_sc": value}
+        if value else {"state": "pending"})
+    command = (
+        "sonic-db-cli -n asic0 STATE_DB HGETALL "
+        "'MACSEC_PORT_TABLE|Ethernet0'"
+    )
+    host = _CommandHost({
+        command: {"failed": False, "stdout": repr(row)}
+    }, multi_asic=True)
+    with pytest.raises(ValueError):
+        get_macsec_max_sa_per_sc(host, "Ethernet0")
+
+
+@pytest.mark.parametrize(
+    "capability, supported",
+    [(2, False), (4, True), (8, False)],
+)
+def test_crossed_role_capability_gate(capability, supported):
+    """Run peer-key-server crossed roles only at effective capability four."""
+    assert crossed_role_peer_key_server_supported(capability) is supported
+
+
+def test_parse_eos_profile_ckns():
+    """Parse only the selected EOS profile's CKNs without exposing CAKs."""
+    output = """
+mac security
+   profile other
+      key dead 7 secret
+   profile target
+      key AABB 7 primary-secret
+      key CCDD 7 fallback-secret fallback
+"""
+    assert parse_eos_profile_ckns(output, "target") == {"aabb", "ccdd"}

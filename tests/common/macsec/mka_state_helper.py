@@ -1,9 +1,14 @@
 import ast
 import json
+import math
+import re
 
 
 MKA_SESSION_TABLE = "MACSEC_MKA_SESSION_TABLE"
 MKA_PARTICIPANT_TABLE = "MACSEC_MKA_PARTICIPANT_TABLE"
+MACSEC_PORT_TABLE = "MACSEC_PORT_TABLE"
+MACSEC_INGRESS_SC_TABLE = "MACSEC_INGRESS_SC_TABLE"
+MACSEC_INGRESS_SA_TABLE = "MACSEC_INGRESS_SA_TABLE"
 
 REQUIRED_SESSION_FIELDS = {
     "profile",
@@ -199,6 +204,62 @@ def parse_wpa_mka_participants(output):
     return participants
 
 
+def parse_eos_profile_ckns(output, profile_name):
+    """Return configured CKNs for one EOS MACsec profile without key data."""
+    ckns = set()
+    in_profile = False
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("profile "):
+            in_profile = stripped.split(None, 1)[1] == profile_name
+            continue
+        if in_profile and stripped.startswith("key "):
+            match = re.match(r"key\s+(\S+)\s+7\s+\S+", stripped)
+            if match:
+                ckns.add(match.group(1).lower())
+    return ckns
+
+
+def eos_key_replacement_status(
+        configured_ckns, participants, old_ckn, new_ckn,
+        required_live_ckns=(), controlled_port=True,
+        expected_configured_ckns=None):
+    """Classify whether an EOS key replacement reached the required runtime."""
+    old_ckn = old_ckn.lower()
+    new_ckn = new_ckn.lower()
+    required_live_ckns = {ckn.lower() for ckn in required_live_ckns}
+    errors = []
+
+    if expected_configured_ckns is not None:
+        expected_configured_ckns = {
+            ckn.lower() for ckn in expected_configured_ckns}
+        if configured_ckns != expected_configured_ckns:
+            errors.append("configured CKNs {}, expected {}".format(
+                sorted(configured_ckns),
+                sorted(expected_configured_ckns)))
+    if old_ckn in configured_ckns:
+        errors.append("old CKN remains in running config")
+    if new_ckn not in configured_ckns:
+        errors.append("new CKN missing from running config")
+    if old_ckn in participants:
+        errors.append("old CKN remains in runtime participants")
+    if new_ckn not in participants:
+        errors.append("new CKN missing from runtime participants")
+    if required_live_ckns and not controlled_port:
+        errors.append("controlled port is not open")
+    for ckn in required_live_ckns:
+        participant = participants.get(ckn, {})
+        if not participant.get("success"):
+            errors.append("{} is not successful".format(ckn))
+        if not participant.get("active"):
+            errors.append("{} is not active".format(ckn))
+        if participant.get("failed"):
+            errors.append("{} is failed".format(ckn))
+        if participant.get("live_peers", 0) < 1:
+            errors.append("{} has no live peer".format(ckn))
+    return errors
+
+
 def _mka_show_result_supported(result):
     """Return whether canonical MKA output comes from a recognized command."""
     if result.get("failed", False) or result.get("rc", 0) != 0:
@@ -296,6 +357,209 @@ def get_mka_state(host, interface):
         participants[ckn] = _read_hash(
             host, namespace_option, "STATE_DB", key)
     return session, participants
+
+
+def get_macsec_ingress_sc_state(host, interface):
+    """Enumerate actual ingress SC/SAs for a namespace-local MACsec port."""
+    namespace_option = get_namespace_option(host, interface)
+    pattern = "{}:{}:*".format(MACSEC_INGRESS_SC_TABLE, interface)
+    result = host.command(
+        "sonic-db-cli {} APPL_DB KEYS '{}'".format(
+            namespace_option, pattern),
+        module_ignore_errors=True,
+        verbose=False,
+    )
+    keys = result.get("stdout_lines", []) if not result.get("failed") else []
+    prefix = "{}:{}:".format(MACSEC_INGRESS_SC_TABLE, interface)
+    entries = []
+    for key in sorted(key.strip() for key in keys if key.strip()):
+        if not key.startswith(prefix):
+            continue
+        sci = key[len(prefix):]
+        sc = _read_hash(host, namespace_option, "APPL_DB", key)
+        sas = {}
+        for an in range(4):
+            sa_key = "{}:{}:{}:{}".format(
+                MACSEC_INGRESS_SA_TABLE, interface, sci, an)
+            sa = _read_hash(
+                host, namespace_option, "APPL_DB", sa_key)
+            if sa:
+                sas[an] = sa
+        entries.append({
+            "key": key,
+            "sci": sci,
+            "sc": sc,
+            "sas": sas,
+        })
+    return entries
+
+
+def validate_point_to_point_ingress_sc(entries):
+    """Validate exactly one ingress SC with at least one active keyed SA."""
+    if len(entries) != 1:
+        return [
+            "expected one ingress SC, found {}: {}".format(
+                len(entries),
+                [entry.get("key") for entry in entries],
+            )
+        ]
+    entry = entries[0]
+    active_sas = [
+        (an, sa) for an, sa in entry.get("sas", {}).items()
+        if sa.get("active") == "true"
+    ]
+    if not active_sas:
+        return [
+            "ingress SC {} has no active SA; ANs={}".format(
+                entry.get("sci"),
+                sorted(entry.get("sas", {})),
+            )
+        ]
+    if any(not sa.get("sak") for _, sa in active_sas):
+        return [
+            "ingress SC {} has an active SA without a SAK".format(
+                entry.get("sci"))
+        ]
+    return []
+
+
+def active_key_state(
+        session, participants, egress_sc, egress_sas, ingress_scs):
+    """Normalize stable key/AN identity while excluding cumulative counters."""
+    principals = sorted(
+        ckn for ckn, participant in participants.items()
+        if participant.get("is_principal") == "true")
+    encoding_an = str(egress_sc.get("encoding_an", ""))
+    try:
+        encoding_an_key = int(encoding_an)
+    except (TypeError, ValueError):
+        encoding_an_key = None
+    active_egress = (
+        egress_sas.get(encoding_an_key, {})
+        if encoding_an_key is not None else {})
+
+    ingress = []
+    for entry in ingress_scs:
+        active_sas = []
+        for an, sa in sorted(entry.get("sas", {}).items()):
+            if sa.get("active") == "true":
+                active_sas.append({
+                    "an": str(an),
+                    "sak": sa.get("sak"),
+                    "auth_key": sa.get("auth_key"),
+                    "salt": sa.get("salt"),
+                    "ssci": sa.get("ssci"),
+                })
+        ingress.append({
+            "sci": entry.get("sci"),
+            "all_ans": sorted(str(an) for an in entry.get("sas", {})),
+            "active_sas": active_sas,
+        })
+
+    return {
+        "principal_ckns": principals,
+        "egress_encoding_an": encoding_an,
+        "egress_all_ans": sorted(str(an) for an in egress_sas),
+        "egress_active": {
+            "sak": active_egress.get("sak"),
+            "auth_key": active_egress.get("auth_key"),
+            "salt": active_egress.get("salt"),
+            "ssci": active_egress.get("ssci"),
+        },
+        "ingress": ingress,
+        "kay_status": session.get("kay_status"),
+        "secured": session.get("secured"),
+    }
+
+
+def mka_hello_timeout_seconds(session, intervals, default_hello_ms=2000):
+    """Return a protocol-aware timeout for the requested hello intervals."""
+    value = session.get("mka_hello_time_ms")
+    if value in (None, ""):
+        hello_ms = default_hello_ms
+    else:
+        try:
+            hello_ms = int(value)
+        except (TypeError, ValueError):
+            raise ValueError(
+                "Invalid mka_hello_time_ms {!r}".format(value))
+    if hello_ms <= 0:
+        raise ValueError(
+            "Invalid mka_hello_time_ms {!r}".format(value))
+    return max(1, int(math.ceil(intervals * hello_ms / 1000.0)))
+
+
+def get_macsec_max_sa_per_sc(host, interface):
+    """Read max-SA capability after the namespace-local port is OK."""
+    namespace_option = get_namespace_option(host, interface)
+    row = _read_hash(
+        host, namespace_option, "STATE_DB",
+        "{}|{}".format(MACSEC_PORT_TABLE, interface))
+    if not row or row.get("state") != "ok":
+        raise ValueError(
+            "MACsec port state is not ready on {}".format(interface))
+    value = row.get("max_sa_per_sc")
+    if value in (None, ""):
+        return 4
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            "Invalid max_sa_per_sc {!r} on {}".format(value, interface))
+
+
+def crossed_role_peer_key_server_supported(max_sa_per_sc):
+    """Return whether WPA permits the peer-key-server crossed-role scenario."""
+    return max_sa_per_sc == 4
+
+
+def validate_multi_port_alternate_state(
+        participants_by_port, alternate_ckn, unsafe_port, safe_ports):
+    """Validate one unsafe and independently healthy safe alternate set."""
+    errors = []
+    alternate_ckn = alternate_ckn.lower()
+    unsafe = participants_by_port.get(unsafe_port, {}).get(
+        alternate_ckn, {})
+    if (unsafe.get("active") == "true"
+            and int(unsafe.get("live_peers", "0")) > 0):
+        errors.append(
+            "{} alternate remains active/live".format(unsafe_port))
+    for port in safe_ports:
+        participant = participants_by_port.get(port, {}).get(
+            alternate_ckn, {})
+        if participant.get("active") != "true":
+            errors.append("{} alternate is not active".format(port))
+        if int(participant.get("live_peers", "0")) < 1:
+            errors.append("{} alternate has no live peer".format(port))
+    return errors
+
+
+def macsecmgrd_restart_ready(old_pids, new_pids, supervisor_output):
+    """Return whether supervisor reports RUNNING with a different live PID."""
+    return (
+        "RUNNING" in supervisor_output
+        and bool(new_pids)
+        and set(new_pids).isdisjoint(set(old_pids))
+    )
+
+
+def macsecmgrd_restart_command(container):
+    """Build the deterministic supervisor restart command."""
+    return "docker exec {} supervisorctl restart macsecmgrd".format(
+        container)
+
+
+def cleanup_all(items, cleanup):
+    """Run cleanup for every item and re-raise the first failure afterward."""
+    first_error = None
+    for item in items:
+        try:
+            cleanup(item)
+        except Exception as error:
+            if first_error is None:
+                first_error = error
+    if first_error is not None:
+        raise first_error
 
 
 def validate_mka_snapshot(session, participants, profile,
