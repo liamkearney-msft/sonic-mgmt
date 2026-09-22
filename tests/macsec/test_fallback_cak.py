@@ -45,6 +45,8 @@ from tests.common.macsec.mka_state_helper import (
     get_macsec_teardown_state,
     get_mka_state,
     get_namespace_option,
+    final_new_key_stable,
+    macsec_sa_lifecycle_sample,
     macsecmgrd_restart_command,
     macsecmgrd_restart_ready,
     mka_hello_timeout_seconds,
@@ -56,8 +58,10 @@ from tests.common.macsec.mka_state_helper import (
     remaining_transition_seconds,
     remaining_link_items,
     select_independent_port_pair,
-    stable_active_key_during_asymmetry,
     validate_direct_actor_state,
+    validate_macsec_sa_lifecycle_sample,
+    validate_make_before_break_samples,
+    validate_pre_distsak_lifecycle,
     validate_lifecycle_cleanup_state,
     validate_multi_port_alternate_state,
     validate_eos_mka_participants,
@@ -418,6 +422,21 @@ def _snapshot_active_key_state(environment, ports):
     return snapshot, diagnostics
 
 
+def _snapshot_sa_lifecycle(environment, port):
+    neighbor = environment["links"][port]
+    session, participants = get_mka_state(
+        environment["duthost"], port)
+    port_table, egress_sc, _, egress_sas, _ = get_appl_db(
+        environment["duthost"], port,
+        neighbor["host"], neighbor["port"])
+    ingress_scs = get_macsec_ingress_sc_state(
+        environment["duthost"], port)
+    key_state = active_key_state(
+        session, participants, egress_sc, egress_sas, ingress_scs)
+    return macsec_sa_lifecycle_sample(
+        port_table.get("enable"), key_state)
+
+
 def _sa_identity_changed(before, after):
     return any(
         before[port] != after[port]
@@ -508,7 +527,7 @@ def _wait_direct_actor_ready(
 
 def _wait_peer_follow(
         environment, port, neighbor, ckn, action_started,
-        expected_primary, inherited_key_state=None,
+        expected_primary, inherited_lifecycle,
         absent_ckn=None, description="peer follow"):
     marker = "Following key server onto CKN {}".format(ckn.lower())
     marker_before = (
@@ -517,43 +536,92 @@ def _wait_peer_follow(
             neighbor["host"], neighbor["port"], marker)
     )
     diagnostics = [None]
+    samples = []
+    following_index = [None]
+    pending_change_index = [None]
+    previous_post_follow = [None]
 
     def _followed():
-        if inherited_key_state is not None:
-            current_key_state = _snapshot_active_key_state(
-                environment, [port])[0]
-            assert stable_active_key_during_asymmetry(
-                inherited_key_state, current_key_state, port), (
-                "Inherited active KI/AN changed during ownership asymmetry")
+        sample = _snapshot_sa_lifecycle(environment, port)
+        samples.append(sample)
+        sample_errors = validate_macsec_sa_lifecycle_sample(sample)
+        assert not sample_errors, (
+            "MACsec SA lifecycle became unusable during peer follow: {}"
+        ).format(sample_errors)
 
         if isinstance(neighbor["host"], EosHost):
-            ready = _peer_ckn_transition_is_operational(
+            peer_ready = _peer_ckn_transition_is_operational(
                 neighbor, ckn, absent_ckn=absent_ckn)
             diagnostics[0] = _direct_participants(
                 neighbor["host"], neighbor["port"])
-            return ready
+            following_seen = False
+        else:
+            participants = _runtime_participants(
+                neighbor["host"], neighbor["port"])
+            following_seen = _mka_log_marker_count(
+                neighbor["host"], neighbor["port"], marker) > marker_before
+            peer_ready = not validate_direct_actor_state(
+                participants,
+                ckn,
+                expected_primary,
+                True,
+                False,
+                True,
+                absent_ckn=absent_ckn,
+            )
+            diagnostics[0] = {
+                "participants": participants,
+                "following_log_seen": following_seen,
+            }
 
-        participants = _runtime_participants(
-            neighbor["host"], neighbor["port"])
-        diagnostics[0] = {
-            "participants": participants,
-            "following_log_seen": _mka_log_marker_count(
-                neighbor["host"], neighbor["port"], marker) > marker_before,
-        }
-        return not validate_direct_actor_state(
-            participants,
-            ckn,
-            expected_primary,
-            True,
-            False,
-            True,
-            absent_ckn=absent_ckn,
+        key_changed = (
+            sample.get("tx_active")
+            != inherited_lifecycle.get("tx_active")
+            or sample.get("rx_active")
+            != inherited_lifecycle.get("rx_active")
         )
+        boundary_seen = following_seen or (peer_ready and key_changed)
+        if following_index[0] is None:
+            if boundary_seen:
+                following_index[0] = (
+                    pending_change_index[0]
+                    if pending_change_index[0] is not None
+                    else len(samples) - 1)
+            elif key_changed:
+                if pending_change_index[0] is None:
+                    pending_change_index[0] = len(samples) - 1
+                    return False
+                raise AssertionError(
+                    "Active KI/AN changed more than one poll before peer "
+                    "Following/readiness")
+            else:
+                pre_errors = validate_pre_distsak_lifecycle(
+                    inherited_lifecycle, sample)
+                assert not pre_errors, (
+                    "Inherited active KI/AN was not preserved before peer "
+                    "Following: {}"
+                ).format(pre_errors)
+                return False
 
-    timeout = _transition_stage_timeout(
-        environment, port, MKA_PEER_FOLLOW_INTERVALS, action_started)
+        if not peer_ready:
+            return False
+        if final_new_key_stable(
+                inherited_lifecycle,
+                previous_post_follow[0],
+                sample):
+            lifecycle_errors = validate_make_before_break_samples(
+                inherited_lifecycle, samples, following_index[0])
+            assert not lifecycle_errors, (
+                "Invalid MACsec make-before-break lifecycle: {}"
+            ).format(lifecycle_errors)
+            return True
+        previous_post_follow[0] = sample
+        return False
+
     if _followed():
         return
+    timeout = _transition_stage_timeout(
+        environment, port, MKA_PEER_FOLLOW_INTERVALS, action_started)
     assert timeout > 0 and wait_until(
         timeout, MKA_OBSERVATION_POLL_SECONDS, 0, _followed,
     ), "{} did not converge within the transition budget: {}".format(
@@ -562,7 +630,7 @@ def _wait_peer_follow(
 
 def _wait_dut_owner_then_peer_follow(
         environment, port, neighbor, ckn, action_started,
-        expected_primary, inherited_key_state=None,
+        expected_primary,
         absent_ckn=None, description="CKN ownership"):
     _wait_direct_actor_ready(
         environment,
@@ -578,6 +646,8 @@ def _wait_dut_owner_then_peer_follow(
         absent_ckn=absent_ckn,
         description="{} DUT authoritative actor".format(description),
     )
+    inherited_lifecycle = _snapshot_sa_lifecycle(
+        environment, port)
     _wait_peer_follow(
         environment,
         port,
@@ -585,7 +655,7 @@ def _wait_dut_owner_then_peer_follow(
         ckn,
         action_started,
         expected_primary,
-        inherited_key_state=inherited_key_state,
+        inherited_lifecycle,
         absent_ckn=absent_ckn,
         description="{} remote follow".format(description),
     )
@@ -593,7 +663,7 @@ def _wait_dut_owner_then_peer_follow(
 
 def _wait_peer_actor_then_dut_owner(
         environment, port, neighbor, ckn, action_started,
-        expected_primary, inherited_key_state=None,
+        expected_primary,
         absent_ckn=None, description="peer actor"):
     is_eos = isinstance(neighbor["host"], EosHost)
     _wait_direct_actor_ready(
@@ -620,7 +690,6 @@ def _wait_peer_actor_then_dut_owner(
         ckn,
         action_started,
         expected_primary,
-        inherited_key_state=inherited_key_state,
         absent_ckn=absent_ckn,
         description=description,
     )
@@ -1376,8 +1445,6 @@ def test_primary_failure_rotation_and_recovery_are_hitless(
                 _fallback_owns_remove_only_interval,
             ), "Fallback did not own the remove-only primary interval"
 
-            inherited_key_state = _snapshot_active_key_state(
-                environment, [selected_port])[0]
             add_started = time.monotonic()
             add_runtime_macsec_key(
                 duthost, selected_port, profile["name"], old_cak, old_ckn)
@@ -1389,7 +1456,6 @@ def test_primary_failure_rotation_and_recovery_are_hitless(
                 old_ckn,
                 add_started,
                 True,
-                inherited_key_state=inherited_key_state,
                 description="DUT runtime primary restore",
             )
         finally:
@@ -1444,8 +1510,6 @@ def test_primary_failure_rotation_and_recovery_are_hitless(
                 _peer_fallback_owns_remove_only_interval,
             ), "Peer fallback did not own its remove-only primary interval"
 
-            inherited_key_state = _snapshot_active_key_state(
-                environment, [selected_port])[0]
             peer_add_started = time.monotonic()
             add_runtime_macsec_key(
                 selected_neighbor["host"], selected_neighbor["port"],
@@ -1459,7 +1523,6 @@ def test_primary_failure_rotation_and_recovery_are_hitless(
                 old_ckn,
                 peer_add_started,
                 True,
-                inherited_key_state=inherited_key_state,
                 description="peer runtime primary restore",
             )
         finally:
@@ -1505,8 +1568,6 @@ def test_primary_failure_rotation_and_recovery_are_hitless(
             assert old_ckn.lower() not in participants
             assert new_ckn.lower() in participants
 
-        inherited_key_state = _snapshot_active_key_state(
-            environment, [selected_port])[0]
         replacement_started = time.monotonic()
         _replace_peer_key_and_verify(
             environment, selected_port,
@@ -1520,7 +1581,6 @@ def test_primary_failure_rotation_and_recovery_are_hitless(
             new_ckn,
             replacement_started,
             True,
-            inherited_key_state=inherited_key_state,
             absent_ckn=old_ckn,
             description="replacement primary",
         )
@@ -1866,8 +1926,6 @@ def test_fallback_rotation_rejected_without_live_primary(
         try:
             if peer_updated:
                 restore_started = time.monotonic()
-                inherited_key_state = _snapshot_active_key_state(
-                    environment, [port])[0]
                 _replace_peer_key_and_verify(
                     environment, port,
                     invalid_cak, invalid_ckn,
@@ -1879,7 +1937,6 @@ def test_fallback_rotation_rejected_without_live_primary(
                     profile["primary_ckn"],
                     restore_started,
                     True,
-                    inherited_key_state=inherited_key_state,
                     description="rejected-rotation primary cleanup",
                 )
                 _wait_final_environment(

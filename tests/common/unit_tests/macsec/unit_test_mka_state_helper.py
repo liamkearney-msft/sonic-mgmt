@@ -37,6 +37,7 @@ _mka_show_result_supported = MKA_STATE_HELPER._mka_show_result_supported
 _mka_state_cli_supported = MKA_STATE_HELPER.mka_state_cli_supported
 macsecmgrd_restart_ready = MKA_STATE_HELPER.macsecmgrd_restart_ready
 macsecmgrd_restart_command = MKA_STATE_HELPER.macsecmgrd_restart_command
+macsec_sa_lifecycle_sample = MKA_STATE_HELPER.macsec_sa_lifecycle_sample
 mka_hello_timeout_seconds = MKA_STATE_HELPER.mka_hello_timeout_seconds
 parse_db_hash = MKA_STATE_HELPER.parse_db_hash
 parse_eos_profile_ckns = MKA_STATE_HELPER.parse_eos_profile_ckns
@@ -48,9 +49,6 @@ remaining_transition_seconds = (
 )
 remaining_link_items = MKA_STATE_HELPER.remaining_link_items
 select_independent_port_pair = MKA_STATE_HELPER.select_independent_port_pair
-stable_active_key_during_asymmetry = (
-    MKA_STATE_HELPER.stable_active_key_during_asymmetry
-)
 validate_multi_port_alternate_state = (
     MKA_STATE_HELPER.validate_multi_port_alternate_state
 )
@@ -65,6 +63,16 @@ validate_lifecycle_cleanup_state = (
     MKA_STATE_HELPER.validate_lifecycle_cleanup_state
 )
 validate_direct_actor_state = MKA_STATE_HELPER.validate_direct_actor_state
+validate_macsec_sa_lifecycle_sample = (
+    MKA_STATE_HELPER.validate_macsec_sa_lifecycle_sample
+)
+validate_make_before_break_samples = (
+    MKA_STATE_HELPER.validate_make_before_break_samples
+)
+validate_pre_distsak_lifecycle = (
+    MKA_STATE_HELPER.validate_pre_distsak_lifecycle
+)
+final_new_key_stable = MKA_STATE_HELPER.final_new_key_stable
 
 
 class _FakeHost:
@@ -712,27 +720,177 @@ def test_fresh_state_publication_is_separate_from_runtime_readiness():
         dict(session, query_status="error"), "old")
 
 
-def test_transient_asymmetry_allows_roles_but_not_key_identity_churn():
-    """Ignore principal movement while requiring inherited KI/AN stability."""
-    before = {
-        "Ethernet0": {
-            "principal_ckns": ["fallback"],
-            "egress_encoding_an": "1",
-            "egress_all_ans": ["1"],
-            "egress_active": {"key_fingerprint": "key", "ssci": "1"},
-            "ingress": [{"sci": "peer", "active_sas": [{"an": "1"}]}],
+def _sa_lifecycle(
+        tx_active=("1", "old-tx"),
+        tx_sas=None,
+        rx_active=None,
+        rx_sas=None,
+        port_enabled=True):
+    if tx_sas is None:
+        tx_sas = {("1", "old-tx")}
+    if rx_active is None:
+        rx_active = {("peer", "1", "old-rx")}
+    if rx_sas is None:
+        rx_sas = set(rx_active)
+    return {
+        "port_enabled": port_enabled,
+        "tx_active": tx_active,
+        "tx_sas": set(tx_sas),
+        "rx_active": set(rx_active),
+        "rx_sas": set(rx_sas),
+    }
+
+
+def test_pre_distsak_lifecycle_keeps_inherited_key_usable():
+    """Allow new RX installation while retaining inherited active TX/RX."""
+    inherited = _sa_lifecycle()
+    current = _sa_lifecycle(
+        rx_active={
+            ("peer", "1", "old-rx"),
+            ("peer", "2", "new-rx"),
         },
+        rx_sas={
+            ("peer", "1", "old-rx"),
+            ("peer", "2", "new-rx"),
+        },
+    )
+    assert validate_pre_distsak_lifecycle(inherited, current) == []
+    current["tx_active"] = ("2", "new-tx")
+    assert "active TX key/AN changed before peer Following" in \
+        validate_pre_distsak_lifecycle(inherited, current)
+
+
+@pytest.mark.parametrize(
+    "sample, expected_error",
+    [
+        (_sa_lifecycle(port_enabled=False),
+         "APPL_DB controlled port is disabled"),
+        (_sa_lifecycle(tx_active=("", None)),
+         "active/usable egress SA set is empty"),
+        (_sa_lifecycle(rx_active=set()),
+         "active/usable ingress SA set is empty"),
+    ],
+)
+def test_sa_lifecycle_rejects_port_or_active_sa_gaps(
+        sample, expected_error):
+    """Reject disabled-port and empty active-SA samples."""
+    assert expected_error in validate_macsec_sa_lifecycle_sample(sample)
+
+
+def test_make_before_break_allows_overlap_or_collapsed_publication():
+    """Accept old-to-overlap-to-new and adjacent old-to-new samples."""
+    inherited = _sa_lifecycle()
+    overlap = _sa_lifecycle(
+        tx_sas={("1", "old-tx"), ("2", "new-tx")},
+        rx_active={
+            ("peer", "1", "old-rx"),
+            ("peer", "2", "new-rx"),
+        },
+        rx_sas={
+            ("peer", "1", "old-rx"),
+            ("peer", "2", "new-rx"),
+        },
+    )
+    new = _sa_lifecycle(
+        tx_active=("2", "new-tx"),
+        tx_sas={("2", "new-tx")},
+        rx_active={("peer", "2", "new-rx")},
+        rx_sas={("peer", "2", "new-rx")},
+    )
+    assert validate_make_before_break_samples(
+        inherited, [inherited, overlap, new], 1) == []
+    assert validate_make_before_break_samples(
+        inherited, [inherited, new], 1) == []
+
+
+def test_make_before_break_rejects_old_sa_early_deletion():
+    """Reject old TX/RX deletion before the new handoff boundary."""
+    inherited = _sa_lifecycle()
+    broken = _sa_lifecycle(
+        tx_active=("1", "old-tx"),
+        tx_sas={("2", "new-tx")},
+        rx_active={("peer", "2", "new-rx")},
+        rx_sas={("peer", "2", "new-rx")},
+    )
+    new = _sa_lifecycle(
+        tx_active=("2", "new-tx"),
+        tx_sas={("2", "new-tx")},
+        rx_active={("peer", "2", "new-rx")},
+        rx_sas={("peer", "2", "new-rx")},
+    )
+    errors = validate_make_before_break_samples(
+        inherited, [broken, new], 1)
+    assert any("before peer Following" in error for error in errors)
+    assert "old TX SA was deleted before new TX activation" in errors
+    assert "old RX SA was deleted before remote TX handoff" in errors
+
+
+def test_final_new_key_must_change_and_stabilize():
+    """Require two stable post-Following polls on a new usable key."""
+    inherited = _sa_lifecycle()
+    new = _sa_lifecycle(
+        tx_active=("2", "new-tx"),
+        tx_sas={("2", "new-tx")},
+        rx_active={("peer", "2", "new-rx")},
+        rx_sas={("peer", "2", "new-rx")},
+    )
+    assert final_new_key_stable(inherited, new, new)
+    assert not final_new_key_stable(inherited, inherited, inherited)
+
+
+def test_lifecycle_sample_normalizes_key_state():
+    """Build non-secret active and installed SA identity sets."""
+    key_state = {
+        "egress_encoding_an": "2",
+        "egress_active": {
+            "key_fingerprint": "new-tx",
+            "present": True,
+        },
+        "egress_sas": [
+            {
+                "an": "1",
+                "key_fingerprint": "old-tx",
+                "present": True,
+            },
+            {
+                "an": "2",
+                "key_fingerprint": "new-tx",
+                "present": True,
+            },
+        ],
+        "ingress": [{
+            "sci": "peer",
+            "sas": [
+                {
+                    "an": "1",
+                    "key_fingerprint": "old-rx",
+                    "present": True,
+                },
+                {
+                    "an": "2",
+                    "key_fingerprint": "new-rx",
+                    "present": True,
+                },
+            ],
+            "active_sas": [
+                {
+                    "an": "2",
+                    "key_fingerprint": "new-rx",
+                    "present": True,
+                },
+            ],
+        }],
     }
-    current = {
-        "Ethernet0": dict(
-            before["Ethernet0"],
-            principal_ckns=["primary"]),
+    assert macsec_sa_lifecycle_sample("true", key_state) == {
+        "port_enabled": True,
+        "tx_active": ("2", "new-tx"),
+        "tx_sas": {("1", "old-tx"), ("2", "new-tx")},
+        "rx_sas": {
+            ("peer", "1", "old-rx"),
+            ("peer", "2", "new-rx"),
+        },
+        "rx_active": {("peer", "2", "new-rx")},
     }
-    assert stable_active_key_during_asymmetry(
-        before, current, "Ethernet0")
-    current["Ethernet0"]["egress_encoding_an"] = "0"
-    assert not stable_active_key_during_asymmetry(
-        before, current, "Ethernet0")
 
 
 def test_eos_key_replacement_status_and_rebind_decision():
@@ -1026,6 +1184,15 @@ def test_actor_readiness_uses_direct_runtime_not_state_db():
         FALLBACK_TEST_PATH, "_wait_direct_actor_ready")
     assert "_direct_participants(" in source
     assert "get_mka_state(" not in source
+
+
+def test_peer_follow_scopes_stability_before_following_boundary():
+    """Allow a new key after Following while validating pre-edge MBB state."""
+    source = _function_source(FALLBACK_TEST_PATH, "_wait_peer_follow")
+    assert "validate_pre_distsak_lifecycle(" in source
+    assert "validate_make_before_break_samples(" in source
+    assert "final_new_key_stable(" in source
+    assert "stable_active_key_during_asymmetry(" not in source
 
 
 def test_timing_policy_constants_match_wpa_semantics():

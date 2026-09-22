@@ -473,21 +473,37 @@ def active_key_state(
         egress_sas.get(encoding_an_key, {})
         if encoding_an_key is not None else {})
 
+    normalized_egress_sas = []
+    for an, sa in sorted(egress_sas.items()):
+        normalized_egress_sas.append({
+            "an": str(an),
+            "key_fingerprint": _fingerprint(
+                sa.get("sak"), sa.get("auth_key"),
+                sa.get("salt"), sa.get("ssci")),
+            "present": bool(sa.get("sak")),
+            "ssci": sa.get("ssci"),
+        })
+
     ingress = []
     for entry in ingress_scs:
         active_sas = []
+        all_sas = []
         for an, sa in sorted(entry.get("sas", {}).items()):
+            normalized_sa = {
+                "an": str(an),
+                "key_fingerprint": _fingerprint(
+                    sa.get("sak"), sa.get("auth_key"),
+                    sa.get("salt"), sa.get("ssci")),
+                "present": bool(sa.get("sak")),
+                "ssci": sa.get("ssci"),
+            }
+            all_sas.append(normalized_sa)
             if sa.get("active") == "true":
-                active_sas.append({
-                    "an": str(an),
-                    "key_fingerprint": _fingerprint(
-                        sa.get("sak"), sa.get("auth_key"),
-                        sa.get("salt"), sa.get("ssci")),
-                    "ssci": sa.get("ssci"),
-                })
+                active_sas.append(normalized_sa)
         ingress.append({
             "sci": entry.get("sci"),
             "all_ans": sorted(str(an) for an in entry.get("sas", {})),
+            "sas": all_sas,
             "active_sas": active_sas,
         })
 
@@ -495,12 +511,14 @@ def active_key_state(
         "principal_ckns": principals,
         "egress_encoding_an": encoding_an,
         "egress_all_ans": sorted(str(an) for an in egress_sas),
+        "egress_sas": normalized_egress_sas,
         "egress_active": {
             "key_fingerprint": _fingerprint(
                 active_egress.get("sak"),
                 active_egress.get("auth_key"),
                 active_egress.get("salt"),
                 active_egress.get("ssci")),
+            "present": bool(active_egress.get("sak")),
             "ssci": active_egress.get("ssci"),
         },
         "ingress": ingress,
@@ -584,17 +602,140 @@ def fresh_mka_state_published(session, previous_last_updated):
     )
 
 
-def stable_active_key_during_asymmetry(before, current, port):
-    """Require inherited KI/AN identity to stay fixed during role asymmetry."""
-    fields = (
-        "egress_encoding_an",
-        "egress_all_ans",
-        "egress_active",
-        "ingress",
+def macsec_sa_lifecycle_sample(port_enabled, key_state):
+    """Normalize non-secret TX/RX SA lifecycle state for one poll."""
+    tx_active = (
+        str(key_state.get("egress_encoding_an", "")),
+        (
+            key_state.get("egress_active", {}).get("key_fingerprint")
+            if key_state.get("egress_active", {}).get("present")
+            else None
+        ),
     )
-    return all(
-        before.get(port, {}).get(field) == current.get(port, {}).get(field)
-        for field in fields
+    tx_sas = {
+        (sa.get("an"), sa.get("key_fingerprint"))
+        for sa in key_state.get("egress_sas", [])
+        if sa.get("present")
+    }
+    rx_sas = {
+        (entry.get("sci"), sa.get("an"), sa.get("key_fingerprint"))
+        for entry in key_state.get("ingress", [])
+        for sa in entry.get("sas", [])
+        if sa.get("present")
+    }
+    rx_active = {
+        (entry.get("sci"), sa.get("an"), sa.get("key_fingerprint"))
+        for entry in key_state.get("ingress", [])
+        for sa in entry.get("active_sas", [])
+        if sa.get("present")
+    }
+    return {
+        "port_enabled": port_enabled == "true",
+        "tx_active": tx_active,
+        "tx_sas": tx_sas,
+        "rx_sas": rx_sas,
+        "rx_active": rx_active,
+    }
+
+
+def validate_pre_distsak_lifecycle(inherited, current):
+    """Require the inherited key to remain usable before peer Following."""
+    errors = validate_macsec_sa_lifecycle_sample(current)
+    if current.get("tx_active") != inherited.get("tx_active"):
+        errors.append("active TX key/AN changed before peer Following")
+    inherited_rx = inherited.get("rx_active", set())
+    if not inherited_rx.issubset(current.get("rx_active", set())):
+        errors.append("inherited active RX SA disappeared before peer Following")
+    return errors
+
+
+def validate_macsec_sa_lifecycle_sample(sample):
+    """Reject controlled-port or empty active-SA gaps in one lifecycle poll."""
+    errors = []
+    if not sample.get("port_enabled"):
+        errors.append("APPL_DB controlled port is disabled")
+    tx_active = sample.get("tx_active")
+    if not tx_active or not tx_active[1]:
+        errors.append("active/usable egress SA set is empty")
+    elif tx_active not in sample.get("tx_sas", set()):
+        errors.append("active egress SA is absent from installed TX SAs")
+    if not sample.get("rx_active"):
+        errors.append("active/usable ingress SA set is empty")
+    elif not sample.get("rx_active", set()).issubset(
+            sample.get("rx_sas", set())):
+        errors.append("active ingress SA is absent from installed RX SAs")
+    return errors
+
+
+def validate_make_before_break_samples(
+        inherited, samples, following_index):
+    """Validate sampled MBB lifecycle without requiring observed overlap."""
+    errors = []
+    if not samples:
+        return ["no SA lifecycle samples were captured"]
+    if following_index is None:
+        return ["peer Following boundary was not observed"]
+
+    for index, sample in enumerate(samples):
+        errors.extend(
+            "sample {}: {}".format(index, error)
+            for error in validate_macsec_sa_lifecycle_sample(sample)
+        )
+        if index < following_index:
+            errors.extend(
+                "sample {}: {}".format(index, error)
+                for error in validate_pre_distsak_lifecycle(
+                    inherited, sample)
+            )
+
+    final = samples[-1]
+    if final.get("tx_active") == inherited.get("tx_active"):
+        errors.append("new TX key/AN did not become active after Following")
+    if final.get("rx_active") == inherited.get("rx_active"):
+        errors.append("new RX key/AN did not become active after Following")
+
+    tx_switch_index = next(
+        (
+            index for index, sample in enumerate(samples)
+            if sample.get("tx_active") != inherited.get("tx_active")
+        ),
+        None,
+    )
+    rx_new_index = next(
+        (
+            index for index, sample in enumerate(samples)
+            if sample.get("rx_active") - inherited.get("rx_active", set())
+        ),
+        None,
+    )
+    if (tx_switch_index is not None and rx_new_index is not None
+            and rx_new_index > tx_switch_index):
+        errors.append("new TX became active before new RX was observed")
+
+    old_tx = inherited.get("tx_active")
+    for index, sample in enumerate(samples):
+        if old_tx not in sample.get("tx_sas", set()):
+            if tx_switch_index is None or index < tx_switch_index:
+                errors.append("old TX SA was deleted before new TX activation")
+            break
+
+    old_rx = inherited.get("rx_active", set())
+    for index, sample in enumerate(samples[:following_index]):
+        if not old_rx.issubset(sample.get("rx_sas", set())):
+            errors.append(
+                "old RX SA was deleted before remote TX handoff")
+            break
+    return errors
+
+
+def final_new_key_stable(inherited, previous, current):
+    """Return whether the post-Following key changed and then stabilized."""
+    return (
+        previous is not None
+        and current == previous
+        and current.get("tx_active") != inherited.get("tx_active")
+        and current.get("rx_active") != inherited.get("rx_active")
+        and not validate_macsec_sa_lifecycle_sample(current)
     )
 
 
