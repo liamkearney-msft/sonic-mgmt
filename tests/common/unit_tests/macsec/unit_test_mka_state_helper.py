@@ -119,7 +119,6 @@ def _participant(is_primary, is_principal):
         "mi": "00112233445566778899aabb",
         "mn": "10",
         "active": "true",
-        "participant": "true",
         "retain": "false",
         "is_principal": is_principal,
         "is_primary": is_primary,
@@ -203,13 +202,42 @@ def test_parse_db_hash_rejects_partial_pair():
 
 
 def test_validate_primary_fallback_snapshot():
-    """Accept the protected Controlled Port tuple with primary ownership."""
+    """Accept latest-schema participants without the removed participant field."""
     participants = {
         "aabb": _participant("true", "true"),
         "ccdd": _participant("false", "false"),
     }
     assert validate_mka_snapshot(
         _session(), participants, _profile(), "AABB") == []
+
+
+@pytest.mark.parametrize(
+    "required_field",
+    [
+        "participant_index",
+        "mi",
+        "mn",
+        "active",
+        "retain",
+        "is_principal",
+        "is_primary",
+        "live_peers",
+        "potential_peers",
+        "is_key_server",
+        "is_elected",
+    ],
+)
+def test_validate_snapshot_rejects_missing_required_participant_field(
+        required_field):
+    """Reject latest-schema participant rows missing a required field."""
+    participants = {
+        "aabb": _participant("true", "true"),
+        "ccdd": _participant("false", "false"),
+    }
+    del participants["ccdd"][required_field]
+    errors = validate_mka_snapshot(
+        _session(), participants, _profile(), "AABB")
+    assert "ccdd missing fields: ['{}']".format(required_field) in errors
 
 
 @pytest.mark.parametrize(

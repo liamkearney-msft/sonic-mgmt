@@ -37,7 +37,6 @@ REQUIRED_PARTICIPANT_FIELDS = {
     "mi",
     "mn",
     "active",
-    "participant",
     "retain",
     "is_principal",
     "is_primary",
