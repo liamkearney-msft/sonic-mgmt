@@ -25,6 +25,9 @@ build_mka_log_cursor_command = (
     MKA_STATE_HELPER.build_mka_log_cursor_command
 )
 classify_macsec_teardown = MKA_STATE_HELPER.classify_macsec_teardown
+classify_published_peer_teardown = (
+    MKA_STATE_HELPER.classify_published_peer_teardown
+)
 cleanup_all = MKA_STATE_HELPER.cleanup_all
 crossed_role_peer_key_server_supported = (
     MKA_STATE_HELPER.crossed_role_peer_key_server_supported
@@ -1215,6 +1218,102 @@ def test_get_macsec_teardown_state_reads_port_and_sa_keys():
     }
 
 
+@pytest.mark.parametrize(
+    "session, participants, enable, egress, ingress, controlled, expected",
+    [
+        (
+            {
+                "profile": "temp",
+                "query_status": "error",
+                "config_status": "in-sync",
+                "last_updated": "new",
+                "secured": "false",
+            },
+            {},
+            "false", [], [], False, "publication-pending",
+        ),
+        (
+            {
+                "profile": "temp",
+                "query_status": "ok",
+                "config_status": "in-sync",
+                "last_updated": "new",
+                "secured": "false",
+            },
+            {
+                "a": {"active": "true", "live_peers": "1"},
+                "b": {"active": "true", "live_peers": "0"},
+            },
+            "false", [], [], False, "live-peers-remain",
+        ),
+        (
+            {
+                "profile": "temp",
+                "query_status": "ok",
+                "config_status": "in-sync",
+                "last_updated": "new",
+                "secured": "false",
+            },
+            {
+                "a": {"active": "true", "live_peers": "0"},
+                "b": {"active": "true", "live_peers": "0"},
+            },
+            "true", [], [], True, "controlled-port-propagation",
+        ),
+        (
+            {
+                "profile": "temp",
+                "query_status": "ok",
+                "config_status": "in-sync",
+                "last_updated": "new",
+                "secured": "false",
+            },
+            {
+                "a": {"active": "true", "live_peers": "0"},
+                "b": {"active": "true", "live_peers": "0"},
+            },
+            "false", ["tx"], [], False, "secy-orch-sa-teardown",
+        ),
+        (
+            {
+                "profile": "temp",
+                "query_status": "ok",
+                "config_status": "in-sync",
+                "last_updated": "new",
+                "secured": "false",
+            },
+            {
+                "a": {"active": "true", "live_peers": "0"},
+                "b": {"active": "true", "live_peers": "0"},
+            },
+            "false", [], [], True,
+            "controlled-port-helper-inconsistency",
+        ),
+        (
+            {
+                "profile": "temp",
+                "query_status": "ok",
+                "config_status": "in-sync",
+                "last_updated": "new",
+                "secured": "false",
+            },
+            {
+                "a": {"active": "true", "live_peers": "0"},
+                "b": {"active": "true", "live_peers": "0"},
+            },
+            "false", [], [], False, "complete",
+        ),
+    ],
+)
+def test_classify_published_peer_teardown(
+        session, participants, enable, egress, ingress,
+        controlled, expected):
+    """Classify peer teardown at the first incomplete published layer."""
+    assert classify_published_peer_teardown(
+        session, participants, enable, egress, ingress,
+        controlled, "temp", {"a", "b"}, "old") == expected
+
+
 def test_validate_lifecycle_cleanup_state_requires_fresh_healthy_state():
     """Require fresh query/config/process/controlled-port and exact SC/SAs."""
     session = {
@@ -1306,6 +1405,9 @@ def test_primary_rotation_uses_staged_timing_without_weakening_expiry():
     assert "_wait_peer_actor_then_dut_owner(" in source
     assert "MKA_STATE_PUBLISH_TIMEOUT" in source
     assert "MKA_TRANSITION_CONVERGENCE_TIMEOUT" in source
+    assert "_capture_environment_last_updated(" in source
+    assert "_wait_restored_environment_published(" in source
+    assert '"original primary cleanup"' in source
 
 
 def test_actor_readiness_uses_supported_operational_state():
@@ -1364,6 +1466,9 @@ def test_sonic_both_invalid_uses_temporary_profile_rebind():
     assert "disable_macsec_port(" in source
     assert "enable_macsec_port(" in source
     assert "_sonic_peer_profile_ready" in source
+    assert "_sonic_peer_both_invalid_teardown_ready" in source
+    assert "_sonic_peer_both_invalid_teardown_state" in source
+    assert "cEOS controlled port remained open" in source
 
 
 def test_peer_follow_scopes_stability_before_following_boundary():

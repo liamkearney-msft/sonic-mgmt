@@ -32,6 +32,7 @@ from tests.common.macsec.mka_state_helper import (
     build_mka_log_cursor_command,
     cleanup_all,
     classify_macsec_teardown,
+    classify_published_peer_teardown,
     crossed_role_peer_key_server_supported,
     eos_key_deletion_status,
     eos_key_replacement_status,
@@ -810,6 +811,77 @@ def _wait_final_environment(
     ), "{} did not become healthy within 30 seconds".format(description)
 
 
+def _capture_environment_last_updated(
+        environment, dut_ports=(), peer_ports=()):
+    snapshots = {"dut": {}, "peers": {}}
+    duthost = environment["duthost"]
+    for port in dut_ports:
+        snapshots["dut"][port] = get_mka_state(
+            duthost, port)[0].get("last_updated")
+    for port in peer_ports:
+        neighbor = environment["links"][port]
+        if not isinstance(neighbor["host"], EosHost):
+            snapshots["peers"][port] = get_mka_state(
+                neighbor["host"], neighbor["port"])[0].get(
+                    "last_updated")
+    return snapshots
+
+
+def _restored_environment_published(
+        environment, snapshots, principal_ckn):
+    profile = environment["profile"]
+    duthost = environment["duthost"]
+    for port, neighbor in environment["links"].items():
+        session, participants = get_mka_state(duthost, port)
+        if (
+                port in snapshots["dut"]
+                and not fresh_mka_state_published(
+                    session, snapshots["dut"][port])):
+            return False
+        if validate_mka_snapshot(
+                session, participants, profile, principal_ckn):
+            return False
+
+        if isinstance(neighbor["host"], EosHost):
+            if not _peer_state_is_healthy(
+                    neighbor,
+                    environment["peer_profiles"][port],
+                    environment["neighbor_profiles"][port],
+                    principal_ckn):
+                return False
+        else:
+            peer_session, peer_participants = get_mka_state(
+                neighbor["host"], neighbor["port"])
+            if (
+                    port in snapshots["peers"]
+                    and not fresh_mka_state_published(
+                        peer_session, snapshots["peers"][port])):
+                return False
+            peer_profile = dict(environment["peer_profiles"][port])
+            peer_profile["name"] = environment[
+                "neighbor_profiles"][port]
+            if validate_mka_snapshot(
+                    peer_session, peer_participants,
+                    peer_profile, principal_ckn):
+                return False
+        if (
+                not duthost.iface_macsec_ok(port)
+                or not neighbor["host"].iface_macsec_ok(
+                    neighbor["port"])):
+            return False
+    return True
+
+
+def _wait_restored_environment_published(
+        environment, snapshots, principal_ckn, description):
+    assert wait_until(
+        MKA_STATE_PUBLISH_TIMEOUT, 2, 0,
+        _restored_environment_published,
+        environment, snapshots, principal_ckn,
+    ), "{} did not republish within three status sweeps".format(
+        description)
+
+
 def _wait_final_link(
         environment, port, action_started, principal_ckn,
         description="MKA link"):
@@ -1255,6 +1327,47 @@ def _sonic_peer_profile_ready(
         if config.get(field, "").lower() != expected_profile[field].lower():
             return False
     return True
+
+
+def _sonic_peer_both_invalid_teardown_state(
+        environment, port, profile_name, expected_profile,
+        previous_last_updated):
+    neighbor = environment["links"][port]
+    session, participants = get_mka_state(
+        neighbor["host"], neighbor["port"])
+    state = get_macsec_teardown_state(
+        neighbor["host"], neighbor["port"])
+    expected_ckns = {
+        expected_profile["primary_ckn"].lower(),
+        expected_profile["fallback_ckn"].lower(),
+    }
+    classification = classify_published_peer_teardown(
+        session,
+        participants,
+        state["port_enable"],
+        state["egress_sa_keys"],
+        state["ingress_sa_keys"],
+        neighbor["host"].iface_macsec_ok(neighbor["port"]),
+        profile_name,
+        expected_ckns,
+        previous_last_updated,
+    )
+    return classification, {
+        "session": session,
+        "participants": participants,
+        "appl": state,
+        "controlled_port": neighbor["host"].iface_macsec_ok(
+            neighbor["port"]),
+    }
+
+
+def _sonic_peer_both_invalid_teardown_ready(
+        environment, port, profile_name, expected_profile,
+        previous_last_updated):
+    classification, _ = _sonic_peer_both_invalid_teardown_state(
+        environment, port, profile_name, expected_profile,
+        previous_last_updated)
+    return classification == "complete"
 
 
 def _environment_is_healthy(
@@ -1798,13 +1911,17 @@ def test_primary_failure_rotation_and_recovery_are_hitless(
             _cleanup_traffic(
                 traffic, assert_loss=sys.exc_info()[0] is None)
         finally:
-            cleanup_started = time.monotonic()
+            cleanup_snapshots = _capture_environment_last_updated(
+                environment,
+                dut_ports=(
+                    tuple(environment["links"]) if dut_updated else ()),
+                peer_ports=tuple(updated_neighbors),
+            )
             if dut_updated:
                 _profile_update(
                     duthost, profile["name"], new_cak, new_ckn,
                     old_cak, old_ckn)
             for candidate_port in updated_neighbors:
-                cleanup_started = time.monotonic()
                 _replace_peer_key_and_verify(
                     environment, candidate_port,
                     new_cak, new_ckn, old_cak, old_ckn,
@@ -1812,9 +1929,9 @@ def test_primary_failure_rotation_and_recovery_are_hitless(
                         old_ckn, profile["fallback_ckn"]))
             profile["primary_cak"] = old_cak
             profile["primary_ckn"] = old_ckn
-            _wait_final_environment(
-                environment, selected_port, cleanup_started,
-                description="original primary cleanup")
+            _wait_restored_environment_published(
+                environment, cleanup_snapshots, old_ckn,
+                "original primary cleanup")
 
 
 def test_fallback_rotation_keeps_primary_and_traffic(
@@ -2731,6 +2848,7 @@ def test_both_invalid_tears_down_and_fallback_recovers(
     fallback_updated = False
     sonic_temp_profile = None
     sonic_peer_rebound = False
+    peer_before_rebind = None
     original_peer_profile_name = environment["neighbor_profiles"][port]
     original_peer_profile = dict(environment["peer_profiles"][port])
 
@@ -2761,6 +2879,9 @@ def test_both_invalid_tears_down_and_fallback_recovers(
                 hot_update_failure="skip")
             fallback_updated = True
         else:
+            peer_before_rebind = get_mka_state(
+                neighbor["host"], neighbor["port"])[0].get(
+                    "last_updated")
             sonic_temp_profile = "MKA_BOTH_INVALID_{}".format(
                 neighbor["port"])
             both_invalid_profile = dict(original_peer_profile)
@@ -2794,6 +2915,16 @@ def test_both_invalid_tears_down_and_fallback_recovers(
                 environment, port, sonic_temp_profile,
                 both_invalid_profile, True,
             ), "SONiC peer both-invalid profile did not publish expected state"
+            assert wait_until(
+                MKA_STATE_PUBLISH_TIMEOUT, 2, 0,
+                _sonic_peer_both_invalid_teardown_ready,
+                environment, port, sonic_temp_profile,
+                both_invalid_profile, peer_before_rebind,
+            ), (
+                "SONiC peer controlled-port/SA teardown did not publish: {}"
+            ).format(_sonic_peer_both_invalid_teardown_state(
+                environment, port, sonic_temp_profile,
+                both_invalid_profile, peer_before_rebind))
 
         def _all_dut_peers_expired():
             _, participants = get_mka_state(duthost, port)
@@ -2840,8 +2971,13 @@ def test_both_invalid_tears_down_and_fallback_recovers(
             get_macsec_teardown_state(duthost, port),
             _redacted_diagnostics(environment, port),
         )
-        assert not neighbor["host"].iface_macsec_ok(neighbor["port"]), \
-            "Peer controlled port remained open with both CAKs mismatched"
+        if isinstance(neighbor["host"], EosHost):
+            assert wait_until(
+                _protocol_timeout(environment, port, 4) + 1,
+                1, 0,
+                lambda: not neighbor["host"].iface_macsec_ok(
+                    neighbor["port"]),
+            ), "cEOS controlled port remained open with both CAKs mismatched"
         traffic_results = _selected_link_ping_results(
             environment, upstream_links, port)
         assert not any(traffic_results), (

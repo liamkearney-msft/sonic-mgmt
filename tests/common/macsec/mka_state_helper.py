@@ -978,6 +978,39 @@ def classify_macsec_teardown(
     return "complete"
 
 
+def classify_published_peer_teardown(
+        session, participants, port_enable, egress_sa_keys,
+        ingress_sa_keys, controlled_port, expected_profile,
+        expected_ckns, previous_last_updated):
+    """Classify the first incomplete layer in published peer teardown."""
+    if (
+            session.get("profile") != expected_profile
+            or session.get("query_status") != "ok"
+            or session.get("config_status") != "in-sync"
+            or not session.get("last_updated")
+            or session.get("last_updated") == previous_last_updated):
+        return "publication-pending"
+    if set(participants) != set(expected_ckns):
+        return "participant-set-mismatch"
+    if any(
+            participant.get("active") != "true"
+            for participant in participants.values()):
+        return "participant-inactive"
+    if any(
+            int(participant.get("live_peers", "0")) > 0
+            for participant in participants.values()):
+        return "live-peers-remain"
+    if session.get("secured") != "false":
+        return "published-secured-state"
+    if port_enable != "false":
+        return "controlled-port-propagation"
+    if egress_sa_keys or ingress_sa_keys:
+        return "secy-orch-sa-teardown"
+    if controlled_port:
+        return "controlled-port-helper-inconsistency"
+    return "complete"
+
+
 def validate_lifecycle_cleanup_state(
         session, previous_last_updated, process_ready, controlled_port,
         egress_sc, egress_sas, ingress_scs):
