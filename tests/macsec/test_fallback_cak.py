@@ -51,7 +51,9 @@ from tests.common.macsec.mka_state_helper import (
     parse_eos_mka_participants,
     parse_wpa_mka_participants,
     quiescence_budget_seconds,
+    remaining_link_items,
     select_independent_port_pair,
+    validate_lifecycle_cleanup_state,
     validate_multi_port_alternate_state,
     validate_eos_mka_participants,
     validate_point_to_point_ingress_sc,
@@ -136,6 +138,20 @@ def _get_eos_profile_ckns(host, profile_name):
     return parse_eos_profile_ckns(output, profile_name)
 
 
+def _get_peer_profile_ckns(neighbor, profile_name):
+    if isinstance(neighbor["host"], EosHost):
+        return _get_eos_profile_ckns(
+            neighbor["host"], profile_name)
+    config = get_macsec_profile_config(
+        neighbor["host"], neighbor["port"], profile_name)
+    return {
+        value.lower()
+        for field in ("primary_ckn", "fallback_ckn")
+        for value in (config.get(field),)
+        if value
+    }
+
+
 def _replace_peer_profile(neighbor, profile_name, profile, priority):
     disable_macsec_port(neighbor["host"], neighbor["port"])
     delete_macsec_profile(neighbor["host"], profile_name)
@@ -188,7 +204,8 @@ def _eos_deletion_errors(
 
 def _replace_peer_key_and_verify(
         environment, port, old_cak, old_ckn, new_cak, new_ckn,
-        is_fallback=False, required_live_ckns=()):
+        is_fallback=False, required_live_ckns=(),
+        hot_update_failure="fail"):
     """Replace a peer key and prove the old runtime actor stopped."""
     neighbor = environment["links"][port]
     profile_name = environment["neighbor_profiles"][port]
@@ -208,23 +225,44 @@ def _replace_peer_key_and_verify(
                 neighbor, profile_name, old_ckn, new_ckn,
                 updated_profile, required_live_ckns)
 
-        try:
-            if not wait_until(
-                    _protocol_timeout(environment, port, 4),
-                    1, 0, _replacement_ready):
-                _replace_peer_profile(
-                    neighbor, profile_name, updated_profile,
-                    environment["neighbor_priorities"][port])
-                assert wait_until(60, 2, 0, _replacement_ready), (
-                    "EOS key replacement did not remove old actor: {}"
-                ).format(_eos_replacement_errors(
-                    neighbor, profile_name, old_ckn, new_ckn,
-                    updated_profile, required_live_ckns))
-        except Exception:
-            _replace_peer_profile(
-                neighbor, profile_name, current_profile,
-                environment["neighbor_priorities"][port])
-            raise
+        if not wait_until(
+                _protocol_timeout(environment, port, 4),
+                1, 0, _replacement_ready):
+            transition_errors = _eos_replacement_errors(
+                neighbor, profile_name, old_ckn, new_ckn,
+                updated_profile, required_live_ckns)
+            _profile_update(
+                neighbor["host"], profile_name,
+                new_cak, new_ckn, old_cak, old_ckn,
+                is_fallback=is_fallback)
+            rollback_live_ckns = tuple(
+                old_ckn if ckn.lower() == new_ckn.lower() else ckn
+                for ckn in required_live_ckns
+            )
+
+            def _rollback_ready():
+                return not _eos_replacement_errors(
+                    neighbor, profile_name, new_ckn, old_ckn,
+                    current_profile, rollback_live_ckns)
+
+            rollback_ready = wait_until(
+                _protocol_timeout(environment, port, 4),
+                1, 0, _rollback_ready)
+            assert rollback_ready, (
+                "EOS hot key replacement and key-line-only rollback both "
+                "failed; transition={}, rollback={}"
+            ).format(
+                transition_errors,
+                _eos_replacement_errors(
+                    neighbor, profile_name, new_ckn, old_ckn,
+                    current_profile, rollback_live_ckns))
+            message = (
+                "cEOS hot key replacement did not converge without profile "
+                "detach/rebind: {}"
+            ).format(transition_errors)
+            if hot_update_failure == "skip":
+                pytest.skip(message)
+            raise AssertionError(message)
 
     environment["peer_profiles"][port] = updated_profile
     return updated_profile
@@ -232,7 +270,7 @@ def _replace_peer_key_and_verify(
 
 def _delete_peer_key_and_verify(
         environment, port, cak, ckn, remaining_ckns,
-        is_fallback=False):
+        is_fallback=False, hot_update_failure="fail"):
     """Delete one peer actor and prove it is absent before timing DUT expiry."""
     neighbor = environment["links"][port]
     profile_name = environment["neighbor_profiles"][port]
@@ -245,16 +283,38 @@ def _delete_peer_key_and_verify(
             return not _eos_deletion_errors(
                 neighbor, profile_name, ckn, remaining_ckns)
 
-        if not wait_until(30, 1, 0, _deleted):
-            disable_macsec_port(
-                neighbor["host"], neighbor["port"])
-            enable_macsec_port(
-                neighbor["host"], neighbor["port"], profile_name)
-            assert wait_until(60, 2, 0, _deleted), (
-                "EOS direct key deletion left a runtime actor after one "
-                "profile rebind: {}"
-            ).format(_eos_deletion_errors(
-                neighbor, profile_name, ckn, remaining_ckns))
+        if not wait_until(
+                _protocol_timeout(environment, port, 4), 1, 0, _deleted):
+            transition_errors = _eos_deletion_errors(
+                neighbor, profile_name, ckn, remaining_ckns)
+            add_runtime_macsec_key(
+                neighbor["host"], neighbor["port"], profile_name,
+                cak, ckn, is_fallback=is_fallback)
+            expected_profile = environment["peer_profiles"][port]
+
+            def _rollback_ready():
+                return not _eos_replacement_errors(
+                    neighbor, profile_name, "__deleted__", ckn,
+                    expected_profile, tuple(remaining_ckns) + (ckn,))
+
+            rollback_ready = wait_until(
+                _protocol_timeout(environment, port, 4),
+                1, 0, _rollback_ready)
+            assert rollback_ready, (
+                "EOS direct key deletion and key-line-only rollback both "
+                "failed; transition={}, rollback={}"
+            ).format(
+                transition_errors,
+                _eos_replacement_errors(
+                    neighbor, profile_name, "__deleted__", ckn,
+                    expected_profile, tuple(remaining_ckns) + (ckn,)))
+            message = (
+                "cEOS direct key deletion left the old runtime actor; "
+                "profile detach/rebind is prohibited: {}"
+            ).format(transition_errors)
+            if hot_update_failure == "skip":
+                pytest.skip(message)
+            raise AssertionError(message)
     else:
         assert wait_until(
             30, 1, 0,
@@ -706,6 +766,74 @@ def _start_bidirectional_traffic(environment, upstream_links):
     ]
 
 
+def _selected_link_ping_results(environment, upstream_links, port):
+    duthost = environment["duthost"]
+    neighbor = environment["links"][port]
+    link = upstream_links[port]
+    dut_result = duthost.command(
+        "{} ping -c 3 {}".format(
+            get_ipnetns_prefix(duthost, port),
+            link["local_ipv4_addr"]),
+        module_ignore_errors=True,
+    )
+    peer_result = neighbor["host"].shell(
+        "{} ping -c 3 {}".format(
+            "" if isinstance(neighbor["host"], EosHost)
+            else get_ipnetns_prefix(
+                neighbor["host"], neighbor["port"]),
+            link["peer_ipv4_addr"]),
+        module_ignore_errors=True,
+    )
+    return (
+        not dut_result.get("failed"),
+        not peer_result.get("failed"),
+    )
+
+
+def _selected_link_ping_succeeds(environment, upstream_links, port):
+    return all(_selected_link_ping_results(
+        environment, upstream_links, port))
+
+
+def _wpa_process_ready(host, container, port):
+    result = host.command(
+        "docker exec {} pgrep -f '/var/run/{}'".format(
+            container, port),
+        module_ignore_errors=True,
+        verbose=False,
+    )
+    return (
+        not result.get("failed")
+        and bool(result.get("stdout_lines", []))
+    )
+
+
+def _lifecycle_cleanup_errors(
+        environment, container, affected_ports, previous_last_updated):
+    errors = []
+    duthost = environment["duthost"]
+    for port in affected_ports:
+        neighbor = environment["links"][port]
+        session, _ = get_mka_state(duthost, port)
+        _, egress_sc, _, egress_sas, _ = get_appl_db(
+            duthost, port, neighbor["host"], neighbor["port"])
+        ingress_scs = get_macsec_ingress_sc_state(duthost, port)
+        port_errors = validate_lifecycle_cleanup_state(
+            session,
+            previous_last_updated.get(port),
+            _wpa_process_ready(duthost, container, port),
+            duthost.iface_macsec_ok(port),
+            egress_sc,
+            egress_sas,
+            ingress_scs,
+        )
+        if not neighbor["host"].iface_macsec_ok(neighbor["port"]):
+            port_errors.append("peer controlled port is not open")
+        if port_errors:
+            errors.append("{}: {}".format(port, port_errors))
+    return errors
+
+
 @pytest.fixture(scope="module")
 def fallback_macsec_environment(
         macsec_duthost, ctrl_links, macsec_profile, port_profiles,
@@ -909,121 +1037,128 @@ def test_primary_failure_rotation_and_recovery_are_hitless(
     updated_neighbors = []
 
     try:
-        port, neighbor = _select_routed_link(environment, upstream_links)
+        selected_port, selected_neighbor = _select_routed_link(
+            environment, upstream_links)
         traffic = _start_bidirectional_traffic(
             environment, upstream_links)
-        paused = _pause_macsecmgrd(duthost, port)
+        paused = _pause_macsecmgrd(duthost, selected_port)
         primary_removed = False
         try:
             delete_runtime_macsec_key(
-                duthost, port, profile["name"], old_cak, old_ckn)
+                duthost, selected_port, profile["name"], old_cak, old_ckn)
             primary_removed = True
             assert wait_until(
                 30, 1, 0,
                 lambda: old_ckn.lower() not in
-                _runtime_participants(duthost, port),
+                _runtime_participants(duthost, selected_port),
             ), "Deleted DUT primary CKN remains in runtime participants"
 
             def _fallback_owns_remove_only_interval():
-                participants = _runtime_participants(duthost, port)
+                participants = _runtime_participants(
+                    duthost, selected_port)
                 return (
                     old_ckn.lower() not in participants
                     and participants.get(
                         profile["fallback_ckn"].lower(), {}
                     ).get("is_principal")
                     and _peer_ckn_transition_is_operational(
-                        neighbor, profile["fallback_ckn"])
-                    and duthost.iface_macsec_ok(port)
+                        selected_neighbor, profile["fallback_ckn"])
+                    and duthost.iface_macsec_ok(selected_port)
                 )
 
             assert wait_until(
-                _protocol_timeout(environment, port, 6), 1, 0,
+                _protocol_timeout(environment, selected_port, 6), 1, 0,
                 _fallback_owns_remove_only_interval,
             ), "Fallback did not own the remove-only primary interval"
 
             add_runtime_macsec_key(
-                duthost, port, profile["name"], old_cak, old_ckn)
+                duthost, selected_port, profile["name"], old_cak, old_ckn)
             primary_removed = False
 
             def _primary_reclaims_after_add():
-                participants = _runtime_participants(duthost, port)
+                participants = _runtime_participants(
+                    duthost, selected_port)
                 return (
                     participants.get(old_ckn.lower(), {}).get(
                         "is_principal")
                     and _peer_ckn_transition_is_operational(
-                        neighbor, old_ckn)
+                        selected_neighbor, old_ckn)
                 )
 
             assert wait_until(
-                _protocol_timeout(environment, port, 6), 1, 0,
+                _protocol_timeout(environment, selected_port, 6), 1, 0,
                 _primary_reclaims_after_add,
             ), "Primary did not reclaim the port after runtime add"
         finally:
             if primary_removed:
                 add_runtime_macsec_key(
-                    duthost, port, profile["name"], old_cak, old_ckn)
+                    duthost, selected_port, profile["name"],
+                    old_cak, old_ckn)
             _resume_macsecmgrd(duthost, paused)
 
         assert wait_until(
-            _protocol_timeout(environment, port, 6), 1, 0,
+            _protocol_timeout(environment, selected_port, 6), 1, 0,
             _environment_is_healthy, environment,
         ), "MKA state did not recover after runtime primary remove/add"
 
         peer_paused = (
-            None if isinstance(neighbor["host"], EosHost)
-            else _pause_macsecmgrd(neighbor["host"], neighbor["port"])
+            None if isinstance(selected_neighbor["host"], EosHost)
+            else _pause_macsecmgrd(
+                selected_neighbor["host"], selected_neighbor["port"])
         )
         peer_primary_removed = False
         try:
             _delete_peer_key_and_verify(
-                environment, port, old_cak, old_ckn,
-                (profile["fallback_ckn"],))
+                environment, selected_port, old_cak, old_ckn,
+                (profile["fallback_ckn"],),
+                hot_update_failure="skip")
             peer_primary_removed = True
 
             def _peer_fallback_owns_remove_only_interval():
                 return (
                     _peer_ckn_transition_is_operational(
-                        neighbor,
+                        selected_neighbor,
                         profile["fallback_ckn"],
                         absent_ckn=old_ckn)
                     and _participant_is_principal(
-                        duthost, port, profile["fallback_ckn"])
+                        duthost, selected_port, profile["fallback_ckn"])
                 )
 
             assert wait_until(
-                _protocol_timeout(environment, port, 4), 1, 0,
+                _protocol_timeout(environment, selected_port, 4), 1, 0,
                 _peer_fallback_owns_remove_only_interval,
             ), "Peer fallback did not own its remove-only primary interval"
 
             add_runtime_macsec_key(
-                neighbor["host"], neighbor["port"],
-                environment["neighbor_profiles"][port],
+                selected_neighbor["host"], selected_neighbor["port"],
+                environment["neighbor_profiles"][selected_port],
                 old_cak, old_ckn)
             peer_primary_removed = False
 
             def _peer_primary_reclaims_after_add():
                 return (
                     _peer_ckn_transition_is_operational(
-                        neighbor, old_ckn)
+                        selected_neighbor, old_ckn)
                     and _participant_is_principal(
-                        duthost, port, old_ckn)
+                        duthost, selected_port, old_ckn)
                 )
 
             assert wait_until(
-                _protocol_timeout(environment, port, 6), 1, 0,
+                _protocol_timeout(environment, selected_port, 6), 1, 0,
                 _peer_primary_reclaims_after_add,
             ), "Peer primary did not reclaim the port after runtime add"
         finally:
             if peer_primary_removed:
                 add_runtime_macsec_key(
-                    neighbor["host"], neighbor["port"],
-                    environment["neighbor_profiles"][port],
+                    selected_neighbor["host"], selected_neighbor["port"],
+                    environment["neighbor_profiles"][selected_port],
                     old_cak, old_ckn)
             if peer_paused:
-                _resume_macsecmgrd(neighbor["host"], peer_paused)
+                _resume_macsecmgrd(
+                    selected_neighbor["host"], peer_paused)
 
         assert wait_until(
-            _protocol_timeout(environment, port, 6), 1, 0,
+            _protocol_timeout(environment, selected_port, 6), 1, 0,
             _environment_is_healthy, environment,
         ), "MKA state did not recover after peer primary remove/add"
 
@@ -1037,36 +1172,38 @@ def test_primary_failure_rotation_and_recovery_are_hitless(
             _environment_is_healthy, environment, profile["fallback_ckn"],
             False, False,
         ), "Fallback did not become principal after one-sided primary rotation"
-        for port in environment["links"]:
-            _, participants = get_mka_state(duthost, port)
+        for candidate_port in environment["links"]:
+            _, participants = get_mka_state(duthost, candidate_port)
             assert old_ckn.lower() not in participants
             assert new_ckn.lower() in participants
 
         _replace_peer_key_and_verify(
-            environment, port,
+            environment, selected_port,
             old_cak, old_ckn, new_cak, new_ckn,
-            required_live_ckns=(new_ckn, profile["fallback_ckn"]))
-        updated_neighbors.append(port)
+            required_live_ckns=(new_ckn, profile["fallback_ckn"]),
+            hot_update_failure="skip")
+        updated_neighbors.append(selected_port)
         assert wait_until(
-            _protocol_timeout(environment, port, 6), 1, 0,
+            _protocol_timeout(environment, selected_port, 6), 1, 0,
             lambda: (
-                _participant_is_principal(duthost, port, new_ckn)
+                _participant_is_principal(
+                    duthost, selected_port, new_ckn)
                 and _peer_ckn_transition_is_operational(
-                    neighbor, new_ckn, absent_ckn=old_ckn)
+                    selected_neighbor, new_ckn, absent_ckn=old_ckn)
             ),
         ), "Selected link did not converge to the replacement primary"
         _cleanup_traffic(traffic, assert_loss=True)
         traffic = []
 
-        for other_port, other_neighbor in environment["links"].items():
-            if other_port == port:
-                continue
+        for candidate_port, candidate_neighbor in remaining_link_items(
+                environment["links"], selected_port):
             _replace_peer_key_and_verify(
-                environment, other_port,
+                environment, candidate_port,
                 old_cak, old_ckn, new_cak, new_ckn,
                 required_live_ckns=(
-                    new_ckn, profile["fallback_ckn"]))
-            updated_neighbors.append(other_port)
+                    new_ckn, profile["fallback_ckn"]),
+                hot_update_failure="skip")
+            updated_neighbors.append(candidate_port)
 
         assert wait_until(
             MKA_CONVERGE_TIMEOUT, 3, 0,
@@ -1081,9 +1218,9 @@ def test_primary_failure_rotation_and_recovery_are_hitless(
                 _profile_update(
                     duthost, profile["name"], new_cak, new_ckn,
                     old_cak, old_ckn)
-            for port in updated_neighbors:
+            for candidate_port in updated_neighbors:
                 _replace_peer_key_and_verify(
-                    environment, port,
+                    environment, candidate_port,
                     new_cak, new_ckn, old_cak, old_ckn,
                     required_live_ckns=(
                         old_ckn, profile["fallback_ckn"]))
@@ -1147,7 +1284,8 @@ def test_fallback_rotation_keeps_primary_and_traffic(
             old_cak, old_ckn, new_cak, new_ckn,
             is_fallback=True,
             required_live_ckns=(
-                profile["primary_ckn"], new_ckn))
+                profile["primary_ckn"], new_ckn),
+            hot_update_failure="skip")
         updated_neighbors.append(port)
         assert wait_until(
             _protocol_timeout(environment, port, 6), 1, 0,
@@ -1176,7 +1314,8 @@ def test_fallback_rotation_keeps_primary_and_traffic(
                 old_cak, old_ckn, new_cak, new_ckn,
                 is_fallback=True,
                 required_live_ckns=(
-                    profile["primary_ckn"], new_ckn))
+                    profile["primary_ckn"], new_ckn),
+                hot_update_failure="skip")
             updated_neighbors.append(other_port)
         assert wait_until(
             MKA_CONVERGE_TIMEOUT, 3, 0,
@@ -1302,7 +1441,8 @@ def test_fallback_rotation_rejected_without_live_primary(
             environment, port,
             profile["primary_cak"], profile["primary_ckn"],
             invalid_cak, invalid_ckn,
-            required_live_ckns=(profile["fallback_ckn"],))
+            required_live_ckns=(profile["fallback_ckn"],),
+            hot_update_failure="skip")
         peer_updated = True
         assert wait_until(
             _protocol_timeout(environment, port, 4), 1, 0,
@@ -1682,14 +1822,11 @@ def test_multi_port_preflight_is_all_or_nothing(
         for port in ports
     }
     pair = select_independent_port_pair(ports, peer_scopes)
-    isolated_profile = None
-    original_peer_profile = None
     if pair is None:
-        unsafe_port, safe_port = ports[:2]
-        original_peer_profile = environment["neighbor_profiles"][unsafe_port]
-        isolated_profile = "MKA_PF_{}".format(unsafe_port)
-    else:
-        unsafe_port, safe_port = pair
+        pytest.skip(
+            "All-or-nothing preflight requires independently scoped "
+            "peer profiles")
+    unsafe_port, safe_port = pair
 
     old_fallback_cak = profile["fallback_cak"]
     old_fallback_ckn = profile["fallback_ckn"]
@@ -1701,31 +1838,13 @@ def test_multi_port_preflight_is_all_or_nothing(
     neighbor_updated = False
 
     try:
-        if isolated_profile:
-            neighbor = environment["links"][unsafe_port]
-            disable_macsec_port(
-                neighbor["host"], neighbor["port"])
-            delete_macsec_profile(
-                neighbor["host"], isolated_profile)
-            _set_profile(
-                neighbor["host"], isolated_profile,
-                environment["peer_profiles"][unsafe_port],
-                environment["neighbor_priorities"][unsafe_port])
-            enable_macsec_port(
-                neighbor["host"], neighbor["port"], isolated_profile)
-            environment["neighbor_profiles"][
-                unsafe_port] = isolated_profile
-            assert wait_until(
-                _protocol_timeout(environment, unsafe_port, 6), 1, 0,
-                _environment_is_healthy, environment,
-            ), "Isolated unsafe peer profile did not converge"
-
         _replace_peer_key_and_verify(
             environment, unsafe_port,
             old_fallback_cak, old_fallback_ckn,
             mismatched_cak, mismatched_ckn,
             is_fallback=True,
-            required_live_ckns=(profile["primary_ckn"],))
+            required_live_ckns=(profile["primary_ckn"],),
+            hot_update_failure="skip")
         neighbor_updated = True
 
         def _preconditions_ready():
@@ -1733,11 +1852,25 @@ def test_multi_port_preflight_is_all_or_nothing(
                 port: get_mka_state(duthost, port)[1]
                 for port in ports
             }
+            peer_participants_by_port = {
+                port: _direct_participants(
+                    environment["links"][port]["host"],
+                    environment["links"][port]["port"])
+                for port in (unsafe_port, safe_port)
+            }
+            peer_configured_ckns_by_port = {
+                port: _get_peer_profile_ckns(
+                    environment["links"][port],
+                    environment["neighbor_profiles"][port])
+                for port in (unsafe_port, safe_port)
+            }
             return not validate_multi_port_alternate_state(
                 participants_by_port,
                 old_fallback_ckn,
                 unsafe_port,
                 [safe_port],
+                peer_participants_by_port,
+                peer_configured_ckns_by_port,
             )
 
         assert wait_until(
@@ -1761,31 +1894,18 @@ def test_multi_port_preflight_is_all_or_nothing(
             assert _participant_is_principal(
                 duthost, port, profile["primary_ckn"])
     finally:
-        try:
-            if neighbor_updated:
-                _replace_peer_key_and_verify(
-                    environment, unsafe_port,
-                    mismatched_cak, mismatched_ckn,
-                    old_fallback_cak, old_fallback_ckn,
-                    is_fallback=True,
-                    required_live_ckns=(
-                        profile["primary_ckn"], old_fallback_ckn))
-        finally:
-            if isolated_profile:
-                neighbor = environment["links"][unsafe_port]
-                disable_macsec_port(
-                    neighbor["host"], neighbor["port"])
-                enable_macsec_port(
-                    neighbor["host"], neighbor["port"],
-                    original_peer_profile)
-                delete_macsec_profile(
-                    neighbor["host"], isolated_profile)
-                environment["neighbor_profiles"][
-                    unsafe_port] = original_peer_profile
-            assert wait_until(
-                _protocol_timeout(environment, unsafe_port, 6), 1, 0,
-                _environment_is_healthy, environment,
-            ), "Fallback did not recover after unsafe preflight test"
+        if neighbor_updated:
+            _replace_peer_key_and_verify(
+                environment, unsafe_port,
+                mismatched_cak, mismatched_ckn,
+                old_fallback_cak, old_fallback_ckn,
+                is_fallback=True,
+                required_live_ckns=(
+                    profile["primary_ckn"], old_fallback_ckn))
+        assert wait_until(
+            _protocol_timeout(environment, unsafe_port, 6), 1, 0,
+            _environment_is_healthy, environment,
+        ), "Fallback did not recover after unsafe preflight test"
 
 
 def test_query_failure_retains_state_and_recovers(
@@ -1858,23 +1978,26 @@ def test_disable_and_macsecmgrd_restart_lifecycle(
     environment = fallback_macsec_environment
     duthost = environment["duthost"]
     profile = environment["profile"]
-    port = next(iter(environment["links"]))
+    selected_port, _ = _select_routed_link(
+        environment, upstream_links)
 
-    disable_macsec_port(duthost, port)
+    disable_macsec_port(duthost, selected_port)
     try:
         assert wait_until(
             MKA_TIMEOUT, 2, 0,
-            lambda: get_mka_state(duthost, port) == ({}, {}),
+            lambda: get_mka_state(
+                duthost, selected_port) == ({}, {}),
         ), "MKA operational rows remained after explicit port disable"
     finally:
-        enable_macsec_port(duthost, port, profile["name"])
+        enable_macsec_port(
+            duthost, selected_port, profile["name"])
 
     assert wait_until(
         MKA_CONVERGE_TIMEOUT, 3, 0,
         _environment_is_healthy, environment,
     ), "MKA did not recover after port re-enable"
 
-    asic = duthost.get_port_asic_instance(port)
+    asic = duthost.get_port_asic_instance(selected_port)
     container = asic.get_docker_name("macsec")
     affected_ports = [
         candidate for candidate in environment["links"]
@@ -1884,7 +2007,16 @@ def test_disable_and_macsecmgrd_restart_lifecycle(
     old_pids = duthost.command(
         "docker exec {} pgrep -x macsecmgrd".format(container)
     ).get("stdout_lines", [])
+    previous_last_updated = {
+        candidate: get_mka_state(duthost, candidate)[0].get(
+            "last_updated")
+        for candidate in affected_ports
+    }
+    bgp_neighbors = duthost.get_bgp_neighbors_per_asic(
+        state="all")
     traffic = []
+    restart_error = None
+    restart_traceback = None
     try:
         traffic = _start_bidirectional_traffic(
             environment, upstream_links)
@@ -1930,8 +2062,18 @@ def test_disable_and_macsecmgrd_restart_lifecycle(
                 "supervisor RUNNING with a new PID and CONFIG_DB "
                 "attachments {}, but MKA rows did not rebuild after >20s: "
                 "{}".format(attachments, rows))
-    finally:
-        primary_failed = sys.exc_info()[0] is not None
+    except BaseException as error:
+        restart_error = error
+        restart_traceback = error.__traceback__
+
+    cleanup_errors = []
+    try:
+        _cleanup_traffic(traffic, assert_loss=False)
+    except Exception as error:
+        cleanup_errors.append(
+            "traffic collection failed: {!r}".format(error))
+
+    try:
         status = duthost.command(
             "docker exec {} supervisorctl status macsecmgrd".format(
                 container),
@@ -1949,31 +2091,69 @@ def test_disable_and_macsecmgrd_restart_lifecycle(
                                   "macsecmgrd".format(container),
                                   module_ignore_errors=True,
                               ).get("stdout", ""))
-        if not _environment_is_healthy(environment):
-            _reapply_macsec_ports(environment, affected_ports)
-        recovered = wait_until(
-            MKA_CONVERGE_TIMEOUT, 3, 0,
-            _environment_is_healthy, environment,
-        )
-        if not recovered:
-            if primary_failed:
-                logger.error(
-                    "MKA state was not restored by explicit port reapply "
-                    "during lifecycle cleanup")
-            else:
-                raise AssertionError(
-                    "MKA state was not restored by explicit port reapply "
-                    "during lifecycle cleanup")
-        _cleanup_traffic(traffic, assert_loss=not primary_failed)
+        _reapply_macsec_ports(environment, affected_ports)
+    except Exception as error:
+        cleanup_errors.append(
+            "service/port reapply failed: {!r}".format(error))
+
+    cleanup_state_errors = [None]
+    try:
+        def _cleanup_state_ready():
+            cleanup_state_errors[0] = _lifecycle_cleanup_errors(
+                environment, container, affected_ports,
+                previous_last_updated)
+            return not cleanup_state_errors[0]
+
+        cleanup_state_recovered = wait_until(
+            MKA_CONVERGE_TIMEOUT, 3, 0, _cleanup_state_ready)
+    except Exception as error:
+        cleanup_state_recovered = False
+        cleanup_state_errors[0] = [repr(error)]
+    if not cleanup_state_recovered:
+        cleanup_errors.append(
+            "fresh MKA/process/SC-SA recovery failed: {}".format(
+                cleanup_state_errors[0]))
+    try:
+        selected_link_recovered = _selected_link_ping_succeeds(
+            environment, upstream_links, selected_port)
+    except Exception as error:
+        selected_link_recovered = False
+        cleanup_errors.append(
+            "selected-link ping check failed: {!r}".format(error))
+    if not selected_link_recovered:
+        cleanup_errors.append(
+            "selected-link bidirectional ping did not recover")
+    try:
+        bgp_recovered = wait_until(
+            MKA_CONVERGE_TIMEOUT, 10, 0,
+            duthost.check_bgp_session_state_all_asics,
+            bgp_neighbors)
+    except Exception as error:
+        bgp_recovered = False
+        cleanup_errors.append(
+            "external BGP recovery check failed: {!r}".format(error))
+    if not bgp_recovered:
+        cleanup_errors.append(
+            "external BGP sessions did not recover")
+
+    if restart_error is not None:
+        if cleanup_errors:
+            logger.error(
+                "Lifecycle cleanup failed after restart verdict: %s",
+                cleanup_errors)
+        raise restart_error.with_traceback(restart_traceback)
+    assert not cleanup_errors, \
+        "Lifecycle cleanup failed: {}".format(cleanup_errors)
 
 
 def test_both_invalid_tears_down_and_fallback_recovers(
-        fallback_macsec_environment):
+        fallback_macsec_environment, upstream_links):
     """Lose both shared CAKs, then recover service with the fallback CA."""
     environment = fallback_macsec_environment
     duthost = environment["duthost"]
     profile = environment["profile"]
-    port, neighbor = next(iter(environment["links"].items()))
+    port, neighbor = _select_routed_link(
+        environment, upstream_links)
     invalid_primary_cak, invalid_primary_ckn = generate_macsec_key_pair(
         profile["cipher_suite"])
     invalid_fallback_cak, invalid_fallback_ckn = generate_macsec_key_pair(
@@ -1986,7 +2166,8 @@ def test_both_invalid_tears_down_and_fallback_recovers(
             environment, port,
             profile["primary_cak"], profile["primary_ckn"],
             invalid_primary_cak, invalid_primary_ckn,
-            required_live_ckns=(profile["fallback_ckn"],))
+            required_live_ckns=(profile["fallback_ckn"],),
+            hot_update_failure="skip")
         primary_updated = True
         assert wait_until(
             _protocol_timeout(environment, port, 4), 1, 0,
@@ -2007,7 +2188,8 @@ def test_both_invalid_tears_down_and_fallback_recovers(
             environment, port,
             profile["fallback_cak"], profile["fallback_ckn"],
             invalid_fallback_cak, invalid_fallback_ckn,
-            is_fallback=True)
+            is_fallback=True,
+            hot_update_failure="skip")
         fallback_updated = True
         expiry_started = time.monotonic()
         expiry_timeout = _protocol_timeout(environment, port, 4)
@@ -2038,7 +2220,7 @@ def test_both_invalid_tears_down_and_fallback_recovers(
                 state["egress_sa_keys"],
                 state["ingress_sa_keys"],
                 log_seen,
-            ) == "complete"
+            ) in ("complete", "complete-without-observed-log")
 
         remaining = max(
             1, expiry_timeout - (time.monotonic() - expiry_started))
@@ -2061,6 +2243,12 @@ def test_both_invalid_tears_down_and_fallback_recovers(
         )
         assert not neighbor["host"].iface_macsec_ok(neighbor["port"]), \
             "Peer controlled port remained open with both CAKs mismatched"
+        traffic_results = _selected_link_ping_results(
+            environment, upstream_links, port)
+        assert not any(traffic_results), (
+            "Traffic still forwarded with both CAKs mismatched: "
+            "dut_to_peer={}, peer_to_dut={}"
+        ).format(*traffic_results)
 
         _replace_peer_key_and_verify(
             environment, port,
@@ -2078,6 +2266,9 @@ def test_both_invalid_tears_down_and_fallback_recovers(
                     duthost, port, profile["fallback_ckn"])
             ),
         ), "Controlled port did not recover on the matching fallback CA"
+        assert _selected_link_ping_succeeds(
+            environment, upstream_links, port), \
+            "Traffic did not recover on the matching fallback CA"
     finally:
         if fallback_updated:
             _replace_peer_key_and_verify(

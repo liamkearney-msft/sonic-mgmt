@@ -1,3 +1,4 @@
+import ast
 import importlib.util
 from pathlib import Path
 
@@ -6,6 +7,9 @@ import pytest
 
 HELPER_PATH = (
     Path(__file__).resolve().parents[2] / "macsec" / "mka_state_helper.py"
+)
+FALLBACK_TEST_PATH = (
+    Path(__file__).resolve().parents[3] / "macsec" / "test_fallback_cak.py"
 )
 SPEC = importlib.util.spec_from_file_location("mka_state_helper", HELPER_PATH)
 MKA_STATE_HELPER = importlib.util.module_from_spec(SPEC)
@@ -35,6 +39,7 @@ parse_eos_profile_ckns = MKA_STATE_HELPER.parse_eos_profile_ckns
 parse_eos_mka_participants = MKA_STATE_HELPER.parse_eos_mka_participants
 parse_wpa_mka_participants = MKA_STATE_HELPER.parse_wpa_mka_participants
 quiescence_budget_seconds = MKA_STATE_HELPER.quiescence_budget_seconds
+remaining_link_items = MKA_STATE_HELPER.remaining_link_items
 select_independent_port_pair = MKA_STATE_HELPER.select_independent_port_pair
 validate_multi_port_alternate_state = (
     MKA_STATE_HELPER.validate_multi_port_alternate_state
@@ -46,6 +51,9 @@ validate_point_to_point_ingress_sc = (
     MKA_STATE_HELPER.validate_point_to_point_ingress_sc
 )
 validate_mka_snapshot = MKA_STATE_HELPER.validate_mka_snapshot
+validate_lifecycle_cleanup_state = (
+    MKA_STATE_HELPER.validate_lifecycle_cleanup_state
+)
 
 
 class _FakeHost:
@@ -614,7 +622,7 @@ def test_mka_hello_timeout_rejects_malformed(value):
 
 
 def test_eos_key_replacement_status_and_rebind_decision():
-    """Require new config/runtime CKN and old actor absence before expiry."""
+    """Require new config/runtime CKN and old actor absence after hot update."""
     participants = {
         "new": {
             "success": False, "active": False, "failed": False,
@@ -666,22 +674,70 @@ def test_select_independent_port_pair_rejects_shared_profile_scope():
         ports[:2], scopes) is None
 
 
+def test_selected_link_identity_survives_reconciliation_iteration():
+    """Keep selected DUT/peer identity separate from remaining-link loops."""
+    selected_neighbor = object()
+    links = {
+        "Ethernet0": selected_neighbor,
+        "Ethernet4": object(),
+        "Ethernet8": object(),
+    }
+    remaining = remaining_link_items(links, "Ethernet0")
+    assert [port for port, _ in remaining] == ["Ethernet4", "Ethernet8"]
+    assert links["Ethernet0"] is selected_neighbor
+
+
 def test_multi_port_preconditions_are_independent():
     """Require unsafe alternate down and every safe alternate active/live."""
     states = {
-        "Ethernet0": {"ccdd": {"active": "false", "live_peers": "0"}},
-        "Ethernet4": {"ccdd": {"active": "true", "live_peers": "1"}},
+        "Ethernet0": {
+            "ccdd": {
+                "active": "true",
+                "success": "true",
+                "live_peers": "0",
+            },
+        },
+        "Ethernet4": {
+            "ccdd": {
+                "active": "true",
+                "success": "true",
+                "live_peers": "1",
+            },
+        },
+    }
+    peer_states = {
+        "Ethernet0": {},
+        "Ethernet4": {
+            "ccdd": {
+                "active": True,
+                "success": True,
+                "live_peers": 1,
+            },
+        },
+    }
+    configured_ckns = {
+        "Ethernet0": {"mismatch"},
+        "Ethernet4": {"ccdd"},
     }
     assert validate_multi_port_alternate_state(
-        states, "CCDD", "Ethernet0", ["Ethernet4"]) == []
+        states, "CCDD", "Ethernet0", ["Ethernet4"],
+        peer_states, configured_ckns) == []
+    peer_states["Ethernet4"]["ccdd"]["success"] = False
+    assert "Ethernet4 peer alternate is not successful" in \
+        validate_multi_port_alternate_state(
+            states, "CCDD", "Ethernet0", ["Ethernet4"],
+            peer_states, configured_ckns)
+    peer_states["Ethernet4"]["ccdd"]["success"] = True
     states["Ethernet4"]["ccdd"]["live_peers"] = "0"
     assert "Ethernet4 alternate has no live peer" in \
         validate_multi_port_alternate_state(
-            states, "CCDD", "Ethernet0", ["Ethernet4"])
-    states["Ethernet0"]["ccdd"]["active"] = "true"
-    assert "Ethernet0 alternate remains active" in \
+            states, "CCDD", "Ethernet0", ["Ethernet4"],
+            peer_states, configured_ckns)
+    states["Ethernet0"]["ccdd"]["live_peers"] = "1"
+    assert "Ethernet0 alternate retains a live peer" in \
         validate_multi_port_alternate_state(
-            states, "CCDD", "Ethernet0", ["Ethernet4"])
+            states, "CCDD", "Ethernet0", ["Ethernet4"],
+            peer_states, configured_ckns)
 
 
 @pytest.mark.parametrize(
@@ -716,11 +772,13 @@ def test_quiescence_budget_includes_measured_snapshot_cost():
         ({"a": {"live_peers": "1"}}, "true", ["tx"], ["rx"], False,
          "live-peers-remain"),
         ({"a": {"live_peers": "0"}}, "true", ["tx"], ["rx"], False,
-         "missing-wpa-teardown"),
+         "controlled-port-propagation"),
         ({"a": {"live_peers": "0"}}, "true", ["tx"], ["rx"], True,
          "controlled-port-propagation"),
         ({"a": {"live_peers": "0"}}, "false", ["tx"], [], True,
          "secy-orch-sa-teardown"),
+        ({"a": {"live_peers": "0"}}, "false", [], [], False,
+         "complete-without-observed-log"),
         ({"a": {"live_peers": "0"}}, "false", [], [], True, "complete"),
     ],
 )
@@ -751,6 +809,89 @@ def test_get_macsec_teardown_state_reads_port_and_sa_keys():
         "egress_sa_keys": ["MACSEC_EGRESS_SA_TABLE:Ethernet0:0"],
         "ingress_sa_keys": [],
     }
+
+
+def test_validate_lifecycle_cleanup_state_requires_fresh_healthy_state():
+    """Require fresh query/config/process/controlled-port and exact SC/SAs."""
+    session = {
+        "query_status": "ok",
+        "config_status": "in-sync",
+        "last_updated": "new",
+    }
+    ingress = [{
+        "sci": "peer",
+        "key": "MACSEC_INGRESS_SC_TABLE:Ethernet0:peer",
+        "sas": {0: {"active": "true", "sak": "secret"}},
+    }]
+    assert validate_lifecycle_cleanup_state(
+        session, "old", True, True,
+        {"encoding_an": "0"},
+        {0: {"sak": "secret"}},
+        ingress,
+    ) == []
+    errors = validate_lifecycle_cleanup_state(
+        dict(session, query_status="error", last_updated="old"),
+        "old", False, False, {}, {}, [])
+    assert "query_status is not ok" in errors
+    assert "last_updated did not refresh" in errors
+    assert "wpa_supplicant process is not healthy" in errors
+    assert "controlled port is not open" in errors
+    assert "egress SC is missing" in errors
+
+
+def _function_calls(path, function_name):
+    tree = ast.parse(path.read_text())
+    function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == function_name
+    )
+    calls = set()
+    for node in ast.walk(function):
+        if not isinstance(node, ast.Call):
+            continue
+        if isinstance(node.func, ast.Name):
+            calls.add(node.func.id)
+        elif isinstance(node.func, ast.Attribute):
+            calls.add(node.func.attr)
+    return calls
+
+
+def _function_source(path, function_name):
+    source = path.read_text()
+    tree = ast.parse(source)
+    function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == function_name
+    )
+    return ast.get_source_segment(source, function)
+
+
+@pytest.mark.parametrize(
+    "function_name",
+    ["_replace_peer_key_and_verify", "_delete_peer_key_and_verify"],
+)
+def test_eos_hot_update_helpers_never_detach_profiles(function_name):
+    """Keep hitless EOS updates strictly key-line-only."""
+    calls = _function_calls(FALLBACK_TEST_PATH, function_name)
+    assert not calls.intersection({
+        "_replace_peer_profile",
+        "disable_macsec_port",
+        "enable_macsec_port",
+        "delete_macsec_profile",
+    })
+
+
+def test_primary_rotation_preserves_selected_link_names():
+    """Prevent reconciliation loops from overwriting selected link identity."""
+    source = _function_source(
+        FALLBACK_TEST_PATH,
+        "test_primary_failure_rotation_and_recovery_are_hitless")
+    assert "selected_port, selected_neighbor = _select_routed_link" in source
+    assert "for candidate_port in environment[\"links\"]" in source
+    assert "remaining_link_items(" in source
+    assert "for port in environment[\"links\"]" not in source
 
 
 def test_cleanup_all_runs_every_cleanup_before_raising():

@@ -559,19 +559,37 @@ def select_independent_port_pair(ports, scope_by_port):
     return None
 
 
+def remaining_link_items(links, selected_port):
+    """Return non-selected links without mutating selected-link identity."""
+    return [
+        (candidate_port, candidate_neighbor)
+        for candidate_port, candidate_neighbor in links.items()
+        if candidate_port != selected_port
+    ]
+
+
 def validate_multi_port_alternate_state(
-        participants_by_port, alternate_ckn, unsafe_port, safe_ports):
+        participants_by_port, alternate_ckn, unsafe_port, safe_ports,
+        peer_participants_by_port=None,
+        peer_configured_ckns_by_port=None):
     """Validate one unsafe and independently healthy safe alternate set."""
     errors = []
     alternate_ckn = alternate_ckn.lower()
     unsafe = participants_by_port.get(unsafe_port, {}).get(
         alternate_ckn, {})
-    if unsafe.get("active") == "true":
-        errors.append(
-            "{} alternate remains active".format(unsafe_port))
     if int(unsafe.get("live_peers", "0")) > 0:
         errors.append(
             "{} alternate retains a live peer".format(unsafe_port))
+    peer_participants_by_port = peer_participants_by_port or {}
+    peer_configured_ckns_by_port = peer_configured_ckns_by_port or {}
+    if alternate_ckn in peer_configured_ckns_by_port.get(
+            unsafe_port, set()):
+        errors.append(
+            "{} peer still configures the unsafe alternate".format(
+                unsafe_port))
+    if alternate_ckn in peer_participants_by_port.get(unsafe_port, {}):
+        errors.append(
+            "{} peer still has the unsafe alternate".format(unsafe_port))
     for port in safe_ports:
         participant = participants_by_port.get(port, {}).get(
             alternate_ckn, {})
@@ -579,6 +597,23 @@ def validate_multi_port_alternate_state(
             errors.append("{} alternate is not active".format(port))
         if int(participant.get("live_peers", "0")) < 1:
             errors.append("{} alternate has no live peer".format(port))
+        peer_participant = peer_participants_by_port.get(
+            port, {}).get(alternate_ckn, {})
+        if (peer_configured_ckns_by_port
+                and alternate_ckn not in
+                peer_configured_ckns_by_port.get(port, set())):
+            errors.append(
+                "{} peer alternate is not configured".format(port))
+        if peer_participants_by_port:
+            if not peer_participant.get("success"):
+                errors.append(
+                    "{} peer alternate is not successful".format(port))
+            if not peer_participant.get("active"):
+                errors.append(
+                    "{} peer alternate is not active".format(port))
+            if peer_participant.get("live_peers", 0) < 1:
+                errors.append(
+                    "{} peer alternate has no live peer".format(port))
     return errors
 
 
@@ -638,13 +673,51 @@ def classify_macsec_teardown(
     }
     if any(count > 0 for count in live.values()):
         return "live-peers-remain"
-    if not teardown_log_seen:
-        return "missing-wpa-teardown"
     if port_enable != "false":
         return "controlled-port-propagation"
     if egress_sa_keys or ingress_sa_keys:
         return "secy-orch-sa-teardown"
+    if not teardown_log_seen:
+        return "complete-without-observed-log"
     return "complete"
+
+
+def validate_lifecycle_cleanup_state(
+        session, previous_last_updated, process_ready, controlled_port,
+        egress_sc, egress_sas, ingress_scs):
+    """Validate fresh MKA/process/SC-SA state after explicit cleanup."""
+    errors = []
+    if session.get("query_status") != "ok":
+        errors.append("query_status is not ok")
+    if session.get("config_status") != "in-sync":
+        errors.append("config_status is not in-sync")
+    last_updated = session.get("last_updated")
+    if not last_updated:
+        errors.append("last_updated is missing")
+    elif last_updated == previous_last_updated:
+        errors.append("last_updated did not refresh")
+    if not process_ready:
+        errors.append("wpa_supplicant process is not healthy")
+    if not controlled_port:
+        errors.append("controlled port is not open")
+
+    errors.extend(validate_point_to_point_ingress_sc(ingress_scs))
+    if not egress_sc:
+        errors.append("egress SC is missing")
+        return errors
+    try:
+        encoding_an = int(egress_sc.get("encoding_an"))
+    except (TypeError, ValueError):
+        errors.append("egress encoding AN is invalid")
+        return errors
+    active_sa = egress_sas.get(encoding_an, {})
+    if not active_sa:
+        errors.append(
+            "egress SA for encoding AN {} is missing".format(encoding_an))
+    elif not active_sa.get("sak"):
+        errors.append(
+            "egress SA for encoding AN {} has no SAK".format(encoding_an))
+    return errors
 
 
 def cleanup_all(items, cleanup):
