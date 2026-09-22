@@ -880,6 +880,28 @@ def test_make_before_break_allows_overlap_or_collapsed_publication():
         inherited, [inherited, new], 1) == []
 
 
+def test_make_before_break_allows_cross_source_rx_publication_lag():
+    """Do not infer TX-before-RX failure from asynchronous sampled sources."""
+    inherited = _sa_lifecycle()
+    tx_switched_before_rx_publication = _sa_lifecycle(
+        tx_active=("2", "new-tx"),
+        tx_sas={("1", "old-tx"), ("2", "new-tx")},
+        rx_active={("peer", "1", "old-rx")},
+        rx_sas={("peer", "1", "old-rx")},
+    )
+    final = _sa_lifecycle(
+        tx_active=("2", "new-tx"),
+        tx_sas={("2", "new-tx")},
+        rx_active={("peer", "2", "new-rx")},
+        rx_sas={("peer", "2", "new-rx")},
+    )
+    assert validate_make_before_break_generations(
+        inherited,
+        [inherited, tx_switched_before_rx_publication, final],
+        1,
+    ) == []
+
+
 def test_make_before_break_accepts_multiple_key_generations():
     """Validate deferred AN1 then AN2 handoffs generation by generation."""
     inherited = _sa_lifecycle()

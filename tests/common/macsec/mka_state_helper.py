@@ -764,19 +764,6 @@ def validate_make_before_break_generations(
             errors.append(
                 "sample {}: new TX is not installed".format(index))
 
-        new_rx = (
-            sample.get("rx_active", set())
-            - generation.get("rx_active", set())
-        )
-        prior_new_rx = (
-            previous_sample.get("rx_active", set())
-            - generation.get("rx_active", set())
-        )
-        if not new_rx and not prior_new_rx:
-            errors.append(
-                "sample {}: new TX became active before new RX "
-                "was observed".format(index))
-
         if (old_tx not in previous_sample.get("tx_sas", set())
                 and previous_sample.get("tx_active") == old_tx):
             errors.append(
