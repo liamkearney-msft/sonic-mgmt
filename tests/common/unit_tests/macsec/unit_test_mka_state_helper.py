@@ -21,6 +21,9 @@ active_key_state = MKA_STATE_HELPER.active_key_state
 bounded_transition_stage_timeout = (
     MKA_STATE_HELPER.bounded_transition_stage_timeout
 )
+build_mka_log_cursor_command = (
+    MKA_STATE_HELPER.build_mka_log_cursor_command
+)
 classify_macsec_teardown = MKA_STATE_HELPER.classify_macsec_teardown
 cleanup_all = MKA_STATE_HELPER.cleanup_all
 crossed_role_peer_key_server_supported = (
@@ -39,7 +42,9 @@ macsecmgrd_restart_ready = MKA_STATE_HELPER.macsecmgrd_restart_ready
 macsecmgrd_restart_command = MKA_STATE_HELPER.macsecmgrd_restart_command
 macsec_sa_lifecycle_sample = MKA_STATE_HELPER.macsec_sa_lifecycle_sample
 mka_hello_timeout_seconds = MKA_STATE_HELPER.mka_hello_timeout_seconds
+mka_following_marker_seen = MKA_STATE_HELPER.mka_following_marker_seen
 parse_db_hash = MKA_STATE_HELPER.parse_db_hash
+parse_mka_log_cursor = MKA_STATE_HELPER.parse_mka_log_cursor
 parse_eos_profile_ckns = MKA_STATE_HELPER.parse_eos_profile_ckns
 parse_eos_mka_participants = MKA_STATE_HELPER.parse_eos_mka_participants
 parse_wpa_mka_participants = MKA_STATE_HELPER.parse_wpa_mka_participants
@@ -63,11 +68,17 @@ validate_lifecycle_cleanup_state = (
     MKA_STATE_HELPER.validate_lifecycle_cleanup_state
 )
 validate_direct_actor_state = MKA_STATE_HELPER.validate_direct_actor_state
+validate_direct_fallback_takeover = (
+    MKA_STATE_HELPER.validate_direct_fallback_takeover
+)
 validate_macsec_sa_lifecycle_sample = (
     MKA_STATE_HELPER.validate_macsec_sa_lifecycle_sample
 )
 validate_make_before_break_samples = (
     MKA_STATE_HELPER.validate_make_before_break_samples
+)
+validate_make_before_break_generations = (
+    MKA_STATE_HELPER.validate_make_before_break_generations
 )
 validate_pre_distsak_lifecycle = (
     MKA_STATE_HELPER.validate_pre_distsak_lifecycle
@@ -684,6 +695,26 @@ def test_transition_stages_keep_protocol_bounds_and_overall_ceiling():
         action_started=100, now=131) == 0
 
 
+def test_following_log_cursor_is_rotation_aware_and_case_insensitive():
+    """Read only post-action logs and match the verified Following marker."""
+    cursor = parse_mka_log_cursor(
+        "123 456 789", "macsec0")
+    assert cursor == {
+        "container": "macsec0",
+        "syslog_inode": "123",
+        "syslog_size": 456,
+        "epoch": 789,
+    }
+    command = build_mka_log_cursor_command(cursor)
+    assert "tail -c +457 /var/log/syslog" in command
+    assert "/var/log/syslog.1 /var/log/syslog" in command
+    assert "docker logs --since 789 macsec0" in command
+    assert mka_following_marker_seen(
+        "KaY: Following key server onto CKN AABB", "aabb")
+    assert not mka_following_marker_seen(
+        "KaY: Following key server onto CKN CCDD", "aabb")
+
+
 def test_direct_actor_readiness_requires_authoritative_role_tuple():
     """Require active/live/primary/principal/key-server/elected direct state."""
     participants = {
@@ -705,6 +736,31 @@ def test_direct_actor_readiness_requires_authoritative_role_tuple():
     participants["primary"]["is_key_server"] = False
     assert validate_direct_actor_state(
         participants, "primary", True, True, False, True) == []
+
+
+def test_direct_wpa_fallback_takeover_tuple_is_strict():
+    """Accept authoritative fallback ownership while rejecting stale primary."""
+    participants = {
+        "primary": {
+            "active": True,
+            "live_peers": 0,
+            "is_principal": False,
+        },
+        "fallback": {
+            "active": True,
+            "live_peers": 1,
+            "is_primary": False,
+            "is_principal": True,
+            "is_key_server": True,
+            "is_elected": True,
+        },
+    }
+    assert validate_direct_fallback_takeover(
+        participants, "primary", "fallback") == []
+    participants["primary"]["live_peers"] = 1
+    assert "primary retains a live peer" in \
+        validate_direct_fallback_takeover(
+            participants, "primary", "fallback")
 
 
 def test_fresh_state_publication_is_separate_from_runtime_readiness():
@@ -803,6 +859,35 @@ def test_make_before_break_allows_overlap_or_collapsed_publication():
         inherited, [inherited, new], 1) == []
 
 
+def test_make_before_break_accepts_multiple_key_generations():
+    """Validate deferred AN1 then AN2 handoffs generation by generation."""
+    inherited = _sa_lifecycle()
+    generation_one = _sa_lifecycle(
+        tx_active=("2", "tx-one"),
+        tx_sas={("1", "old-tx"), ("2", "tx-one")},
+        rx_active={("peer", "2", "rx-one")},
+        rx_sas={
+            ("peer", "1", "old-rx"),
+            ("peer", "2", "rx-one"),
+        },
+    )
+    generation_two = _sa_lifecycle(
+        tx_active=("3", "tx-two"),
+        tx_sas={("2", "tx-one"), ("3", "tx-two")},
+        rx_active={("peer", "3", "rx-two")},
+        rx_sas={
+            ("peer", "2", "rx-one"),
+            ("peer", "3", "rx-two"),
+        },
+    )
+    assert validate_make_before_break_generations(
+        inherited,
+        [inherited, generation_one, generation_one,
+         generation_two, generation_two],
+        1,
+    ) == []
+
+
 def test_make_before_break_rejects_old_sa_early_deletion():
     """Reject old TX/RX deletion before the new handoff boundary."""
     inherited = _sa_lifecycle()
@@ -821,7 +906,9 @@ def test_make_before_break_rejects_old_sa_early_deletion():
     errors = validate_make_before_break_samples(
         inherited, [broken, new], 1)
     assert any("before peer Following" in error for error in errors)
-    assert "old TX SA was deleted before new TX activation" in errors
+    assert any(
+        "old TX SA was deleted before new TX activation" in error
+        for error in errors)
     assert "old RX SA was deleted before remote TX handoff" in errors
 
 
@@ -1190,9 +1277,44 @@ def test_peer_follow_scopes_stability_before_following_boundary():
     """Allow a new key after Following while validating pre-edge MBB state."""
     source = _function_source(FALLBACK_TEST_PATH, "_wait_peer_follow")
     assert "validate_pre_distsak_lifecycle(" in source
-    assert "validate_make_before_break_samples(" in source
+    assert "validate_make_before_break_generations(" in source
     assert "final_new_key_stable(" in source
     assert "stable_active_key_during_asymmetry(" not in source
+
+
+def test_peer_follow_splits_action_and_post_follow_windows():
+    """Start a separate stability window after Following at the action edge."""
+    source = _function_source(FALLBACK_TEST_PATH, "_wait_peer_follow")
+    assert "action_deadline" in source
+    assert "MKA_POST_FOLLOW_STABILITY_TIMEOUT" in source
+    assert "_following_primary_seen(" in source
+    assert "following_seen or (peer_ready and key_changed)" in source
+
+
+def test_mismatch_uses_direct_takeover_then_publication():
+    """Judge expiry from direct WPA and require STATE_DB separately."""
+    source = _function_source(
+        FALLBACK_TEST_PATH,
+        "test_fallback_rotation_rejected_without_live_primary")
+    assert "_direct_dut_fallback_takeover_ready" in source
+    assert "_published_fallback_takeover_ready" in source
+    assert "_restore_and_verify_peer_cleanup" in source
+    assert "raise body_error.with_traceback(body_traceback)" in source
+
+
+def test_peer_cleanup_branches_by_host_type():
+    """Keep cEOS free of STATE_DB waits and SONiC destructively restored."""
+    source = _function_source(
+        FALLBACK_TEST_PATH, "_restore_and_verify_peer_cleanup")
+    eos_branch, sonic_branch = source.split("else:", 1)
+    assert "_replace_peer_profile(" in eos_branch
+    assert "get_mka_state(" not in eos_branch
+    assert "disable_macsec_port(" in sonic_branch
+    assert "delete_macsec_profile(" in sonic_branch
+    assert "_set_profile(" in sonic_branch
+    assert "enable_macsec_port(" in sonic_branch
+    assert "_peer_original_runtime_ready" in sonic_branch
+    assert "_peer_published_original_state_ready" in sonic_branch
 
 
 def test_timing_policy_constants_match_wpa_semantics():
@@ -1203,6 +1325,7 @@ def test_timing_policy_constants_match_wpa_semantics():
     assert "MKA_ADVERTISEMENT_READY_INTERVALS = 5" in source
     assert "MKA_PEER_FOLLOW_INTERVALS = 8" in source
     assert "MKA_TRANSITION_CONVERGENCE_TIMEOUT = 30" in source
+    assert "MKA_POST_FOLLOW_STABILITY_TIMEOUT = 12" in source
 
 
 def test_crossed_roles_use_non_key_server_peer_follow_stage():

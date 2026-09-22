@@ -602,6 +602,46 @@ def fresh_mka_state_published(session, previous_last_updated):
     )
 
 
+def parse_mka_log_cursor(output, container):
+    """Parse syslog inode/size/time into an action-local log cursor."""
+    values = output.split()
+    if len(values) != 3:
+        raise ValueError("Malformed MKA log cursor output {!r}".format(
+            output))
+    inode, size, epoch = values
+    return {
+        "container": container,
+        "syslog_inode": inode,
+        "syslog_size": int(size),
+        "epoch": int(epoch),
+    }
+
+
+def build_mka_log_cursor_command(cursor):
+    """Build a rotation-aware command returning only post-cursor MKA logs."""
+    return (
+        "current=$(stat -c %i /var/log/syslog); "
+        "if [ \"$current\" = '{inode}' ]; then "
+        "tail -c +{offset} /var/log/syslog; "
+        "else cat /var/log/syslog.1 /var/log/syslog 2>/dev/null; fi; "
+        "docker logs --since {epoch} {container} 2>&1 || true"
+    ).format(
+        inode=cursor["syslog_inode"],
+        offset=cursor["syslog_size"] + 1,
+        epoch=cursor["epoch"],
+        container=cursor["container"],
+    )
+
+
+def mka_following_marker_seen(output, ckn):
+    """Match a post-cursor Following marker case-insensitively."""
+    output = output.lower()
+    return (
+        "following key server onto ckn" in output
+        and ckn.lower() in output
+    )
+
+
 def macsec_sa_lifecycle_sample(port_enabled, key_state):
     """Normalize non-secret TX/RX SA lifecycle state for one poll."""
     tx_active = (
@@ -667,9 +707,9 @@ def validate_macsec_sa_lifecycle_sample(sample):
     return errors
 
 
-def validate_make_before_break_samples(
+def validate_make_before_break_generations(
         inherited, samples, following_index):
-    """Validate sampled MBB lifecycle without requiring observed overlap."""
+    """Validate each observed MBB generation without requiring overlap."""
     errors = []
     if not samples:
         return ["no SA lifecycle samples were captured"]
@@ -694,38 +734,58 @@ def validate_make_before_break_samples(
     if final.get("rx_active") == inherited.get("rx_active"):
         errors.append("new RX key/AN did not become active after Following")
 
-    tx_switch_index = next(
-        (
-            index for index, sample in enumerate(samples)
-            if sample.get("tx_active") != inherited.get("tx_active")
-        ),
-        None,
-    )
-    rx_new_index = next(
-        (
-            index for index, sample in enumerate(samples)
-            if sample.get("rx_active") - inherited.get("rx_active", set())
-        ),
-        None,
-    )
-    if (tx_switch_index is not None and rx_new_index is not None
-            and rx_new_index > tx_switch_index):
-        errors.append("new TX became active before new RX was observed")
-
-    old_tx = inherited.get("tx_active")
-    for index, sample in enumerate(samples):
-        if old_tx not in sample.get("tx_sas", set()):
-            if tx_switch_index is None or index < tx_switch_index:
-                errors.append("old TX SA was deleted before new TX activation")
-            break
-
     old_rx = inherited.get("rx_active", set())
     for index, sample in enumerate(samples[:following_index]):
         if not old_rx.issubset(sample.get("rx_sas", set())):
             errors.append(
                 "old RX SA was deleted before remote TX handoff")
             break
+
+    generation = inherited
+    previous_sample = (
+        samples[following_index - 1]
+        if following_index > 0 else inherited)
+    for index, sample in enumerate(
+            samples[following_index:], start=following_index):
+        if sample.get("tx_active") == generation.get("tx_active"):
+            previous_sample = sample
+            continue
+
+        new_tx = sample.get("tx_active")
+        old_tx = generation.get("tx_active")
+        if new_tx not in sample.get("tx_sas", set()):
+            errors.append(
+                "sample {}: new TX is not installed".format(index))
+
+        new_rx = (
+            sample.get("rx_active", set())
+            - generation.get("rx_active", set())
+        )
+        prior_new_rx = (
+            previous_sample.get("rx_active", set())
+            - generation.get("rx_active", set())
+        )
+        if not new_rx and not prior_new_rx:
+            errors.append(
+                "sample {}: new TX became active before new RX "
+                "was observed".format(index))
+
+        if (old_tx not in previous_sample.get("tx_sas", set())
+                and previous_sample.get("tx_active") == old_tx):
+            errors.append(
+                "sample {}: old TX SA was deleted before new TX "
+                "activation".format(index - 1))
+
+        generation = sample
+        previous_sample = sample
     return errors
+
+
+def validate_make_before_break_samples(
+        inherited, samples, following_index):
+    """Backward-compatible alias for per-generation MBB validation."""
+    return validate_make_before_break_generations(
+        inherited, samples, following_index)
 
 
 def final_new_key_stable(inherited, previous, current):
@@ -737,6 +797,34 @@ def final_new_key_stable(inherited, previous, current):
         and current.get("rx_active") != inherited.get("rx_active")
         and not validate_macsec_sa_lifecycle_sample(current)
     )
+
+
+def validate_direct_fallback_takeover(
+        participants, primary_ckn, fallback_ckn):
+    """Validate authoritative direct-WPA fallback ownership."""
+    primary_ckn = primary_ckn.lower()
+    fallback_ckn = fallback_ckn.lower()
+    primary = participants.get(primary_ckn, {})
+    fallback = participants.get(fallback_ckn, {})
+    errors = []
+    if primary.get("live_peers", 0) != 0:
+        errors.append("primary retains a live peer")
+    if primary.get("is_principal"):
+        errors.append("primary remains principal")
+    expected = {
+        "active": True,
+        "is_primary": False,
+        "is_principal": True,
+        "is_key_server": True,
+        "is_elected": True,
+    }
+    if fallback.get("live_peers", 0) < 1:
+        errors.append("fallback has no live peer")
+    for field, expected_value in expected.items():
+        if fallback.get(field) is not expected_value:
+            errors.append("fallback {}={!r}, expected {!r}".format(
+                field, fallback.get(field), expected_value))
+    return errors
 
 
 def get_macsec_max_sa_per_sc(host, interface):
