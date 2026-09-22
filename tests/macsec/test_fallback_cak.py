@@ -12,15 +12,12 @@ from tests.common.helpers.dut_utils import (
     restart_service_with_startlimit_guard,
 )
 from tests.common.macsec.macsec_config_helper import (
-    add_runtime_macsec_key,
     delete_macsec_profile,
-    delete_runtime_macsec_key,
     disable_macsec_port,
     enable_macsec_port,
     ensure_macsec_profile_fallback,
     generate_macsec_key_pair,
     macsec_profile_has_fallback,
-    list_runtime_macsec_participants,
     set_macsec_profile,
     update_macsec_profile_key,
 )
@@ -56,13 +53,10 @@ from tests.common.macsec.mka_state_helper import (
     parse_mka_log_cursor,
     parse_eos_profile_ckns,
     parse_eos_mka_participants,
-    parse_wpa_mka_participants,
     quiescence_budget_seconds,
     remaining_transition_seconds,
     remaining_link_items,
     select_independent_port_pair,
-    validate_direct_actor_state,
-    validate_direct_fallback_takeover,
     validate_macsec_sa_lifecycle_sample,
     validate_make_before_break_generations,
     validate_pre_distsak_lifecycle,
@@ -71,6 +65,7 @@ from tests.common.macsec.mka_state_helper import (
     validate_eos_mka_participants,
     validate_point_to_point_ingress_sc,
     validate_mka_snapshot,
+    validate_observed_actor_state,
 )
 from tests.common.utilities import wait_until
 
@@ -224,6 +219,46 @@ def _eos_deletion_errors(
     )
 
 
+def _sonic_replacement_errors(
+        neighbor, profile_name, old_ckn, new_ckn,
+        expected_profile, required_live_ckns):
+    config = get_macsec_profile_config(
+        neighbor["host"], neighbor["port"], profile_name)
+    session, participants = get_mka_state(
+        neighbor["host"], neighbor["port"])
+    errors = []
+    for field in ("primary_ckn", "fallback_ckn"):
+        if config.get(field, "").lower() != expected_profile[field].lower():
+            errors.append("{} does not match expected profile".format(field))
+    if session.get("profile") != profile_name:
+        errors.append("runtime profile does not match binding")
+    if session.get("query_status") != "ok":
+        errors.append("query_status is not ok")
+    if session.get("config_status") != "in-sync":
+        errors.append("config_status is not in-sync")
+    if old_ckn.lower() in participants:
+        errors.append("old CKN remains in STATE_DB participants")
+    if new_ckn.lower() not in participants:
+        errors.append("new CKN missing from STATE_DB participants")
+    for ckn in required_live_ckns:
+        participant = participants.get(ckn.lower(), {})
+        if participant.get("active") != "true":
+            errors.append("{} is not active".format(ckn.lower()))
+        if int(participant.get("live_peers", "0")) < 1:
+            errors.append("{} has no live peer".format(ckn.lower()))
+    return errors
+
+
+def _set_eos_profile_key(
+        neighbor, profile_name, cak, ckn, is_fallback=False):
+    line = "key {} 7 {}".format(ckn, cak)
+    if is_fallback:
+        line += " fallback"
+    neighbor["host"].eos_config(
+        lines=[line],
+        parents=["mac security", "profile {}".format(profile_name)])
+
+
 def _replace_peer_key_and_verify(
         environment, port, old_cak, old_ckn, new_cak, new_ckn,
         is_fallback=False, required_live_ckns=(),
@@ -292,6 +327,20 @@ def _replace_peer_key_and_verify(
             if hot_update_failure == "skip":
                 pytest.skip(message)
             raise AssertionError(message)
+    else:
+        def _replacement_ready():
+            return not _sonic_replacement_errors(
+                neighbor, profile_name, old_ckn, new_ckn,
+                updated_profile, required_live_ckns)
+
+        if not wait_until(
+                MKA_STATE_PUBLISH_TIMEOUT, 2, 0,
+                _replacement_ready):
+            raise AssertionError(
+                "SONiC supported profile update did not publish expected "
+                "state: {}".format(_sonic_replacement_errors(
+                    neighbor, profile_name, old_ckn, new_ckn,
+                    updated_profile, required_live_ckns)))
 
     environment["peer_profiles"][port] = updated_profile
     return updated_profile
@@ -300,99 +349,62 @@ def _replace_peer_key_and_verify(
 def _delete_peer_key_and_verify(
         environment, port, cak, ckn, remaining_ckns,
         is_fallback=False, hot_update_failure="fail"):
-    """Delete one peer actor and prove it is absent before timing DUT expiry."""
+    """Delete one cEOS key and prove its vendor runtime actor is absent."""
     neighbor = environment["links"][port]
+    if not isinstance(neighbor["host"], EosHost):
+        pytest.skip(
+            "Delete-only CA fault injection is component-level for "
+            "SONiC peers; E2E coverage requires a cEOS key-line delete")
     profile_name = environment["neighbor_profiles"][port]
     action_started = time.monotonic()
-    delete_runtime_macsec_key(
-        neighbor["host"], neighbor["port"], profile_name, cak, ckn,
-        is_fallback=is_fallback)
+    key_line = "key {} 7 {}".format(ckn, cak)
+    if is_fallback:
+        key_line += " fallback"
+    neighbor["host"].eos_config(
+        lines=["no " + key_line],
+        parents=["mac security", "profile {}".format(profile_name)])
 
-    if isinstance(neighbor["host"], EosHost):
-        def _deleted():
-            return not _eos_deletion_errors(
-                neighbor, profile_name, ckn, remaining_ckns)
+    def _deleted():
+        return not _eos_deletion_errors(
+            neighbor, profile_name, ckn, remaining_ckns)
 
-        if not wait_until(
-                _transition_stage_timeout(
-                    environment, port, MKA_LIVENESS_INTERVALS,
-                    action_started),
-                1, 0, _deleted):
-            transition_errors = _eos_deletion_errors(
-                neighbor, profile_name, ckn, remaining_ckns)
-            add_runtime_macsec_key(
-                neighbor["host"], neighbor["port"], profile_name,
-                cak, ckn, is_fallback=is_fallback)
-            expected_profile = environment["peer_profiles"][port]
-
-            def _rollback_ready():
-                return not _eos_replacement_errors(
-                    neighbor, profile_name, "__deleted__", ckn,
-                    expected_profile, tuple(remaining_ckns) + (ckn,))
-
-            rollback_ready = wait_until(
-                _transition_stage_timeout(
-                    environment, port,
-                    MKA_ADVERTISEMENT_READY_INTERVALS,
-                    time.monotonic()),
-                1, 0, _rollback_ready)
-            assert rollback_ready, (
-                "EOS direct key deletion and key-line-only rollback both "
-                "failed; transition={}, rollback={}"
-            ).format(
-                transition_errors,
-                _eos_replacement_errors(
-                    neighbor, profile_name, "__deleted__", ckn,
-                    expected_profile, tuple(remaining_ckns) + (ckn,)))
-            message = (
-                "cEOS direct key deletion left the old runtime actor; "
-                "profile detach/rebind is prohibited: {}"
-            ).format(transition_errors)
-            if hot_update_failure == "skip":
-                pytest.skip(message)
-            raise AssertionError(message)
-    else:
-        assert wait_until(
+    if not wait_until(
             _transition_stage_timeout(
                 environment, port, MKA_LIVENESS_INTERVALS,
                 action_started),
-            1, 0,
-            lambda: ckn.lower() not in _runtime_participants(
-                neighbor["host"], neighbor["port"]),
-        ), "Deleted peer CKN remains in runtime participants"
+            1, 0, _deleted):
+        transition_errors = _eos_deletion_errors(
+            neighbor, profile_name, ckn, remaining_ckns)
+        neighbor["host"].eos_config(
+            lines=[key_line],
+            parents=["mac security", "profile {}".format(profile_name)])
+        message = (
+            "cEOS key-line delete did not remove the runtime actor: {}"
+        ).format(transition_errors)
+        if hot_update_failure == "skip":
+            pytest.skip(message)
+        raise AssertionError(message)
 
 
-def _pause_macsecmgrd(host, port):
-    asic = host.get_port_asic_instance(port)
-    container = asic.get_docker_name("macsec")
-    result = host.command(
-        "docker exec {} pgrep -x macsecmgrd".format(container))
-    pids = [int(pid) for pid in result.get("stdout_lines", [])]
-    assert pids, "Unable to locate macsecmgrd"
-    host.command(
-        "docker exec {} kill -STOP {}".format(
-            container, " ".join(str(pid) for pid in pids)))
-    return container, pids
+def _state_participants(host, port):
+    _, participants = get_mka_state(host, port)
+    return {
+        ckn: {
+            "active": participant.get("active") == "true",
+            "is_principal": participant.get("is_principal") == "true",
+            "is_primary": participant.get("is_primary") == "true",
+            "is_key_server": participant.get("is_key_server") == "true",
+            "is_elected": participant.get("is_elected") == "true",
+            "live_peers": int(participant.get("live_peers", "0")),
+        }
+        for ckn, participant in participants.items()
+    }
 
 
-def _resume_macsecmgrd(host, paused):
-    container, pids = paused
-    host.command(
-        "docker exec {} kill -CONT {}".format(
-            container, " ".join(str(pid) for pid in pids)),
-        module_ignore_errors=True,
-    )
-
-
-def _runtime_participants(host, port):
-    return parse_wpa_mka_participants(
-        list_runtime_macsec_participants(host, port))
-
-
-def _direct_participants(host, port):
+def _observed_participants(host, port):
     if isinstance(host, EosHost):
         return _get_eos_participants(host, port)
-    return _runtime_participants(host, port)
+    return _state_participants(host, port)
 
 
 def _snapshot_active_key_state(environment, ports):
@@ -502,7 +514,7 @@ def _transition_stage_timeout(
     )
 
 
-def _wait_direct_actor_ready(
+def _wait_actor_ready(
         environment, port, host, host_port, ckn,
         is_primary, is_principal, is_key_server, is_elected,
         action_started, intervals=MKA_ACTOR_READY_INTERVALS,
@@ -510,8 +522,8 @@ def _wait_direct_actor_ready(
     errors = [None]
 
     def _ready():
-        errors[0] = validate_direct_actor_state(
-            _direct_participants(host, host_port),
+        errors[0] = validate_observed_actor_state(
+            _observed_participants(host, host_port),
             ckn,
             is_primary,
             is_principal,
@@ -521,8 +533,12 @@ def _wait_direct_actor_ready(
         )
         return not errors[0]
 
-    timeout = _transition_stage_timeout(
-        environment, port, intervals, action_started)
+    timeout = (
+        _transition_stage_timeout(
+            environment, port, intervals, action_started)
+        if isinstance(host, EosHost)
+        else MKA_STATE_PUBLISH_TIMEOUT
+    )
     if _ready():
         return
     assert timeout > 0 and wait_until(
@@ -553,15 +569,15 @@ def _wait_peer_follow(
         if isinstance(neighbor["host"], EosHost):
             peer_ready = _peer_ckn_transition_is_operational(
                 neighbor, ckn, absent_ckn=absent_ckn)
-            diagnostics = _direct_participants(
+            diagnostics = _observed_participants(
                 neighbor["host"], neighbor["port"])
             following_seen = False
         else:
-            participants = _runtime_participants(
+            participants = _state_participants(
                 neighbor["host"], neighbor["port"])
             following_seen = _following_primary_seen(
                 neighbor["host"], following_cursor, ckn)
-            peer_ready = not validate_direct_actor_state(
+            peer_ready = not validate_observed_actor_state(
                 participants,
                 ckn,
                 expected_primary,
@@ -630,8 +646,8 @@ def _wait_peer_follow(
             peer_ready = _peer_ckn_transition_is_operational(
                 neighbor, ckn, absent_ckn=absent_ckn)
         else:
-            peer_ready = not validate_direct_actor_state(
-                _runtime_participants(
+            peer_ready = not validate_observed_actor_state(
+                _state_participants(
                     neighbor["host"], neighbor["port"]),
                 ckn,
                 expected_primary,
@@ -667,7 +683,7 @@ def _wait_dut_owner_then_peer_follow(
         environment, port, neighbor, ckn, action_started,
         expected_primary, following_cursor,
         absent_ckn=None, description="CKN ownership"):
-    _wait_direct_actor_ready(
+    _wait_actor_ready(
         environment,
         port,
         environment["duthost"],
@@ -681,6 +697,7 @@ def _wait_dut_owner_then_peer_follow(
         absent_ckn=absent_ckn,
         description="{} DUT authoritative actor".format(description),
     )
+    follow_started = time.monotonic()
     inherited_lifecycle = _snapshot_sa_lifecycle(
         environment, port)
     _wait_peer_follow(
@@ -688,7 +705,7 @@ def _wait_dut_owner_then_peer_follow(
         port,
         neighbor,
         ckn,
-        action_started,
+        follow_started,
         expected_primary,
         inherited_lifecycle,
         following_cursor,
@@ -702,7 +719,7 @@ def _wait_peer_actor_then_dut_owner(
         expected_primary, following_cursor,
         absent_ckn=None, description="peer actor"):
     is_eos = isinstance(neighbor["host"], EosHost)
-    _wait_direct_actor_ready(
+    _wait_actor_ready(
         environment,
         port,
         neighbor["host"],
@@ -724,7 +741,7 @@ def _wait_peer_actor_then_dut_owner(
         port,
         neighbor,
         ckn,
-        action_started,
+        time.monotonic(),
         expected_primary,
         following_cursor,
         absent_ckn=absent_ckn,
@@ -736,7 +753,7 @@ def _wait_authoritative_peer_then_dut_follow(
         environment, port, neighbor, ckn, action_started,
         dut_expected_primary, description="peer key-server ownership"):
     is_eos = isinstance(neighbor["host"], EosHost)
-    _wait_direct_actor_ready(
+    _wait_actor_ready(
         environment,
         port,
         neighbor["host"],
@@ -752,7 +769,7 @@ def _wait_authoritative_peer_then_dut_follow(
             if is_eos else MKA_ACTOR_READY_INTERVALS),
         description="{} authoritative actor".format(description),
     )
-    _wait_direct_actor_ready(
+    _wait_actor_ready(
         environment,
         port,
         environment["duthost"],
@@ -762,7 +779,7 @@ def _wait_authoritative_peer_then_dut_follow(
         True,
         False,
         True,
-        action_started,
+        time.monotonic(),
         intervals=MKA_PEER_FOLLOW_INTERVALS,
         description="{} DUT non-key-server follow".format(description),
     )
@@ -815,7 +832,7 @@ def _redacted_diagnostics(environment, port):
     neighbor = environment["links"][port]
     session, participants = get_mka_state(
         environment["duthost"], port)
-    peer = _direct_participants(
+    peer = _observed_participants(
         neighbor["host"], neighbor["port"])
     return {
         "port": port,
@@ -1040,15 +1057,6 @@ def _participant_is_principal(host, port, ckn):
     )
 
 
-def _direct_dut_fallback_takeover_ready(
-        duthost, port, primary_ckn, fallback_ckn):
-    return not validate_direct_fallback_takeover(
-        _runtime_participants(duthost, port),
-        primary_ckn,
-        fallback_ckn,
-    )
-
-
 def _published_fallback_takeover_ready(
         environment, port, previous_last_updated):
     session, participants = get_mka_state(
@@ -1076,8 +1084,8 @@ def _dut_liveness_diagnostics(environment, port):
     return {
         "session": session,
         "state_participants": participants,
-        "direct_participants": _runtime_participants(duthost, port),
-        "peer_participants": _direct_participants(
+        "published_participants": _state_participants(duthost, port),
+        "peer_participants": _observed_participants(
             neighbor["host"], neighbor["port"]),
     }
 
@@ -1086,7 +1094,7 @@ def _peer_ckn_transition_is_operational(
         neighbor, expected_ckn, absent_ckn=None):
     host = neighbor["host"]
     port = neighbor["port"]
-    participants = _direct_participants(host, port)
+    participants = _observed_participants(host, port)
     if absent_ckn and absent_ckn.lower() in participants:
         return False
     expected = participants.get(expected_ckn.lower(), {})
@@ -1099,8 +1107,8 @@ def _peer_ckn_transition_is_operational(
     )
 
 
-def _peer_original_runtime_ready(neighbor, original_profile):
-    participants = _direct_participants(
+def _peer_original_operational_ready(neighbor, original_profile):
+    participants = _observed_participants(
         neighbor["host"], neighbor["port"])
     expected = {
         original_profile["primary_ckn"].lower(): True,
@@ -1164,7 +1172,7 @@ def _restore_and_verify_peer_cleanup(
             return (
                 _get_eos_profile_ckns(
                     neighbor["host"], profile_name) == expected_ckns
-                and _peer_original_runtime_ready(
+                and _peer_original_operational_ready(
                     neighbor, original_profile)
                 and neighbor["host"].iface_macsec_ok(
                     neighbor["port"])
@@ -1195,9 +1203,9 @@ def _restore_and_verify_peer_cleanup(
         assert wait_until(
             MKA_TRANSITION_CONVERGENCE_TIMEOUT,
             MKA_OBSERVATION_POLL_SECONDS, 0,
-            _peer_original_runtime_ready,
+            _peer_original_operational_ready,
             neighbor, original_profile,
-        ), "Original SONiC peer direct WPA state did not recover"
+        ), "Original SONiC peer operational state did not recover"
         assert wait_until(
             MKA_STATE_PUBLISH_TIMEOUT, 2, 0,
             _peer_published_original_state_ready,
@@ -1211,6 +1219,42 @@ def _restore_and_verify_peer_cleanup(
         MKA_OBSERVATION_POLL_SECONDS, 0,
         _environment_is_healthy, environment,
     ), "Environment did not recover after peer cleanup"
+
+
+def _sonic_peer_profile_ready(
+        environment, port, profile_name, expected_profile,
+        require_no_live=False):
+    neighbor = environment["links"][port]
+    if _port_profile_attachment(
+            neighbor["host"], neighbor["port"]) != profile_name:
+        return False
+    config = get_macsec_profile_config(
+        neighbor["host"], neighbor["port"], profile_name)
+    session, participants = get_mka_state(
+        neighbor["host"], neighbor["port"])
+    expected_ckns = {
+        expected_profile["primary_ckn"].lower(): "true",
+        expected_profile["fallback_ckn"].lower(): "false",
+    }
+    if (
+            session.get("profile") != profile_name
+            or session.get("query_status") != "ok"
+            or session.get("config_status") != "in-sync"
+            or set(participants) != set(expected_ckns)):
+        return False
+    for ckn, is_primary in expected_ckns.items():
+        participant = participants[ckn]
+        if (
+                participant.get("active") != "true"
+                or participant.get("is_primary") != is_primary):
+            return False
+        if (require_no_live
+                and int(participant.get("live_peers", "0")) != 0):
+            return False
+    for field in ("primary_ckn", "fallback_ckn"):
+        if config.get(field, "").lower() != expected_profile[field].lower():
+            return False
+    return True
 
 
 def _environment_is_healthy(
@@ -1385,16 +1429,16 @@ def _selected_link_ping_succeeds(environment, upstream_links, port):
         environment, upstream_links, port))
 
 
-def _wpa_process_ready(host, container, port):
+def _macsecmgrd_process_ready(host, container):
     result = host.command(
-        "docker exec {} pgrep -f '/var/run/{}'".format(
-            container, port),
+        "docker exec {} supervisorctl status macsecmgrd".format(
+            container),
         module_ignore_errors=True,
         verbose=False,
     )
     return (
         not result.get("failed")
-        and bool(result.get("stdout_lines", []))
+        and "RUNNING" in result.get("stdout", "")
     )
 
 
@@ -1411,7 +1455,7 @@ def _lifecycle_cleanup_errors(
         port_errors = validate_lifecycle_cleanup_state(
             session,
             previous_last_updated.get(port),
-            _wpa_process_ready(duthost, container, port),
+            _macsecmgrd_process_ready(duthost, container),
             duthost.iface_macsec_ok(port),
             egress_sc,
             egress_sas,
@@ -1631,161 +1675,62 @@ def test_primary_failure_rotation_and_recovery_are_hitless(
             environment, upstream_links)
         traffic = _start_bidirectional_traffic(
             environment, upstream_links)
-        dut_state_before_pause = get_mka_state(
-            duthost, selected_port)[0].get("last_updated")
-        paused = _pause_macsecmgrd(duthost, selected_port)
-        primary_removed = False
-        try:
-            removal_started = time.monotonic()
-            delete_runtime_macsec_key(
-                duthost, selected_port, profile["name"], old_cak, old_ckn)
-            primary_removed = True
-            assert wait_until(
-                _transition_stage_timeout(
-                    environment, selected_port,
-                    MKA_LIVENESS_INTERVALS, removal_started),
-                MKA_OBSERVATION_POLL_SECONDS, 0,
-                lambda: old_ckn.lower() not in
-                _runtime_participants(duthost, selected_port),
-            ), "Deleted DUT primary CKN remains in runtime participants"
-
-            expiry_started = time.monotonic()
-
-            def _fallback_owns_remove_only_interval():
-                participants = _runtime_participants(
-                    duthost, selected_port)
-                return (
-                    old_ckn.lower() not in participants
-                    and not validate_direct_actor_state(
-                        participants,
-                        profile["fallback_ckn"],
-                        False,
-                        True,
-                        True,
-                        True,
-                        absent_ckn=old_ckn)
-                    and _peer_ckn_transition_is_operational(
-                        selected_neighbor, profile["fallback_ckn"])
-                    and duthost.iface_macsec_ok(selected_port)
-                )
-
-            assert wait_until(
-                _transition_stage_timeout(
-                    environment, selected_port,
-                    MKA_LIVENESS_INTERVALS, expiry_started),
-                MKA_OBSERVATION_POLL_SECONDS, 0,
-                _fallback_owns_remove_only_interval,
-            ), "Fallback did not own the remove-only primary interval"
-
-            following_cursor = _capture_peer_follow_cursor(
-                selected_neighbor)
-            add_started = time.monotonic()
-            add_runtime_macsec_key(
-                duthost, selected_port, profile["name"], old_cak, old_ckn)
-            primary_removed = False
-            _wait_dut_owner_then_peer_follow(
-                environment,
-                selected_port,
-                selected_neighbor,
-                old_ckn,
-                add_started,
-                True,
-                following_cursor,
-                description="DUT runtime primary restore",
-            )
-        finally:
-            if primary_removed:
-                add_runtime_macsec_key(
-                    duthost, selected_port, profile["name"],
-                    old_cak, old_ckn)
-            _resume_macsecmgrd(duthost, paused)
-
-        _wait_fresh_mka_state(
-            duthost, selected_port, dut_state_before_pause)
-        published_ready_started = time.monotonic()
-        _wait_final_environment(
-            environment, selected_port, published_ready_started,
-            description="MKA state after DUT macsecmgrd resume")
-
-        peer_state_before_pause = (
-            None if isinstance(selected_neighbor["host"], EosHost)
-            else get_mka_state(
-                selected_neighbor["host"],
-                selected_neighbor["port"])[0].get("last_updated")
-        )
-        peer_paused = (
-            None if isinstance(selected_neighbor["host"], EosHost)
-            else _pause_macsecmgrd(
-                selected_neighbor["host"], selected_neighbor["port"])
-        )
-        peer_primary_removed = False
-        try:
-            _delete_peer_key_and_verify(
-                environment, selected_port, old_cak, old_ckn,
-                (profile["fallback_ckn"],),
-                hot_update_failure="skip")
-            peer_primary_removed = True
-            peer_expiry_started = time.monotonic()
-
-            def _peer_fallback_owns_remove_only_interval():
-                return (
-                    _peer_ckn_transition_is_operational(
-                        selected_neighbor,
-                        profile["fallback_ckn"],
-                        absent_ckn=old_ckn)
-                    and _participant_is_principal(
-                        duthost, selected_port, profile["fallback_ckn"])
-                )
-
-            assert wait_until(
-                _transition_stage_timeout(
-                    environment, selected_port,
-                    MKA_LIVENESS_INTERVALS, peer_expiry_started),
-                MKA_OBSERVATION_POLL_SECONDS, 0,
-                _peer_fallback_owns_remove_only_interval,
-            ), "Peer fallback did not own its remove-only primary interval"
-
-            following_cursor = _capture_peer_follow_cursor(
-                selected_neighbor)
-            peer_add_started = time.monotonic()
-            add_runtime_macsec_key(
-                selected_neighbor["host"], selected_neighbor["port"],
-                environment["neighbor_profiles"][selected_port],
-                old_cak, old_ckn)
+        if isinstance(selected_neighbor["host"], EosHost):
             peer_primary_removed = False
-            _wait_peer_actor_then_dut_owner(
-                environment,
-                selected_port,
-                selected_neighbor,
-                old_ckn,
-                peer_add_started,
-                True,
-                following_cursor,
-                description="peer runtime primary restore",
-            )
-        finally:
-            if peer_primary_removed:
-                add_runtime_macsec_key(
-                    selected_neighbor["host"], selected_neighbor["port"],
+            try:
+                _delete_peer_key_and_verify(
+                    environment, selected_port, old_cak, old_ckn,
+                    (profile["fallback_ckn"],),
+                    hot_update_failure="skip")
+                peer_primary_removed = True
+
+                def _peer_fallback_owns_remove_only_interval():
+                    return (
+                        _peer_ckn_transition_is_operational(
+                            selected_neighbor,
+                            profile["fallback_ckn"],
+                            absent_ckn=old_ckn)
+                        and _participant_is_principal(
+                            duthost, selected_port,
+                            profile["fallback_ckn"])
+                    )
+
+                assert wait_until(
+                    MKA_STATE_PUBLISH_TIMEOUT, 2, 0,
+                    _peer_fallback_owns_remove_only_interval,
+                ), "Peer fallback ownership was not published"
+
+                peer_add_started = time.monotonic()
+                _set_eos_profile_key(
+                    selected_neighbor,
                     environment["neighbor_profiles"][selected_port],
                     old_cak, old_ckn)
-            if peer_paused:
-                _resume_macsecmgrd(
-                    selected_neighbor["host"], peer_paused)
-
-        if peer_paused:
-            _wait_fresh_mka_state(
-                selected_neighbor["host"],
-                selected_neighbor["port"],
-                peer_state_before_pause)
-            peer_published_ready_started = time.monotonic()
-            _wait_final_environment(
-                environment, selected_port, peer_published_ready_started,
-                description="MKA state after peer macsecmgrd resume")
+                peer_primary_removed = False
+                _wait_peer_actor_then_dut_owner(
+                    environment,
+                    selected_port,
+                    selected_neighbor,
+                    old_ckn,
+                    peer_add_started,
+                    True,
+                    None,
+                    description="cEOS primary restore",
+                )
+                _wait_final_environment(
+                    environment, selected_port, peer_add_started,
+                    description="MKA state after cEOS primary restore")
+            finally:
+                if peer_primary_removed:
+                    _set_eos_profile_key(
+                        selected_neighbor,
+                        environment["neighbor_profiles"][selected_port],
+                        old_cak, old_ckn)
         else:
-            _wait_final_environment(
-                environment, selected_port, peer_add_started,
-                description="MKA state after peer primary restore")
+            logger.info(
+                "Skipping delete-only primary fault injection on SONiC "
+                "peer %s: no supported config interface removes one "
+                "attached CA without profile replacement",
+                selected_neighbor["host"].hostname)
 
         dut_rotation_started = time.monotonic()
         _profile_update(
@@ -2117,22 +2062,12 @@ def test_fallback_rotation_rejected_without_live_primary(
             required_live_ckns=(profile["fallback_ckn"],),
             hot_update_failure="skip")
         peer_updated = True
-        expiry_started = time.monotonic()
-        assert wait_until(
-            _transition_stage_timeout(
-                environment, port, MKA_LIVENESS_INTERVALS,
-                expiry_started),
-            MKA_OBSERVATION_POLL_SECONDS, 0,
-            _direct_dut_fallback_takeover_ready,
-            duthost, port,
-            profile["primary_ckn"], profile["fallback_ckn"],
-        ), "Direct WPA fallback did not take over: {}".format(
-            _dut_liveness_diagnostics(environment, port))
         assert wait_until(
             MKA_STATE_PUBLISH_TIMEOUT, 2, 0,
             _published_fallback_takeover_ready,
             environment, port, state_before_mismatch,
-        ), "Fresh STATE_DB did not publish direct-WPA fallback ownership"
+        ), "Fresh STATE_DB did not publish fallback ownership: {}".format(
+            _dut_liveness_diagnostics(environment, port))
         traffic_phases.append(
             _macsec_traffic_phase(environment, port, "fallback-takeover"))
 
@@ -2542,7 +2477,7 @@ def test_multi_port_preflight_is_all_or_nothing(
                 for port in ports
             }
             peer_participants_by_port = {
-                port: _direct_participants(
+                port: _observed_participants(
                     environment["links"][port]["host"],
                     environment["links"][port]["port"])
                 for port in (unsafe_port, safe_port)
@@ -2599,66 +2534,11 @@ def test_multi_port_preflight_is_all_or_nothing(
 
 def test_query_failure_retains_state_and_recovers(
         fallback_macsec_environment):
-    """Retain the last MKA snapshot on query failure, then refresh it."""
-    environment = fallback_macsec_environment
-    duthost = environment["duthost"]
-    port = next(iter(environment["links"]))
-    asic = duthost.get_port_asic_instance(port)
-    container = asic.get_docker_name("macsec")
-    before_session, before_participants = get_mka_state(duthost, port)
-    assert before_session and before_participants
-    result = duthost.command(
-        "docker exec {} pgrep -f '/var/run/{}'".format(container, port))
-    pids = [int(pid) for pid in result["stdout_lines"]]
-    assert pids, "Unable to locate wpa_supplicant for {}".format(port)
-
-    try:
-        duthost.command(
-            "docker exec {} kill -STOP {}".format(
-                container, " ".join(str(pid) for pid in pids)))
-        assert wait_until(
-            45, 3, 0,
-            lambda: get_mka_state(
-                duthost, port)[0].get("query_status") == "error",
-        ), "MKA query failure was not published"
-        failed_session, retained_participants = get_mka_state(duthost, port)
-        assert retained_participants
-        assert wait_until(
-            10, 2, 6,
-            lambda: get_mka_state(duthost, port) == (
-                failed_session, retained_participants),
-        ), "Retained MKA state changed while queries were failing"
-        output = duthost.command(
-            "show macsec --mka {}".format(port))["stdout"].lower()
-        assert "error" in output
-        assert "retained" in output or "stale" in output
-        _assert_key_material_absent(output, environment["profile"])
-
-        profile = environment["profile"]
-        before_config = get_macsec_profile_config(
-            duthost, port, profile["name"])
-        blocked_cak, blocked_ckn = generate_macsec_key_pair(
-            profile["cipher_suite"])
-        _profile_update(
-            duthost, profile["name"], profile["primary_cak"],
-            profile["primary_ckn"], blocked_cak, blocked_ckn,
-            namespace_option=get_namespace_option(duthost, port),
-            expect_success=False)
-        assert get_macsec_profile_config(
-            duthost, port, profile["name"]) == before_config
-    finally:
-        duthost.command(
-            "docker exec {} kill -CONT {}".format(
-                container, " ".join(str(pid) for pid in pids)),
-            module_ignore_errors=True,
-        )
-
-    assert wait_until(
-        MKA_CONVERGE_TIMEOUT, 3, 0,
-        _environment_is_healthy, environment,
-    ), "MKA state did not recover after query resumed"
-    recovered_session, _ = get_mka_state(duthost, port)
-    assert recovered_session["last_updated"] != failed_session["last_updated"]
+    """Document that query-failure injection belongs in component testing."""
+    pytest.skip(
+        "MKA query-failure injection requires direct wpa_supplicant "
+        "control; sonic-mgmt E2E coverage uses supported service restart "
+        "and published-state recovery instead")
 
 
 def test_disable_and_macsecmgrd_restart_lifecycle(
@@ -2837,7 +2717,7 @@ def test_disable_and_macsecmgrd_restart_lifecycle(
 
 def test_both_invalid_tears_down_and_fallback_recovers(
         fallback_macsec_environment, upstream_links):
-    """Lose both shared CAKs, then recover service with the fallback CA."""
+    """Lose both shared CAKs through supported peer configuration."""
     environment = fallback_macsec_environment
     duthost = environment["duthost"]
     profile = environment["profile"]
@@ -2849,45 +2729,71 @@ def test_both_invalid_tears_down_and_fallback_recovers(
         profile["cipher_suite"])
     primary_updated = False
     fallback_updated = False
+    sonic_temp_profile = None
+    sonic_peer_rebound = False
+    original_peer_profile_name = environment["neighbor_profiles"][port]
+    original_peer_profile = dict(environment["peer_profiles"][port])
 
     try:
-        _replace_peer_key_and_verify(
-            environment, port,
-            profile["primary_cak"], profile["primary_ckn"],
-            invalid_primary_cak, invalid_primary_ckn,
-            required_live_ckns=(profile["fallback_ckn"],),
-            hot_update_failure="skip")
-        primary_updated = True
-        primary_expiry_started = time.monotonic()
-        assert wait_until(
-            _transition_stage_timeout(
-                environment, port, MKA_LIVENESS_INTERVALS,
-                primary_expiry_started),
-            MKA_OBSERVATION_POLL_SECONDS, 0,
-            lambda: (
-                get_mka_state(duthost, port)[1]
-                [profile["primary_ckn"].lower()].get("live_peers") == "0"
-                and _participant_is_principal(
-                    duthost, port, profile["fallback_ckn"])
-            ),
-        ), "Fallback did not carry the port: {}".format(
-            _redacted_diagnostics(environment, port))
-
         teardown_marker = (
             "KaY: No CA has a live peer; tearing down the controlled port")
         teardown_log_count = _mka_log_marker_count(
             duthost, port, teardown_marker)
-        _replace_peer_key_and_verify(
-            environment, port,
-            profile["fallback_cak"], profile["fallback_ckn"],
-            invalid_fallback_cak, invalid_fallback_ckn,
-            is_fallback=True,
-            hot_update_failure="skip")
-        fallback_updated = True
-        expiry_started = time.monotonic()
-        expiry_timeout = _transition_stage_timeout(
-            environment, port, MKA_LIVENESS_INTERVALS,
-            expiry_started)
+
+        if isinstance(neighbor["host"], EosHost):
+            _replace_peer_key_and_verify(
+                environment, port,
+                profile["primary_cak"], profile["primary_ckn"],
+                invalid_primary_cak, invalid_primary_ckn,
+                required_live_ckns=(profile["fallback_ckn"],),
+                hot_update_failure="skip")
+            primary_updated = True
+            assert wait_until(
+                MKA_STATE_PUBLISH_TIMEOUT, 2, 0,
+                lambda: _participant_is_principal(
+                    duthost, port, profile["fallback_ckn"]),
+            ), "Fallback ownership was not published after cEOS mismatch"
+            _replace_peer_key_and_verify(
+                environment, port,
+                profile["fallback_cak"], profile["fallback_ckn"],
+                invalid_fallback_cak, invalid_fallback_ckn,
+                is_fallback=True,
+                hot_update_failure="skip")
+            fallback_updated = True
+        else:
+            sonic_temp_profile = "MKA_BOTH_INVALID_{}".format(
+                neighbor["port"])
+            both_invalid_profile = dict(original_peer_profile)
+            both_invalid_profile.update({
+                "name": sonic_temp_profile,
+                "primary_cak": invalid_primary_cak,
+                "primary_ckn": invalid_primary_ckn,
+                "fallback_cak": invalid_fallback_cak,
+                "fallback_ckn": invalid_fallback_ckn,
+            })
+            delete_macsec_profile(
+                neighbor["host"], sonic_temp_profile)
+            _set_profile(
+                neighbor["host"], sonic_temp_profile,
+                both_invalid_profile,
+                environment["neighbor_priorities"][port])
+            assert _port_profile_attachment(
+                neighbor["host"],
+                neighbor["port"]) != sonic_temp_profile
+            disable_macsec_port(
+                neighbor["host"], neighbor["port"])
+            enable_macsec_port(
+                neighbor["host"], neighbor["port"],
+                sonic_temp_profile)
+            sonic_peer_rebound = True
+            environment["neighbor_profiles"][port] = sonic_temp_profile
+            environment["peer_profiles"][port] = both_invalid_profile
+            assert wait_until(
+                MKA_STATE_PUBLISH_TIMEOUT, 2, 0,
+                _sonic_peer_profile_ready,
+                environment, port, sonic_temp_profile,
+                both_invalid_profile, True,
+            ), "SONiC peer both-invalid profile did not publish expected state"
 
         def _all_dut_peers_expired():
             _, participants = get_mka_state(duthost, port)
@@ -2900,7 +2806,7 @@ def test_both_invalid_tears_down_and_fallback_recovers(
             )
 
         assert wait_until(
-            expiry_timeout, 1, 0, _all_dut_peers_expired,
+            MKA_STATE_PUBLISH_TIMEOUT, 2, 0, _all_dut_peers_expired,
         ), "DUT participants retained live peers after peer actor removal: {}".format(
             _redacted_diagnostics(environment, port))
 
@@ -2917,10 +2823,8 @@ def test_both_invalid_tears_down_and_fallback_recovers(
                 log_seen,
             ) in ("complete", "complete-without-observed-log")
 
-        remaining = max(
-            1, expiry_timeout - (time.monotonic() - expiry_started))
         assert wait_until(
-            remaining, 1, 0, _teardown_complete,
+            MKA_STATE_PUBLISH_TIMEOUT, 2, 0, _teardown_complete,
         ), "Both-invalid teardown failed: classification={}, state={}, mka={}".format(
             classify_macsec_teardown(
                 get_mka_state(duthost, port)[1],
@@ -2945,33 +2849,57 @@ def test_both_invalid_tears_down_and_fallback_recovers(
             "dut_to_peer={}, peer_to_dut={}"
         ).format(*traffic_results)
 
-        following_cursor = _capture_peer_follow_cursor(neighbor)
         recovery_started = time.monotonic()
-        _replace_peer_key_and_verify(
-            environment, port,
-            invalid_fallback_cak, invalid_fallback_ckn,
-            profile["fallback_cak"], profile["fallback_ckn"],
-            is_fallback=True)
-        fallback_updated = False
-        _wait_peer_actor_then_dut_owner(
-            environment,
-            port,
-            neighbor,
-            profile["fallback_ckn"],
-            recovery_started,
-            False,
-            following_cursor,
-            description="both-invalid fallback recovery",
-        )
-        _wait_final_environment(
-            environment, port, recovery_started,
-            principal_ckn=profile["fallback_ckn"],
-            description="both-invalid fallback recovery")
+        if isinstance(neighbor["host"], EosHost):
+            _replace_peer_key_and_verify(
+                environment, port,
+                invalid_fallback_cak, invalid_fallback_ckn,
+                profile["fallback_cak"], profile["fallback_ckn"],
+                is_fallback=True)
+            fallback_updated = False
+            _wait_final_link(
+                environment, port, recovery_started,
+                profile["fallback_ckn"],
+                description="both-invalid cEOS fallback recovery")
+        else:
+            disable_macsec_port(
+                neighbor["host"], neighbor["port"])
+            enable_macsec_port(
+                neighbor["host"], neighbor["port"],
+                original_peer_profile_name)
+            sonic_peer_rebound = False
+            environment["neighbor_profiles"][
+                port] = original_peer_profile_name
+            environment["peer_profiles"][port] = original_peer_profile
+            assert wait_until(
+                MKA_STATE_PUBLISH_TIMEOUT, 2, 0,
+                _sonic_peer_profile_ready,
+                environment, port, original_peer_profile_name,
+                original_peer_profile, False,
+            ), "Original SONiC peer profile did not recover"
+            delete_macsec_profile(
+                neighbor["host"], sonic_temp_profile)
+            sonic_temp_profile = None
+            _wait_final_environment(
+                environment, port, recovery_started,
+                description="both-invalid SONiC profile recovery")
         assert _selected_link_ping_succeeds(
             environment, upstream_links, port), \
-            "Traffic did not recover on the matching fallback CA"
+            "Traffic did not recover after restoring a matching profile"
     finally:
         cleanup_started = time.monotonic()
+        if sonic_peer_rebound:
+            disable_macsec_port(
+                neighbor["host"], neighbor["port"])
+            enable_macsec_port(
+                neighbor["host"], neighbor["port"],
+                original_peer_profile_name)
+            environment["neighbor_profiles"][
+                port] = original_peer_profile_name
+            environment["peer_profiles"][port] = original_peer_profile
+        if sonic_temp_profile:
+            delete_macsec_profile(
+                neighbor["host"], sonic_temp_profile)
         if fallback_updated:
             _replace_peer_key_and_verify(
                 environment, port,

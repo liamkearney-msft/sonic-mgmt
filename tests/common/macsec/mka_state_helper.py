@@ -566,10 +566,10 @@ def bounded_transition_stage_timeout(
     )
 
 
-def validate_direct_actor_state(
+def validate_observed_actor_state(
         participants, ckn, is_primary, is_principal,
         is_key_server, is_elected, absent_ckn=None):
-    """Validate direct KaY actor readiness without relying on STATE_DB."""
+    """Validate normalized actor readiness from a supported state surface."""
     errors = []
     ckn = ckn.lower()
     if absent_ckn and absent_ckn.lower() in participants:
@@ -793,9 +793,9 @@ def final_new_key_stable(inherited, previous, current):
     )
 
 
-def validate_direct_fallback_takeover(
+def validate_observed_fallback_takeover(
         participants, primary_ckn, fallback_ckn):
-    """Validate authoritative direct-WPA fallback ownership."""
+    """Validate fallback ownership from a supported operational state."""
     primary_ckn = primary_ckn.lower()
     fallback_ckn = fallback_ckn.lower()
     primary = participants.get(primary_ckn, {})
@@ -993,7 +993,7 @@ def validate_lifecycle_cleanup_state(
     elif last_updated == previous_last_updated:
         errors.append("last_updated did not refresh")
     if not process_ready:
-        errors.append("wpa_supplicant process is not healthy")
+        errors.append("MACsec service process is not healthy")
     if not controlled_port:
         errors.append("controlled port is not open")
 

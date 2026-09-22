@@ -70,9 +70,11 @@ validate_mka_snapshot = MKA_STATE_HELPER.validate_mka_snapshot
 validate_lifecycle_cleanup_state = (
     MKA_STATE_HELPER.validate_lifecycle_cleanup_state
 )
-validate_direct_actor_state = MKA_STATE_HELPER.validate_direct_actor_state
-validate_direct_fallback_takeover = (
-    MKA_STATE_HELPER.validate_direct_fallback_takeover
+validate_observed_actor_state = (
+    MKA_STATE_HELPER.validate_observed_actor_state
+)
+validate_observed_fallback_takeover = (
+    MKA_STATE_HELPER.validate_observed_fallback_takeover
 )
 validate_macsec_sa_lifecycle_sample = (
     MKA_STATE_HELPER.validate_macsec_sa_lifecycle_sample
@@ -745,19 +747,19 @@ def test_direct_actor_readiness_requires_authoritative_role_tuple():
             "is_elected": True,
         },
     }
-    assert validate_direct_actor_state(
+    assert validate_observed_actor_state(
         participants, "PRIMARY", True, True, True, True) == []
     participants["primary"]["is_key_server"] = False
     assert "primary is_key_server=False, expected True" in \
-        validate_direct_actor_state(
+        validate_observed_actor_state(
             participants, "primary", True, True, True, True)
     participants["primary"]["is_key_server"] = False
-    assert validate_direct_actor_state(
+    assert validate_observed_actor_state(
         participants, "primary", True, True, False, True) == []
 
 
-def test_direct_wpa_fallback_takeover_tuple_is_strict():
-    """Accept authoritative fallback ownership while rejecting stale primary."""
+def test_observed_fallback_takeover_tuple_is_strict():
+    """Accept published fallback ownership while rejecting stale primary."""
     participants = {
         "primary": {
             "active": True,
@@ -773,11 +775,11 @@ def test_direct_wpa_fallback_takeover_tuple_is_strict():
             "is_elected": True,
         },
     }
-    assert validate_direct_fallback_takeover(
+    assert validate_observed_fallback_takeover(
         participants, "primary", "fallback") == []
     participants["primary"]["live_peers"] = 1
     assert "primary retains a live peer" in \
-        validate_direct_fallback_takeover(
+        validate_observed_fallback_takeover(
             participants, "primary", "fallback")
 
 
@@ -1236,7 +1238,7 @@ def test_validate_lifecycle_cleanup_state_requires_fresh_healthy_state():
         "old", False, False, {}, {}, [])
     assert "query_status is not ok" in errors
     assert "last_updated did not refresh" in errors
-    assert "wpa_supplicant process is not healthy" in errors
+    assert "MACsec service process is not healthy" in errors
     assert "controlled port is not open" in errors
     assert "egress SC is missing" in errors
 
@@ -1297,23 +1299,71 @@ def test_primary_rotation_preserves_selected_link_names():
 
 
 def test_primary_rotation_uses_staged_timing_without_weakening_expiry():
-    """Use 30s convergence staging while retaining four-hello expiry."""
+    """Use supported staged convergence without direct WPA manipulation."""
     source = _function_source(
         FALLBACK_TEST_PATH,
         "test_primary_failure_rotation_and_recovery_are_hitless")
-    assert "_wait_dut_owner_then_peer_follow(" in source
-    assert "_wait_fresh_mka_state(" in source
-    assert "MKA_LIVENESS_INTERVALS" in source
-    assert "_transition_stage_timeout(" in source
+    assert "_wait_peer_actor_then_dut_owner(" in source
+    assert "MKA_STATE_PUBLISH_TIMEOUT" in source
     assert "MKA_TRANSITION_CONVERGENCE_TIMEOUT" in source
 
 
-def test_actor_readiness_uses_direct_runtime_not_state_db():
-    """Avoid stale STATE_DB while macsecmgrd publication is paused."""
+def test_actor_readiness_uses_supported_operational_state():
+    """Use normalized EOS show or SONiC STATE_DB actor state."""
     source = _function_source(
-        FALLBACK_TEST_PATH, "_wait_direct_actor_ready")
-    assert "_direct_participants(" in source
-    assert "get_mka_state(" not in source
+        FALLBACK_TEST_PATH, "_wait_actor_ready")
+    assert "_observed_participants(" in source
+
+
+def test_fallback_module_has_no_direct_wpa_control_paths():
+    """Keep sonic-mgmt E2E on supported config and state interfaces."""
+    source = FALLBACK_TEST_PATH.read_text()
+    forbidden = (
+        "wpa_cli",
+        "macsec_mka_list",
+        "macsec_add_mka",
+        "macsec_del_mka",
+        "list_runtime_macsec_participants",
+        "add_runtime_macsec_key",
+        "delete_runtime_macsec_key",
+        "kill -STOP",
+        "kill -CONT",
+        "_pause_macsecmgrd",
+        "_resume_macsecmgrd",
+    )
+    for token in forbidden:
+        assert token not in source
+
+
+def test_primary_delete_only_is_ceos_scoped():
+    """Run delete-only E2E only through supported cEOS key-line config."""
+    source = _function_source(
+        FALLBACK_TEST_PATH,
+        "test_primary_failure_rotation_and_recovery_are_hitless")
+    assert 'isinstance(selected_neighbor["host"], EosHost)' in source
+    assert "no supported config interface removes one" in source
+    assert "_delete_peer_key_and_verify(" in source
+
+
+def test_query_failure_is_component_level_skip():
+    """Do not stop or query per-port WPA processes from E2E."""
+    source = _function_source(
+        FALLBACK_TEST_PATH,
+        "test_query_failure_retains_state_and_recovers")
+    assert "pytest.skip(" in source
+    assert "direct wpa_supplicant" in source
+    assert "supported service restart" in source
+
+
+def test_sonic_both_invalid_uses_temporary_profile_rebind():
+    """Reach both-invalid through supported destructive profile binding."""
+    source = _function_source(
+        FALLBACK_TEST_PATH,
+        "test_both_invalid_tears_down_and_fallback_recovers")
+    assert "MKA_BOTH_INVALID_" in source
+    assert "disable_macsec_port(" in source
+    assert "enable_macsec_port(" in source
+    assert "_sonic_peer_profile_ready" in source
 
 
 def test_peer_follow_scopes_stability_before_following_boundary():
@@ -1334,12 +1384,11 @@ def test_peer_follow_splits_action_and_post_follow_windows():
     assert "following_seen or (peer_ready and key_changed)" in source
 
 
-def test_mismatch_uses_direct_takeover_then_publication():
-    """Judge expiry from direct WPA and require STATE_DB separately."""
+def test_mismatch_uses_published_takeover_state():
+    """Judge mismatch takeover through supported STATE_DB publication."""
     source = _function_source(
         FALLBACK_TEST_PATH,
         "test_fallback_rotation_rejected_without_live_primary")
-    assert "_direct_dut_fallback_takeover_ready" in source
     assert "_published_fallback_takeover_ready" in source
     assert "_restore_and_verify_peer_cleanup" in source
     assert "raise body_error.with_traceback(body_traceback)" in source
@@ -1356,7 +1405,7 @@ def test_peer_cleanup_branches_by_host_type():
     assert "delete_macsec_profile(" in sonic_branch
     assert "_set_profile(" in sonic_branch
     assert "enable_macsec_port(" in sonic_branch
-    assert "_peer_original_runtime_ready" in sonic_branch
+    assert "_peer_original_operational_ready" in sonic_branch
     assert "_peer_published_original_state_ready" in sonic_branch
 
 
