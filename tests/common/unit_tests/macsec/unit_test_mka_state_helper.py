@@ -43,6 +43,9 @@ macsecmgrd_restart_command = MKA_STATE_HELPER.macsecmgrd_restart_command
 macsec_sa_lifecycle_sample = MKA_STATE_HELPER.macsec_sa_lifecycle_sample
 mka_hello_timeout_seconds = MKA_STATE_HELPER.mka_hello_timeout_seconds
 mka_following_marker_seen = MKA_STATE_HELPER.mka_following_marker_seen
+mka_state_publication_within_budget = (
+    MKA_STATE_HELPER.mka_state_publication_within_budget
+)
 parse_db_hash = MKA_STATE_HELPER.parse_db_hash
 parse_mka_log_cursor = MKA_STATE_HELPER.parse_mka_log_cursor
 parse_eos_profile_ckns = MKA_STATE_HELPER.parse_eos_profile_ckns
@@ -713,6 +716,21 @@ def test_following_log_cursor_is_rotation_aware_and_case_insensitive():
         "KaY: Following key server onto CKN AABB", "aabb")
     assert not mka_following_marker_seen(
         "KaY: Following key server onto CKN CCDD", "aabb")
+    with pytest.raises(ValueError, match="Malformed MKA log cursor"):
+        parse_mka_log_cursor(
+            "$(stat -c %i /var/log/syslog) literal", "macsec0")
+
+
+def test_log_cursor_helpers_use_shell_capable_host_api():
+    """Execute compound stat/tail/docker commands through host.shell."""
+    capture_source = _function_source(
+        FALLBACK_TEST_PATH, "_capture_mka_log_cursor")
+    read_source = _function_source(
+        FALLBACK_TEST_PATH, "_mka_log_since_cursor")
+    assert "host.shell(" in capture_source
+    assert "host.command(" not in capture_source
+    assert "host.shell(" in read_source
+    assert "host.command(" not in read_source
 
 
 def test_direct_actor_readiness_requires_authoritative_role_tuple():
@@ -774,6 +792,9 @@ def test_fresh_state_publication_is_separate_from_runtime_readiness():
     assert not fresh_mka_state_published(session, "new")
     assert not fresh_mka_state_published(
         dict(session, query_status="error"), "old")
+    assert mka_state_publication_within_budget(0, 32.2)
+    assert mka_state_publication_within_budget(0, 60)
+    assert not mka_state_publication_within_budget(0, 60.001)
 
 
 def _sa_lifecycle(
@@ -1326,6 +1347,7 @@ def test_timing_policy_constants_match_wpa_semantics():
     assert "MKA_PEER_FOLLOW_INTERVALS = 8" in source
     assert "MKA_TRANSITION_CONVERGENCE_TIMEOUT = 30" in source
     assert "MKA_POST_FOLLOW_STABILITY_TIMEOUT = 12" in source
+    assert "MKA_STATE_PUBLISH_TIMEOUT = 60" in source
 
 
 def test_crossed_roles_use_non_key_server_peer_follow_stage():

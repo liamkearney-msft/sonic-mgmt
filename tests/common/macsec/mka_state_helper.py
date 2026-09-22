@@ -602,6 +602,13 @@ def fresh_mka_state_published(session, previous_last_updated):
     )
 
 
+def mka_state_publication_within_budget(
+        started_at, observed_at, budget_seconds=60):
+    """Return whether publication occurred within the status-sweep budget."""
+    elapsed = observed_at - started_at
+    return 0 <= elapsed <= budget_seconds
+
+
 def parse_mka_log_cursor(output, container):
     """Parse syslog inode/size/time into an action-local log cursor."""
     values = output.split()

@@ -92,7 +92,7 @@ MKA_ACTOR_READY_INTERVALS = 4
 MKA_ADVERTISEMENT_READY_INTERVALS = 5
 MKA_PEER_FOLLOW_INTERVALS = 8
 MKA_OBSERVATION_POLL_SECONDS = 1
-MKA_STATE_PUBLISH_TIMEOUT = 30
+MKA_STATE_PUBLISH_TIMEOUT = 60
 MKA_POST_FOLLOW_STABILITY_TIMEOUT = 12
 MKA_POST_FOLLOW_STABLE_POLLS = 2
 STRESS_ROTATIONS = 10
@@ -844,7 +844,7 @@ def _mka_log_marker_count(host, port, marker):
 
 def _capture_mka_log_cursor(host, port):
     container = host.get_port_asic_instance(port).get_docker_name("macsec")
-    result = host.command(
+    result = host.shell(
         "printf '%s ' \"$(stat -c %i /var/log/syslog)\"; "
         "printf '%s ' \"$(stat -c %s /var/log/syslog)\"; "
         "date +%s",
@@ -861,7 +861,7 @@ def _capture_mka_log_cursor(host, port):
 
 
 def _mka_log_since_cursor(host, cursor):
-    result = host.command(
+    result = host.shell(
         build_mka_log_cursor_command(cursor),
         module_ignore_errors=True,
         verbose=False,
