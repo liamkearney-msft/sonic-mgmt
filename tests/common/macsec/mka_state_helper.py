@@ -201,6 +201,8 @@ def parse_wpa_mka_participants(output):
             "active": _as_bool(block.get("active")),
             "is_principal": _as_bool(block.get("is_principal")),
             "is_primary": _as_bool(block.get("is_primary")),
+            "is_key_server": _as_bool(block.get("is_key_server")),
+            "is_elected": _as_bool(block.get("is_elected")),
             "live_peers": int(block.get("live_peers", "0")),
         }
     return participants
@@ -522,6 +524,78 @@ def mka_hello_timeout_seconds(session, intervals, default_hello_ms=2000):
         raise ValueError(
             "Invalid mka_hello_time_ms {!r}".format(value))
     return max(1, int(math.ceil(intervals * hello_ms / 1000.0)))
+
+
+def remaining_transition_seconds(
+        action_started, now, convergence_ceiling=30):
+    """Return the remaining whole-second convergence budget."""
+    return max(
+        0,
+        int(math.ceil(convergence_ceiling - (now - action_started))),
+    )
+
+
+def bounded_transition_stage_timeout(
+        protocol_seconds, action_started, now,
+        convergence_ceiling=30, observation_cushion=1):
+    """Bound one protocol stage by its limit and the action-wide ceiling."""
+    remaining = remaining_transition_seconds(
+        action_started, now, convergence_ceiling)
+    return min(
+        remaining,
+        max(1, int(math.ceil(
+            protocol_seconds + observation_cushion))),
+    )
+
+
+def validate_direct_actor_state(
+        participants, ckn, is_primary, is_principal,
+        is_key_server, is_elected, absent_ckn=None):
+    """Validate direct KaY actor readiness without relying on STATE_DB."""
+    errors = []
+    ckn = ckn.lower()
+    if absent_ckn and absent_ckn.lower() in participants:
+        errors.append("old CKN remains in runtime participants")
+    participant = participants.get(ckn, {})
+    if not participant.get("active"):
+        errors.append("{} is not active".format(ckn))
+    if participant.get("live_peers", 0) < 1:
+        errors.append("{} has no live peer".format(ckn))
+    expected = {
+        "is_primary": is_primary,
+        "is_principal": is_principal,
+        "is_key_server": is_key_server,
+        "is_elected": is_elected,
+    }
+    for field, value in expected.items():
+        if value is not None and participant.get(field) is not value:
+            errors.append("{} {}={!r}, expected {!r}".format(
+                ckn, field, participant.get(field), value))
+    return errors
+
+
+def fresh_mka_state_published(session, previous_last_updated):
+    """Return whether a fresh, usable MKA snapshot was published."""
+    return (
+        session.get("query_status") == "ok"
+        and session.get("config_status") == "in-sync"
+        and bool(session.get("last_updated"))
+        and session.get("last_updated") != previous_last_updated
+    )
+
+
+def stable_active_key_during_asymmetry(before, current, port):
+    """Require inherited KI/AN identity to stay fixed during role asymmetry."""
+    fields = (
+        "egress_encoding_an",
+        "egress_all_ans",
+        "egress_active",
+        "ingress",
+    )
+    return all(
+        before.get(port, {}).get(field) == current.get(port, {}).get(field)
+        for field in fields
+    )
 
 
 def get_macsec_max_sa_per_sc(host, interface):

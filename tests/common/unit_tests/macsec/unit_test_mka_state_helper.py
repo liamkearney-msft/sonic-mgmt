@@ -16,7 +16,11 @@ MKA_STATE_HELPER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MKA_STATE_HELPER)
 
 find_secret_fields = MKA_STATE_HELPER.find_secret_fields
+fresh_mka_state_published = MKA_STATE_HELPER.fresh_mka_state_published
 active_key_state = MKA_STATE_HELPER.active_key_state
+bounded_transition_stage_timeout = (
+    MKA_STATE_HELPER.bounded_transition_stage_timeout
+)
 classify_macsec_teardown = MKA_STATE_HELPER.classify_macsec_teardown
 cleanup_all = MKA_STATE_HELPER.cleanup_all
 crossed_role_peer_key_server_supported = (
@@ -39,8 +43,14 @@ parse_eos_profile_ckns = MKA_STATE_HELPER.parse_eos_profile_ckns
 parse_eos_mka_participants = MKA_STATE_HELPER.parse_eos_mka_participants
 parse_wpa_mka_participants = MKA_STATE_HELPER.parse_wpa_mka_participants
 quiescence_budget_seconds = MKA_STATE_HELPER.quiescence_budget_seconds
+remaining_transition_seconds = (
+    MKA_STATE_HELPER.remaining_transition_seconds
+)
 remaining_link_items = MKA_STATE_HELPER.remaining_link_items
 select_independent_port_pair = MKA_STATE_HELPER.select_independent_port_pair
+stable_active_key_during_asymmetry = (
+    MKA_STATE_HELPER.stable_active_key_during_asymmetry
+)
 validate_multi_port_alternate_state = (
     MKA_STATE_HELPER.validate_multi_port_alternate_state
 )
@@ -54,6 +64,7 @@ validate_mka_snapshot = MKA_STATE_HELPER.validate_mka_snapshot
 validate_lifecycle_cleanup_state = (
     MKA_STATE_HELPER.validate_lifecycle_cleanup_state
 )
+validate_direct_actor_state = MKA_STATE_HELPER.validate_direct_actor_state
 
 
 class _FakeHost:
@@ -512,13 +523,13 @@ def test_parse_wpa_mka_participants():
 participant_idx=0
 ckn=AABB
 active=Yes participant=Yes retain=No
-is_principal=No is_primary=Yes
+is_principal=No is_primary=Yes is_key_server=No is_elected=Yes
 live_peers=0 potential_peers=0
 
 participant_idx=1
 ckn=CCDD
 active=Yes participant=Yes retain=No
-is_principal=Yes is_primary=No
+is_principal=Yes is_primary=No is_key_server=Yes is_elected=Yes
 live_peers=1 potential_peers=0
 """
     assert parse_wpa_mka_participants(output) == {
@@ -526,12 +537,16 @@ live_peers=1 potential_peers=0
             "active": True,
             "is_principal": False,
             "is_primary": True,
+            "is_key_server": False,
+            "is_elected": True,
             "live_peers": 0,
         },
         "ccdd": {
             "active": True,
             "is_principal": True,
             "is_primary": False,
+            "is_key_server": True,
+            "is_elected": True,
             "live_peers": 1,
         },
     }
@@ -647,6 +662,77 @@ def test_mka_hello_timeout_rejects_malformed(value):
     with pytest.raises(ValueError):
         mka_hello_timeout_seconds(
             {"mka_hello_time_ms": value}, 4)
+
+
+def test_transition_stages_keep_protocol_bounds_and_overall_ceiling():
+    """Keep four/eight-hello stages inside the 30-second action budget."""
+    assert bounded_transition_stage_timeout(
+        8, action_started=100, now=100) == 9
+    assert bounded_transition_stage_timeout(
+        16, action_started=100, now=109) == 17
+    assert bounded_transition_stage_timeout(
+        16, action_started=100, now=125) == 5
+    assert remaining_transition_seconds(
+        action_started=100, now=131) == 0
+
+
+def test_direct_actor_readiness_requires_authoritative_role_tuple():
+    """Require active/live/primary/principal/key-server/elected direct state."""
+    participants = {
+        "primary": {
+            "active": True,
+            "live_peers": 1,
+            "is_primary": True,
+            "is_principal": True,
+            "is_key_server": True,
+            "is_elected": True,
+        },
+    }
+    assert validate_direct_actor_state(
+        participants, "PRIMARY", True, True, True, True) == []
+    participants["primary"]["is_key_server"] = False
+    assert "primary is_key_server=False, expected True" in \
+        validate_direct_actor_state(
+            participants, "primary", True, True, True, True)
+    participants["primary"]["is_key_server"] = False
+    assert validate_direct_actor_state(
+        participants, "primary", True, True, False, True) == []
+
+
+def test_fresh_state_publication_is_separate_from_runtime_readiness():
+    """Require a fresh, in-sync STATE_DB timestamp after daemon resume."""
+    session = {
+        "query_status": "ok",
+        "config_status": "in-sync",
+        "last_updated": "new",
+    }
+    assert fresh_mka_state_published(session, "old")
+    assert not fresh_mka_state_published(session, "new")
+    assert not fresh_mka_state_published(
+        dict(session, query_status="error"), "old")
+
+
+def test_transient_asymmetry_allows_roles_but_not_key_identity_churn():
+    """Ignore principal movement while requiring inherited KI/AN stability."""
+    before = {
+        "Ethernet0": {
+            "principal_ckns": ["fallback"],
+            "egress_encoding_an": "1",
+            "egress_all_ans": ["1"],
+            "egress_active": {"key_fingerprint": "key", "ssci": "1"},
+            "ingress": [{"sci": "peer", "active_sas": [{"an": "1"}]}],
+        },
+    }
+    current = {
+        "Ethernet0": dict(
+            before["Ethernet0"],
+            principal_ckns=["primary"]),
+    }
+    assert stable_active_key_during_asymmetry(
+        before, current, "Ethernet0")
+    current["Ethernet0"]["egress_encoding_an"] = "0"
+    assert not stable_active_key_during_asymmetry(
+        before, current, "Ethernet0")
 
 
 def test_eos_key_replacement_status_and_rebind_decision():
@@ -920,6 +1006,48 @@ def test_primary_rotation_preserves_selected_link_names():
     assert "for candidate_port in environment[\"links\"]" in source
     assert "remaining_link_items(" in source
     assert "for port in environment[\"links\"]" not in source
+
+
+def test_primary_rotation_uses_staged_timing_without_weakening_expiry():
+    """Use 30s convergence staging while retaining four-hello expiry."""
+    source = _function_source(
+        FALLBACK_TEST_PATH,
+        "test_primary_failure_rotation_and_recovery_are_hitless")
+    assert "_wait_dut_owner_then_peer_follow(" in source
+    assert "_wait_fresh_mka_state(" in source
+    assert "MKA_LIVENESS_INTERVALS" in source
+    assert "_transition_stage_timeout(" in source
+    assert "MKA_TRANSITION_CONVERGENCE_TIMEOUT" in source
+
+
+def test_actor_readiness_uses_direct_runtime_not_state_db():
+    """Avoid stale STATE_DB while macsecmgrd publication is paused."""
+    source = _function_source(
+        FALLBACK_TEST_PATH, "_wait_direct_actor_ready")
+    assert "_direct_participants(" in source
+    assert "get_mka_state(" not in source
+
+
+def test_timing_policy_constants_match_wpa_semantics():
+    """Pin four/eight-hello stages and the 30-second overall ceiling."""
+    source = FALLBACK_TEST_PATH.read_text()
+    assert "MKA_LIVENESS_INTERVALS = 4" in source
+    assert "MKA_ACTOR_READY_INTERVALS = 4" in source
+    assert "MKA_ADVERTISEMENT_READY_INTERVALS = 5" in source
+    assert "MKA_PEER_FOLLOW_INTERVALS = 8" in source
+    assert "MKA_TRANSITION_CONVERGENCE_TIMEOUT = 30" in source
+
+
+def test_crossed_roles_use_non_key_server_peer_follow_stage():
+    """Give DUT non-key-server ownership a fresh eight-hello follow stage."""
+    helper_source = _function_source(
+        FALLBACK_TEST_PATH,
+        "_wait_authoritative_peer_then_dut_follow")
+    test_source = _function_source(
+        FALLBACK_TEST_PATH,
+        "test_crossed_roles_follow_key_server_primary")
+    assert "MKA_PEER_FOLLOW_INTERVALS" in helper_source
+    assert "_wait_authoritative_peer_then_dut_follow(" in test_source
 
 
 def test_cleanup_all_runs_every_cleanup_before_raising():
