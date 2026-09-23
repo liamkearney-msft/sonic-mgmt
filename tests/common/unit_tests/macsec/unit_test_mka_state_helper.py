@@ -1,4 +1,3 @@
-import ast
 import importlib.util
 from pathlib import Path
 
@@ -17,13 +16,6 @@ SPEC.loader.exec_module(MKA_STATE_HELPER)
 
 find_secret_fields = MKA_STATE_HELPER.find_secret_fields
 fresh_mka_state_published = MKA_STATE_HELPER.fresh_mka_state_published
-active_key_state = MKA_STATE_HELPER.active_key_state
-bounded_transition_stage_timeout = (
-    MKA_STATE_HELPER.bounded_transition_stage_timeout
-)
-build_mka_log_cursor_command = (
-    MKA_STATE_HELPER.build_mka_log_cursor_command
-)
 classify_macsec_teardown = MKA_STATE_HELPER.classify_macsec_teardown
 classify_published_peer_teardown = (
     MKA_STATE_HELPER.classify_published_peer_teardown
@@ -43,21 +35,11 @@ _mka_show_result_supported = MKA_STATE_HELPER._mka_show_result_supported
 _mka_state_cli_supported = MKA_STATE_HELPER.mka_state_cli_supported
 macsecmgrd_restart_ready = MKA_STATE_HELPER.macsecmgrd_restart_ready
 macsecmgrd_restart_command = MKA_STATE_HELPER.macsecmgrd_restart_command
-macsec_sa_lifecycle_sample = MKA_STATE_HELPER.macsec_sa_lifecycle_sample
 mka_hello_timeout_seconds = MKA_STATE_HELPER.mka_hello_timeout_seconds
-mka_following_marker_seen = MKA_STATE_HELPER.mka_following_marker_seen
-mka_state_publication_within_budget = (
-    MKA_STATE_HELPER.mka_state_publication_within_budget
-)
 parse_db_hash = MKA_STATE_HELPER.parse_db_hash
-parse_mka_log_cursor = MKA_STATE_HELPER.parse_mka_log_cursor
 parse_eos_profile_ckns = MKA_STATE_HELPER.parse_eos_profile_ckns
 parse_eos_mka_participants = MKA_STATE_HELPER.parse_eos_mka_participants
-parse_wpa_mka_participants = MKA_STATE_HELPER.parse_wpa_mka_participants
 quiescence_budget_seconds = MKA_STATE_HELPER.quiescence_budget_seconds
-remaining_transition_seconds = (
-    MKA_STATE_HELPER.remaining_transition_seconds
-)
 remaining_link_items = MKA_STATE_HELPER.remaining_link_items
 select_independent_port_pair = MKA_STATE_HELPER.select_independent_port_pair
 validate_multi_port_alternate_state = (
@@ -73,25 +55,6 @@ validate_mka_snapshot = MKA_STATE_HELPER.validate_mka_snapshot
 validate_lifecycle_cleanup_state = (
     MKA_STATE_HELPER.validate_lifecycle_cleanup_state
 )
-validate_observed_actor_state = (
-    MKA_STATE_HELPER.validate_observed_actor_state
-)
-validate_observed_fallback_takeover = (
-    MKA_STATE_HELPER.validate_observed_fallback_takeover
-)
-validate_macsec_sa_lifecycle_sample = (
-    MKA_STATE_HELPER.validate_macsec_sa_lifecycle_sample
-)
-validate_make_before_break_samples = (
-    MKA_STATE_HELPER.validate_make_before_break_samples
-)
-validate_make_before_break_generations = (
-    MKA_STATE_HELPER.validate_make_before_break_generations
-)
-validate_pre_distsak_lifecycle = (
-    MKA_STATE_HELPER.validate_pre_distsak_lifecycle
-)
-final_new_key_stable = MKA_STATE_HELPER.final_new_key_stable
 
 
 class _FakeHost:
@@ -138,7 +101,6 @@ def _session():
         "secured": "true",
         "failed": "false",
         "actor_sci": "0011223344550001",
-        "key_server_sci": "0011223344550001",
         "actor_priority": "64",
         "key_server_priority": "63",
         "is_key_server": "false",
@@ -240,7 +202,7 @@ def test_parse_db_hash_rejects_partial_pair():
 
 
 def test_validate_primary_fallback_snapshot():
-    """Accept latest-schema participants without the removed participant field."""
+    """Accept participants without the removed participant field."""
     participants = {
         "aabb": _participant("true", "true"),
         "ccdd": _participant("false", "false"),
@@ -544,41 +506,6 @@ def test_validate_eos_operational_rejects_unhealthy_state(
     assert expected_error in errors
 
 
-def test_parse_wpa_mka_participants():
-    """Parse primary/fallback roles from runtime supplicant output."""
-    output = """
-participant_idx=0
-ckn=AABB
-active=Yes participant=Yes retain=No
-is_principal=No is_primary=Yes is_key_server=No is_elected=Yes
-live_peers=0 potential_peers=0
-
-participant_idx=1
-ckn=CCDD
-active=Yes participant=Yes retain=No
-is_principal=Yes is_primary=No is_key_server=Yes is_elected=Yes
-live_peers=1 potential_peers=0
-"""
-    assert parse_wpa_mka_participants(output) == {
-        "aabb": {
-            "active": True,
-            "is_principal": False,
-            "is_primary": True,
-            "is_key_server": False,
-            "is_elected": True,
-            "live_peers": 0,
-        },
-        "ccdd": {
-            "active": True,
-            "is_principal": True,
-            "is_primary": False,
-            "is_key_server": True,
-            "is_elected": True,
-            "live_peers": 1,
-        },
-    }
-
-
 @pytest.mark.parametrize(
     "entries, expected_error",
     [
@@ -628,48 +555,6 @@ def test_enumerate_actual_ingress_sc_and_active_sa():
     assert validate_point_to_point_ingress_sc(entries) == []
 
 
-def test_active_key_state_excludes_cumulative_counters():
-    """Keep quiescence stable when only cumulative MKA counters change."""
-    participants = {
-        "aabb": {"is_principal": "true"},
-        "ccdd": {"is_principal": "false"},
-    }
-    egress_sc = {"encoding_an": "1"}
-    egress_sas = {
-        0: {"sak": "old"},
-        1: {
-            "sak": "secret-egress-sak",
-            "salt": "secret-egress-salt",
-            "ssci": "1",
-        },
-    }
-    ingress_scs = [{
-        "sci": "peer",
-        "sas": {
-            1: {
-                "active": "true",
-                "sak": "secret-ingress-sak",
-            },
-        },
-    }]
-    first = active_key_state(
-        {"keys_distributed": "1", "keys_received": "2",
-         "kay_status": "active", "secured": "true"},
-        participants, egress_sc, egress_sas, ingress_scs)
-    second = active_key_state(
-        {"keys_distributed": "99", "keys_received": "100",
-         "kay_status": "active", "secured": "true"},
-        participants, egress_sc, egress_sas, ingress_scs)
-    assert first == second
-    assert "secret-egress-sak" not in repr(first)
-    assert "secret-egress-salt" not in repr(first)
-    assert "secret-ingress-sak" not in repr(first)
-    changed = active_key_state(
-        {"kay_status": "active", "secured": "true"},
-        participants, {"encoding_an": "0"}, egress_sas, ingress_scs)
-    assert changed != first
-
-
 @pytest.mark.parametrize(
     "session, intervals, expected",
     [
@@ -691,101 +576,6 @@ def test_mka_hello_timeout_rejects_malformed(value):
             {"mka_hello_time_ms": value}, 4)
 
 
-def test_transition_stages_keep_protocol_bounds_and_overall_ceiling():
-    """Keep four/eight-hello stages inside the 30-second action budget."""
-    assert bounded_transition_stage_timeout(
-        8, action_started=100, now=100) == 9
-    assert bounded_transition_stage_timeout(
-        16, action_started=100, now=109) == 17
-    assert bounded_transition_stage_timeout(
-        16, action_started=100, now=125) == 5
-    assert remaining_transition_seconds(
-        action_started=100, now=131) == 0
-
-
-def test_following_log_cursor_is_rotation_aware_and_case_insensitive():
-    """Read only post-action logs and match the verified Following marker."""
-    cursor = parse_mka_log_cursor(
-        "123 456 789", "macsec0")
-    assert cursor == {
-        "container": "macsec0",
-        "syslog_inode": "123",
-        "syslog_size": 456,
-        "epoch": 789,
-    }
-    command = build_mka_log_cursor_command(cursor)
-    assert "tail -c +457 /var/log/syslog" in command
-    assert "/var/log/syslog.1 /var/log/syslog" in command
-    assert "docker logs --since 789 macsec0" in command
-    assert mka_following_marker_seen(
-        "KaY: Following key server onto CKN AABB", "aabb")
-    assert not mka_following_marker_seen(
-        "KaY: Following key server onto CKN CCDD", "aabb")
-    with pytest.raises(ValueError, match="Malformed MKA log cursor"):
-        parse_mka_log_cursor(
-            "$(stat -c %i /var/log/syslog) literal", "macsec0")
-
-
-def test_log_cursor_helpers_use_shell_capable_host_api():
-    """Execute compound stat/tail/docker commands through host.shell."""
-    capture_source = _function_source(
-        FALLBACK_TEST_PATH, "_capture_mka_log_cursor")
-    read_source = _function_source(
-        FALLBACK_TEST_PATH, "_mka_log_since_cursor")
-    assert "host.shell(" in capture_source
-    assert "host.command(" not in capture_source
-    assert "host.shell(" in read_source
-    assert "host.command(" not in read_source
-
-
-def test_direct_actor_readiness_requires_authoritative_role_tuple():
-    """Require active/live/primary/principal/key-server/elected direct state."""
-    participants = {
-        "primary": {
-            "active": True,
-            "live_peers": 1,
-            "is_primary": True,
-            "is_principal": True,
-            "is_key_server": True,
-            "is_elected": True,
-        },
-    }
-    assert validate_observed_actor_state(
-        participants, "PRIMARY", True, True, True, True) == []
-    participants["primary"]["is_key_server"] = False
-    assert "primary is_key_server=False, expected True" in \
-        validate_observed_actor_state(
-            participants, "primary", True, True, True, True)
-    participants["primary"]["is_key_server"] = False
-    assert validate_observed_actor_state(
-        participants, "primary", True, True, False, True) == []
-
-
-def test_observed_fallback_takeover_tuple_is_strict():
-    """Accept published fallback ownership while rejecting stale primary."""
-    participants = {
-        "primary": {
-            "active": True,
-            "live_peers": 0,
-            "is_principal": False,
-        },
-        "fallback": {
-            "active": True,
-            "live_peers": 1,
-            "is_primary": False,
-            "is_principal": True,
-            "is_key_server": True,
-            "is_elected": True,
-        },
-    }
-    assert validate_observed_fallback_takeover(
-        participants, "primary", "fallback") == []
-    participants["primary"]["live_peers"] = 1
-    assert "primary retains a live peer" in \
-        validate_observed_fallback_takeover(
-            participants, "primary", "fallback")
-
-
 def test_fresh_state_publication_is_separate_from_runtime_readiness():
     """Require a fresh, in-sync STATE_DB timestamp after daemon resume."""
     session = {
@@ -797,239 +587,10 @@ def test_fresh_state_publication_is_separate_from_runtime_readiness():
     assert not fresh_mka_state_published(session, "new")
     assert not fresh_mka_state_published(
         dict(session, query_status="error"), "old")
-    assert mka_state_publication_within_budget(0, 32.2)
-    assert mka_state_publication_within_budget(0, 60)
-    assert not mka_state_publication_within_budget(0, 60.001)
-
-
-def _sa_lifecycle(
-        tx_active=("1", "old-tx"),
-        tx_sas=None,
-        rx_active=None,
-        rx_sas=None,
-        port_enabled=True):
-    if tx_sas is None:
-        tx_sas = {("1", "old-tx")}
-    if rx_active is None:
-        rx_active = {("peer", "1", "old-rx")}
-    if rx_sas is None:
-        rx_sas = set(rx_active)
-    return {
-        "port_enabled": port_enabled,
-        "tx_active": tx_active,
-        "tx_sas": set(tx_sas),
-        "rx_active": set(rx_active),
-        "rx_sas": set(rx_sas),
-    }
-
-
-def test_pre_distsak_lifecycle_keeps_inherited_key_usable():
-    """Allow new RX installation while retaining inherited active TX/RX."""
-    inherited = _sa_lifecycle()
-    current = _sa_lifecycle(
-        rx_active={
-            ("peer", "1", "old-rx"),
-            ("peer", "2", "new-rx"),
-        },
-        rx_sas={
-            ("peer", "1", "old-rx"),
-            ("peer", "2", "new-rx"),
-        },
-    )
-    assert validate_pre_distsak_lifecycle(inherited, current) == []
-    current["tx_active"] = ("2", "new-tx")
-    assert "active TX key/AN changed before peer Following" in \
-        validate_pre_distsak_lifecycle(inherited, current)
-
-
-@pytest.mark.parametrize(
-    "sample, expected_error",
-    [
-        (_sa_lifecycle(port_enabled=False),
-         "APPL_DB controlled port is disabled"),
-        (_sa_lifecycle(tx_active=("", None)),
-         "active/usable egress SA set is empty"),
-        (_sa_lifecycle(rx_active=set()),
-         "active/usable ingress SA set is empty"),
-    ],
-)
-def test_sa_lifecycle_rejects_port_or_active_sa_gaps(
-        sample, expected_error):
-    """Reject disabled-port and empty active-SA samples."""
-    assert expected_error in validate_macsec_sa_lifecycle_sample(sample)
-
-
-def test_make_before_break_allows_overlap_or_collapsed_publication():
-    """Accept old-to-overlap-to-new and adjacent old-to-new samples."""
-    inherited = _sa_lifecycle()
-    overlap = _sa_lifecycle(
-        tx_sas={("1", "old-tx"), ("2", "new-tx")},
-        rx_active={
-            ("peer", "1", "old-rx"),
-            ("peer", "2", "new-rx"),
-        },
-        rx_sas={
-            ("peer", "1", "old-rx"),
-            ("peer", "2", "new-rx"),
-        },
-    )
-    new = _sa_lifecycle(
-        tx_active=("2", "new-tx"),
-        tx_sas={("2", "new-tx")},
-        rx_active={("peer", "2", "new-rx")},
-        rx_sas={("peer", "2", "new-rx")},
-    )
-    assert validate_make_before_break_samples(
-        inherited, [inherited, overlap, new], 1) == []
-    assert validate_make_before_break_samples(
-        inherited, [inherited, new], 1) == []
-
-
-def test_make_before_break_allows_cross_source_rx_publication_lag():
-    """Do not infer TX-before-RX failure from asynchronous sampled sources."""
-    inherited = _sa_lifecycle()
-    tx_switched_before_rx_publication = _sa_lifecycle(
-        tx_active=("2", "new-tx"),
-        tx_sas={("1", "old-tx"), ("2", "new-tx")},
-        rx_active={("peer", "1", "old-rx")},
-        rx_sas={("peer", "1", "old-rx")},
-    )
-    final = _sa_lifecycle(
-        tx_active=("2", "new-tx"),
-        tx_sas={("2", "new-tx")},
-        rx_active={("peer", "2", "new-rx")},
-        rx_sas={("peer", "2", "new-rx")},
-    )
-    assert validate_make_before_break_generations(
-        inherited,
-        [inherited, tx_switched_before_rx_publication, final],
-        1,
-    ) == []
-
-
-def test_make_before_break_accepts_multiple_key_generations():
-    """Validate deferred AN1 then AN2 handoffs generation by generation."""
-    inherited = _sa_lifecycle()
-    generation_one = _sa_lifecycle(
-        tx_active=("2", "tx-one"),
-        tx_sas={("1", "old-tx"), ("2", "tx-one")},
-        rx_active={("peer", "2", "rx-one")},
-        rx_sas={
-            ("peer", "1", "old-rx"),
-            ("peer", "2", "rx-one"),
-        },
-    )
-    generation_two = _sa_lifecycle(
-        tx_active=("3", "tx-two"),
-        tx_sas={("2", "tx-one"), ("3", "tx-two")},
-        rx_active={("peer", "3", "rx-two")},
-        rx_sas={
-            ("peer", "2", "rx-one"),
-            ("peer", "3", "rx-two"),
-        },
-    )
-    assert validate_make_before_break_generations(
-        inherited,
-        [inherited, generation_one, generation_one,
-         generation_two, generation_two],
-        1,
-    ) == []
-
-
-def test_make_before_break_rejects_old_sa_early_deletion():
-    """Reject old TX/RX deletion before the new handoff boundary."""
-    inherited = _sa_lifecycle()
-    broken = _sa_lifecycle(
-        tx_active=("1", "old-tx"),
-        tx_sas={("2", "new-tx")},
-        rx_active={("peer", "2", "new-rx")},
-        rx_sas={("peer", "2", "new-rx")},
-    )
-    new = _sa_lifecycle(
-        tx_active=("2", "new-tx"),
-        tx_sas={("2", "new-tx")},
-        rx_active={("peer", "2", "new-rx")},
-        rx_sas={("peer", "2", "new-rx")},
-    )
-    errors = validate_make_before_break_samples(
-        inherited, [broken, new], 1)
-    assert any("before peer Following" in error for error in errors)
-    assert any(
-        "old TX SA was deleted before new TX activation" in error
-        for error in errors)
-    assert "old RX SA was deleted before remote TX handoff" in errors
-
-
-def test_final_new_key_must_change_and_stabilize():
-    """Require two stable post-Following polls on a new usable key."""
-    inherited = _sa_lifecycle()
-    new = _sa_lifecycle(
-        tx_active=("2", "new-tx"),
-        tx_sas={("2", "new-tx")},
-        rx_active={("peer", "2", "new-rx")},
-        rx_sas={("peer", "2", "new-rx")},
-    )
-    assert final_new_key_stable(inherited, new, new)
-    assert not final_new_key_stable(inherited, inherited, inherited)
-
-
-def test_lifecycle_sample_normalizes_key_state():
-    """Build non-secret active and installed SA identity sets."""
-    key_state = {
-        "egress_encoding_an": "2",
-        "egress_active": {
-            "key_fingerprint": "new-tx",
-            "present": True,
-        },
-        "egress_sas": [
-            {
-                "an": "1",
-                "key_fingerprint": "old-tx",
-                "present": True,
-            },
-            {
-                "an": "2",
-                "key_fingerprint": "new-tx",
-                "present": True,
-            },
-        ],
-        "ingress": [{
-            "sci": "peer",
-            "sas": [
-                {
-                    "an": "1",
-                    "key_fingerprint": "old-rx",
-                    "present": True,
-                },
-                {
-                    "an": "2",
-                    "key_fingerprint": "new-rx",
-                    "present": True,
-                },
-            ],
-            "active_sas": [
-                {
-                    "an": "2",
-                    "key_fingerprint": "new-rx",
-                    "present": True,
-                },
-            ],
-        }],
-    }
-    assert macsec_sa_lifecycle_sample("true", key_state) == {
-        "port_enabled": True,
-        "tx_active": ("2", "new-tx"),
-        "tx_sas": {("1", "old-tx"), ("2", "new-tx")},
-        "rx_sas": {
-            ("peer", "1", "old-rx"),
-            ("peer", "2", "new-rx"),
-        },
-        "rx_active": {("peer", "2", "new-rx")},
-    }
 
 
 def test_eos_key_replacement_status_and_rebind_decision():
-    """Require new config/runtime CKN and old actor absence after hot update."""
+    """Require new CKN state and old actor absence after hot update."""
     participants = {
         "new": {
             "success": False, "active": False, "failed": False,
@@ -1342,81 +903,6 @@ def test_validate_lifecycle_cleanup_state_requires_fresh_healthy_state():
     assert "egress SC is missing" in errors
 
 
-def _function_calls(path, function_name):
-    tree = ast.parse(path.read_text())
-    function = next(
-        node for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == function_name
-    )
-    calls = set()
-    for node in ast.walk(function):
-        if not isinstance(node, ast.Call):
-            continue
-        if isinstance(node.func, ast.Name):
-            calls.add(node.func.id)
-        elif isinstance(node.func, ast.Attribute):
-            calls.add(node.func.attr)
-    return calls
-
-
-def _function_source(path, function_name):
-    source = path.read_text()
-    tree = ast.parse(source)
-    function = next(
-        node for node in tree.body
-        if isinstance(node, ast.FunctionDef)
-        and node.name == function_name
-    )
-    return ast.get_source_segment(source, function)
-
-
-@pytest.mark.parametrize(
-    "function_name",
-    ["_replace_peer_key_and_verify", "_delete_peer_key_and_verify"],
-)
-def test_eos_hot_update_helpers_never_detach_profiles(function_name):
-    """Keep hitless EOS updates strictly key-line-only."""
-    calls = _function_calls(FALLBACK_TEST_PATH, function_name)
-    assert not calls.intersection({
-        "_replace_peer_profile",
-        "disable_macsec_port",
-        "enable_macsec_port",
-        "delete_macsec_profile",
-    })
-
-
-def test_primary_rotation_preserves_selected_link_names():
-    """Prevent reconciliation loops from overwriting selected link identity."""
-    source = _function_source(
-        FALLBACK_TEST_PATH,
-        "test_primary_failure_rotation_and_recovery_are_hitless")
-    assert "selected_port, selected_neighbor = _select_routed_link" in source
-    assert "for candidate_port in environment[\"links\"]" in source
-    assert "remaining_link_items(" in source
-    assert "for port in environment[\"links\"]" not in source
-
-
-def test_primary_rotation_uses_staged_timing_without_weakening_expiry():
-    """Use supported staged convergence without direct WPA manipulation."""
-    source = _function_source(
-        FALLBACK_TEST_PATH,
-        "test_primary_failure_rotation_and_recovery_are_hitless")
-    assert "_wait_peer_actor_then_dut_owner(" in source
-    assert "MKA_STATE_PUBLISH_TIMEOUT" in source
-    assert "MKA_TRANSITION_CONVERGENCE_TIMEOUT" in source
-    assert "_capture_environment_last_updated(" in source
-    assert "_wait_restored_environment_published(" in source
-    assert '"original primary cleanup"' in source
-
-
-def test_actor_readiness_uses_supported_operational_state():
-    """Use normalized EOS show or SONiC STATE_DB actor state."""
-    source = _function_source(
-        FALLBACK_TEST_PATH, "_wait_actor_ready")
-    assert "_observed_participants(" in source
-
-
 def test_fallback_module_has_no_direct_wpa_control_paths():
     """Keep sonic-mgmt E2E on supported config and state interfaces."""
     source = FALLBACK_TEST_PATH.read_text()
@@ -1437,105 +923,15 @@ def test_fallback_module_has_no_direct_wpa_control_paths():
         assert token not in source
 
 
-def test_primary_delete_only_is_ceos_scoped():
-    """Run delete-only E2E only through supported cEOS key-line config."""
-    source = _function_source(
-        FALLBACK_TEST_PATH,
-        "test_primary_failure_rotation_and_recovery_are_hitless")
-    assert 'isinstance(selected_neighbor["host"], EosHost)' in source
-    assert "no supported config interface removes one" in source
-    assert "_delete_peer_key_and_verify(" in source
-
-
 def test_query_failure_is_component_level_skip():
     """Do not stop or query per-port WPA processes from E2E."""
-    source = _function_source(
-        FALLBACK_TEST_PATH,
-        "test_query_failure_retains_state_and_recovers")
+    source = FALLBACK_TEST_PATH.read_text()
+    marker = "def test_query_failure_retains_state_and_recovers"
+    source = source[source.index(marker):]
+    source = source[:source.index("\ndef ", 1)]
     assert "pytest.skip(" in source
     assert "direct wpa_supplicant" in source
     assert "supported service restart" in source
-
-
-def test_sonic_both_invalid_uses_temporary_profile_rebind():
-    """Reach both-invalid through supported destructive profile binding."""
-    source = _function_source(
-        FALLBACK_TEST_PATH,
-        "test_both_invalid_tears_down_and_fallback_recovers")
-    assert "MKA_BOTH_INVALID_" in source
-    assert "disable_macsec_port(" in source
-    assert "enable_macsec_port(" in source
-    assert "_sonic_peer_profile_ready" in source
-    assert "_sonic_peer_both_invalid_teardown_ready" in source
-    assert "_sonic_peer_both_invalid_teardown_state" in source
-    assert "cEOS controlled port remained open" in source
-
-
-def test_peer_follow_scopes_stability_before_following_boundary():
-    """Allow a new key after Following while validating pre-edge MBB state."""
-    source = _function_source(FALLBACK_TEST_PATH, "_wait_peer_follow")
-    assert "validate_pre_distsak_lifecycle(" in source
-    assert "validate_make_before_break_generations(" in source
-    assert "final_new_key_stable(" in source
-    assert "stable_active_key_during_asymmetry(" not in source
-
-
-def test_peer_follow_splits_action_and_post_follow_windows():
-    """Start a separate stability window after Following at the action edge."""
-    source = _function_source(FALLBACK_TEST_PATH, "_wait_peer_follow")
-    assert "action_deadline" in source
-    assert "MKA_POST_FOLLOW_STABILITY_TIMEOUT" in source
-    assert "_following_primary_seen(" in source
-    assert "following_seen or (peer_ready and key_changed)" in source
-
-
-def test_mismatch_uses_published_takeover_state():
-    """Judge mismatch takeover through supported STATE_DB publication."""
-    source = _function_source(
-        FALLBACK_TEST_PATH,
-        "test_fallback_rotation_rejected_without_live_primary")
-    assert "_published_fallback_takeover_ready" in source
-    assert "_restore_and_verify_peer_cleanup" in source
-    assert "raise body_error.with_traceback(body_traceback)" in source
-
-
-def test_peer_cleanup_branches_by_host_type():
-    """Keep cEOS free of STATE_DB waits and SONiC destructively restored."""
-    source = _function_source(
-        FALLBACK_TEST_PATH, "_restore_and_verify_peer_cleanup")
-    eos_branch, sonic_branch = source.split("else:", 1)
-    assert "_replace_peer_profile(" in eos_branch
-    assert "get_mka_state(" not in eos_branch
-    assert "disable_macsec_port(" in sonic_branch
-    assert "delete_macsec_profile(" in sonic_branch
-    assert "_set_profile(" in sonic_branch
-    assert "enable_macsec_port(" in sonic_branch
-    assert "_peer_original_operational_ready" in sonic_branch
-    assert "_peer_published_original_state_ready" in sonic_branch
-
-
-def test_timing_policy_constants_match_wpa_semantics():
-    """Pin four/eight-hello stages and the 30-second overall ceiling."""
-    source = FALLBACK_TEST_PATH.read_text()
-    assert "MKA_LIVENESS_INTERVALS = 4" in source
-    assert "MKA_ACTOR_READY_INTERVALS = 4" in source
-    assert "MKA_ADVERTISEMENT_READY_INTERVALS = 5" in source
-    assert "MKA_PEER_FOLLOW_INTERVALS = 8" in source
-    assert "MKA_TRANSITION_CONVERGENCE_TIMEOUT = 30" in source
-    assert "MKA_POST_FOLLOW_STABILITY_TIMEOUT = 12" in source
-    assert "MKA_STATE_PUBLISH_TIMEOUT = 60" in source
-
-
-def test_crossed_roles_use_non_key_server_peer_follow_stage():
-    """Give DUT non-key-server ownership a fresh eight-hello follow stage."""
-    helper_source = _function_source(
-        FALLBACK_TEST_PATH,
-        "_wait_authoritative_peer_then_dut_follow")
-    test_source = _function_source(
-        FALLBACK_TEST_PATH,
-        "test_crossed_roles_follow_key_server_primary")
-    assert "MKA_PEER_FOLLOW_INTERVALS" in helper_source
-    assert "_wait_authoritative_peer_then_dut_follow(" in test_source
 
 
 def test_cleanup_all_runs_every_cleanup_before_raising():

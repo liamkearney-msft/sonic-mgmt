@@ -1,5 +1,4 @@
 import ast
-import hashlib
 import json
 import math
 import re
@@ -20,7 +19,6 @@ REQUIRED_SESSION_FIELDS = {
     "secured",
     "failed",
     "actor_sci",
-    "key_server_sci",
     "actor_priority",
     "key_server_priority",
     "is_key_server",
@@ -171,43 +169,6 @@ def validate_eos_mka_participants(
     return errors
 
 
-def parse_wpa_mka_participants(output):
-    """Parse ``macsec_mka_list`` output into role and liveness fields."""
-    blocks = []
-    current = {}
-    for line in output.splitlines():
-        line = line.strip()
-        if not line:
-            if current:
-                blocks.append(current)
-                current = {}
-            continue
-        if line.startswith("participant_idx=") and current:
-            blocks.append(current)
-            current = {}
-        for field in line.split():
-            if "=" in field:
-                key, value = field.split("=", 1)
-                current[key] = value
-    if current:
-        blocks.append(current)
-
-    participants = {}
-    for block in blocks:
-        ckn = block.get("ckn", "").lower()
-        if not ckn:
-            continue
-        participants[ckn] = {
-            "active": _as_bool(block.get("active")),
-            "is_principal": _as_bool(block.get("is_principal")),
-            "is_primary": _as_bool(block.get("is_primary")),
-            "is_key_server": _as_bool(block.get("is_key_server")),
-            "is_elected": _as_bool(block.get("is_elected")),
-            "live_peers": int(block.get("live_peers", "0")),
-        }
-    return participants
-
-
 def parse_eos_profile_ckns(output, profile_name):
     """Return configured CKNs for one EOS MACsec profile without key data."""
     ckns = set()
@@ -267,7 +228,7 @@ def eos_key_replacement_status(
 def eos_key_deletion_status(
         configured_ckns, participants, deleted_ckn,
         remaining_ckns, controlled_port=True):
-    """Validate that one EOS actor was deleted and survivors stay operational."""
+    """Validate deleted EOS actor state and operational survivors."""
     deleted_ckn = deleted_ckn.lower()
     remaining_ckns = {ckn.lower() for ckn in remaining_ckns}
     errors = []
@@ -454,79 +415,6 @@ def validate_point_to_point_ingress_sc(entries):
     return []
 
 
-def active_key_state(
-        session, participants, egress_sc, egress_sas, ingress_scs):
-    """Normalize stable key/AN identity while excluding cumulative counters."""
-    def _fingerprint(*values):
-        material = "|".join(str(value or "") for value in values)
-        return hashlib.sha256(material.encode()).hexdigest()
-
-    principals = sorted(
-        ckn for ckn, participant in participants.items()
-        if participant.get("is_principal") == "true")
-    encoding_an = str(egress_sc.get("encoding_an", ""))
-    try:
-        encoding_an_key = int(encoding_an)
-    except (TypeError, ValueError):
-        encoding_an_key = None
-    active_egress = (
-        egress_sas.get(encoding_an_key, {})
-        if encoding_an_key is not None else {})
-
-    normalized_egress_sas = []
-    for an, sa in sorted(egress_sas.items()):
-        normalized_egress_sas.append({
-            "an": str(an),
-            "key_fingerprint": _fingerprint(
-                sa.get("sak"), sa.get("auth_key"),
-                sa.get("salt"), sa.get("ssci")),
-            "present": bool(sa.get("sak")),
-            "ssci": sa.get("ssci"),
-        })
-
-    ingress = []
-    for entry in ingress_scs:
-        active_sas = []
-        all_sas = []
-        for an, sa in sorted(entry.get("sas", {}).items()):
-            normalized_sa = {
-                "an": str(an),
-                "key_fingerprint": _fingerprint(
-                    sa.get("sak"), sa.get("auth_key"),
-                    sa.get("salt"), sa.get("ssci")),
-                "present": bool(sa.get("sak")),
-                "ssci": sa.get("ssci"),
-            }
-            all_sas.append(normalized_sa)
-            if sa.get("active") == "true":
-                active_sas.append(normalized_sa)
-        ingress.append({
-            "sci": entry.get("sci"),
-            "all_ans": sorted(str(an) for an in entry.get("sas", {})),
-            "sas": all_sas,
-            "active_sas": active_sas,
-        })
-
-    return {
-        "principal_ckns": principals,
-        "egress_encoding_an": encoding_an,
-        "egress_all_ans": sorted(str(an) for an in egress_sas),
-        "egress_sas": normalized_egress_sas,
-        "egress_active": {
-            "key_fingerprint": _fingerprint(
-                active_egress.get("sak"),
-                active_egress.get("auth_key"),
-                active_egress.get("salt"),
-                active_egress.get("ssci")),
-            "present": bool(active_egress.get("sak")),
-            "ssci": active_egress.get("ssci"),
-        },
-        "ingress": ingress,
-        "kay_status": session.get("kay_status"),
-        "secured": session.get("secured"),
-    }
-
-
 def mka_hello_timeout_seconds(session, intervals, default_hello_ms=2000):
     """Return a protocol-aware timeout for the requested hello intervals."""
     value = session.get("mka_hello_time_ms")
@@ -544,54 +432,6 @@ def mka_hello_timeout_seconds(session, intervals, default_hello_ms=2000):
     return max(1, int(math.ceil(intervals * hello_ms / 1000.0)))
 
 
-def remaining_transition_seconds(
-        action_started, now, convergence_ceiling=30):
-    """Return the remaining whole-second convergence budget."""
-    return max(
-        0,
-        int(math.ceil(convergence_ceiling - (now - action_started))),
-    )
-
-
-def bounded_transition_stage_timeout(
-        protocol_seconds, action_started, now,
-        convergence_ceiling=30, observation_cushion=1):
-    """Bound one protocol stage by its limit and the action-wide ceiling."""
-    remaining = remaining_transition_seconds(
-        action_started, now, convergence_ceiling)
-    return min(
-        remaining,
-        max(1, int(math.ceil(
-            protocol_seconds + observation_cushion))),
-    )
-
-
-def validate_observed_actor_state(
-        participants, ckn, is_primary, is_principal,
-        is_key_server, is_elected, absent_ckn=None):
-    """Validate normalized actor readiness from a supported state surface."""
-    errors = []
-    ckn = ckn.lower()
-    if absent_ckn and absent_ckn.lower() in participants:
-        errors.append("old CKN remains in runtime participants")
-    participant = participants.get(ckn, {})
-    if not participant.get("active"):
-        errors.append("{} is not active".format(ckn))
-    if participant.get("live_peers", 0) < 1:
-        errors.append("{} has no live peer".format(ckn))
-    expected = {
-        "is_primary": is_primary,
-        "is_principal": is_principal,
-        "is_key_server": is_key_server,
-        "is_elected": is_elected,
-    }
-    for field, value in expected.items():
-        if value is not None and participant.get(field) is not value:
-            errors.append("{} {}={!r}, expected {!r}".format(
-                ckn, field, participant.get(field), value))
-    return errors
-
-
 def fresh_mka_state_published(session, previous_last_updated):
     """Return whether a fresh, usable MKA snapshot was published."""
     return (
@@ -600,225 +440,6 @@ def fresh_mka_state_published(session, previous_last_updated):
         and bool(session.get("last_updated"))
         and session.get("last_updated") != previous_last_updated
     )
-
-
-def mka_state_publication_within_budget(
-        started_at, observed_at, budget_seconds=60):
-    """Return whether publication occurred within the status-sweep budget."""
-    elapsed = observed_at - started_at
-    return 0 <= elapsed <= budget_seconds
-
-
-def parse_mka_log_cursor(output, container):
-    """Parse syslog inode/size/time into an action-local log cursor."""
-    values = output.split()
-    if len(values) != 3:
-        raise ValueError("Malformed MKA log cursor output {!r}".format(
-            output))
-    inode, size, epoch = values
-    return {
-        "container": container,
-        "syslog_inode": inode,
-        "syslog_size": int(size),
-        "epoch": int(epoch),
-    }
-
-
-def build_mka_log_cursor_command(cursor):
-    """Build a rotation-aware command returning only post-cursor MKA logs."""
-    return (
-        "current=$(stat -c %i /var/log/syslog); "
-        "if [ \"$current\" = '{inode}' ]; then "
-        "tail -c +{offset} /var/log/syslog; "
-        "else cat /var/log/syslog.1 /var/log/syslog 2>/dev/null; fi; "
-        "docker logs --since {epoch} {container} 2>&1 || true"
-    ).format(
-        inode=cursor["syslog_inode"],
-        offset=cursor["syslog_size"] + 1,
-        epoch=cursor["epoch"],
-        container=cursor["container"],
-    )
-
-
-def mka_following_marker_seen(output, ckn):
-    """Match a post-cursor Following marker case-insensitively."""
-    output = output.lower()
-    return (
-        "following key server onto ckn" in output
-        and ckn.lower() in output
-    )
-
-
-def macsec_sa_lifecycle_sample(port_enabled, key_state):
-    """Normalize non-secret TX/RX SA lifecycle state for one poll."""
-    tx_active = (
-        str(key_state.get("egress_encoding_an", "")),
-        (
-            key_state.get("egress_active", {}).get("key_fingerprint")
-            if key_state.get("egress_active", {}).get("present")
-            else None
-        ),
-    )
-    tx_sas = {
-        (sa.get("an"), sa.get("key_fingerprint"))
-        for sa in key_state.get("egress_sas", [])
-        if sa.get("present")
-    }
-    rx_sas = {
-        (entry.get("sci"), sa.get("an"), sa.get("key_fingerprint"))
-        for entry in key_state.get("ingress", [])
-        for sa in entry.get("sas", [])
-        if sa.get("present")
-    }
-    rx_active = {
-        (entry.get("sci"), sa.get("an"), sa.get("key_fingerprint"))
-        for entry in key_state.get("ingress", [])
-        for sa in entry.get("active_sas", [])
-        if sa.get("present")
-    }
-    return {
-        "port_enabled": port_enabled == "true",
-        "tx_active": tx_active,
-        "tx_sas": tx_sas,
-        "rx_sas": rx_sas,
-        "rx_active": rx_active,
-    }
-
-
-def validate_pre_distsak_lifecycle(inherited, current):
-    """Require the inherited key to remain usable before peer Following."""
-    errors = validate_macsec_sa_lifecycle_sample(current)
-    if current.get("tx_active") != inherited.get("tx_active"):
-        errors.append("active TX key/AN changed before peer Following")
-    inherited_rx = inherited.get("rx_active", set())
-    if not inherited_rx.issubset(current.get("rx_active", set())):
-        errors.append("inherited active RX SA disappeared before peer Following")
-    return errors
-
-
-def validate_macsec_sa_lifecycle_sample(sample):
-    """Reject controlled-port or empty active-SA gaps in one lifecycle poll."""
-    errors = []
-    if not sample.get("port_enabled"):
-        errors.append("APPL_DB controlled port is disabled")
-    tx_active = sample.get("tx_active")
-    if not tx_active or not tx_active[1]:
-        errors.append("active/usable egress SA set is empty")
-    elif tx_active not in sample.get("tx_sas", set()):
-        errors.append("active egress SA is absent from installed TX SAs")
-    if not sample.get("rx_active"):
-        errors.append("active/usable ingress SA set is empty")
-    elif not sample.get("rx_active", set()).issubset(
-            sample.get("rx_sas", set())):
-        errors.append("active ingress SA is absent from installed RX SAs")
-    return errors
-
-
-def validate_make_before_break_generations(
-        inherited, samples, following_index):
-    """Validate each observed MBB generation without requiring overlap."""
-    errors = []
-    if not samples:
-        return ["no SA lifecycle samples were captured"]
-    if following_index is None:
-        return ["peer Following boundary was not observed"]
-
-    for index, sample in enumerate(samples):
-        errors.extend(
-            "sample {}: {}".format(index, error)
-            for error in validate_macsec_sa_lifecycle_sample(sample)
-        )
-        if index < following_index:
-            errors.extend(
-                "sample {}: {}".format(index, error)
-                for error in validate_pre_distsak_lifecycle(
-                    inherited, sample)
-            )
-
-    final = samples[-1]
-    if final.get("tx_active") == inherited.get("tx_active"):
-        errors.append("new TX key/AN did not become active after Following")
-    if final.get("rx_active") == inherited.get("rx_active"):
-        errors.append("new RX key/AN did not become active after Following")
-
-    old_rx = inherited.get("rx_active", set())
-    for index, sample in enumerate(samples[:following_index]):
-        if not old_rx.issubset(sample.get("rx_sas", set())):
-            errors.append(
-                "old RX SA was deleted before remote TX handoff")
-            break
-
-    generation = inherited
-    previous_sample = (
-        samples[following_index - 1]
-        if following_index > 0 else inherited)
-    for index, sample in enumerate(
-            samples[following_index:], start=following_index):
-        if sample.get("tx_active") == generation.get("tx_active"):
-            previous_sample = sample
-            continue
-
-        new_tx = sample.get("tx_active")
-        old_tx = generation.get("tx_active")
-        if new_tx not in sample.get("tx_sas", set()):
-            errors.append(
-                "sample {}: new TX is not installed".format(index))
-
-        if (old_tx not in previous_sample.get("tx_sas", set())
-                and previous_sample.get("tx_active") == old_tx):
-            errors.append(
-                "sample {}: old TX SA was deleted before new TX "
-                "activation".format(index - 1))
-
-        generation = sample
-        previous_sample = sample
-    return errors
-
-
-def validate_make_before_break_samples(
-        inherited, samples, following_index):
-    """Backward-compatible alias for per-generation MBB validation."""
-    return validate_make_before_break_generations(
-        inherited, samples, following_index)
-
-
-def final_new_key_stable(inherited, previous, current):
-    """Return whether the post-Following key changed and then stabilized."""
-    return (
-        previous is not None
-        and current == previous
-        and current.get("tx_active") != inherited.get("tx_active")
-        and current.get("rx_active") != inherited.get("rx_active")
-        and not validate_macsec_sa_lifecycle_sample(current)
-    )
-
-
-def validate_observed_fallback_takeover(
-        participants, primary_ckn, fallback_ckn):
-    """Validate fallback ownership from a supported operational state."""
-    primary_ckn = primary_ckn.lower()
-    fallback_ckn = fallback_ckn.lower()
-    primary = participants.get(primary_ckn, {})
-    fallback = participants.get(fallback_ckn, {})
-    errors = []
-    if primary.get("live_peers", 0) != 0:
-        errors.append("primary retains a live peer")
-    if primary.get("is_principal"):
-        errors.append("primary remains principal")
-    expected = {
-        "active": True,
-        "is_primary": False,
-        "is_principal": True,
-        "is_key_server": True,
-        "is_elected": True,
-    }
-    if fallback.get("live_peers", 0) < 1:
-        errors.append("fallback has no live peer")
-    for field, expected_value in expected.items():
-        if fallback.get(field) is not expected_value:
-            errors.append("fallback {}={!r}, expected {!r}".format(
-                field, fallback.get(field), expected_value))
-    return errors
 
 
 def get_macsec_max_sa_per_sc(host, interface):
