@@ -2,7 +2,7 @@ import json
 import logging
 import re
 import time
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 
 import pytest
 from passlib.hash import cisco_type7
@@ -227,8 +227,26 @@ def _wait_peer_protected(
         return not errors[0]
 
     assert wait_until(timeout, 2, 0, _ready), (
-        "{} peer did not become protected by {}: {}"
-    ).format(adapter.provider, principal_ckn, errors[0])
+        "{} peer did not become protected by {}: {}; diagnostics={}"
+    ).format(
+        adapter.provider,
+        principal_ckn,
+        errors[0],
+        adapter.diagnostics(),
+    )
+
+
+def _wait_peer_primary_removed(
+        adapter, original_profile, timeout=MKA_STATE_PUBLISH_TIMEOUT):
+    errors = [None]
+
+    def _removed():
+        errors[0] = adapter.primary_removed_errors(original_profile)
+        return not errors[0]
+
+    assert wait_until(timeout, 2, 0, _removed), (
+        "{} peer did not remove the original primary: {}; diagnostics={}"
+    ).format(adapter.provider, errors[0], adapter.diagnostics())
 
 
 def _wait_link_blocked(
@@ -293,36 +311,154 @@ def _diagnostics(environment, port):
     }
 
 
-def _establish_primary_mismatch(environment, port, invalid_pair):
+def _safe_diagnostics(environment, port):
+    try:
+        return _diagnostics(environment, port)
+    except Exception as error:
+        return {"collection_error": type(error).__name__}
+
+
+@contextmanager
+def _primary_mismatch(environment, port, invalid_pair):
     profile = environment["profile"]
     adapter = peer_adapter(environment, port)
+    original_profile = dict(environment["peer_profiles"][port])
     original_pair = (
-        environment["peer_profiles"][port]["primary_cak"],
-        environment["peer_profiles"][port]["primary_ckn"],
+        original_profile["primary_cak"],
+        original_profile["primary_ckn"],
     )
-    adapter.rotate("primary", original_pair, invalid_pair)
-    _wait_link_protected(
-        environment, port, profile["fallback_ckn"],
-        require_all_live=False)
-    _wait_peer_protected(
-        adapter,
-        environment["peer_profiles"][port],
-        profile["fallback_ckn"],
-        require_all_live=False,
-    )
-    return adapter, original_pair
+    mismatched_profile = adapter.profile_with_pair(
+        original_profile, "primary", invalid_pair)
+    body_error = None
+    body_traceback = None
+
+    try:
+        if adapter.supports_primary_delete:
+            adapter.delete_primary_if_supported(original_pair)
+            _wait_link_protected(
+                environment, port, profile["fallback_ckn"],
+                require_all_live=False)
+            _wait_peer_primary_removed(adapter, original_profile)
+            adapter.add_primary(invalid_pair)
+        else:
+            adapter.rotate(
+                "primary",
+                original_pair,
+                invalid_pair,
+                commit=False,
+                base_profile=original_profile,
+            )
+
+        _wait_link_protected(
+            environment, port, profile["fallback_ckn"],
+            require_all_live=False)
+        _wait_peer_protected(
+            adapter,
+            mismatched_profile,
+            profile["fallback_ckn"],
+            require_all_live=False,
+        )
+        adapter.commit_profile(mismatched_profile)
+        yield adapter
+    except BaseException as error:
+        body_error = error
+        body_traceback = error.__traceback__
+
+    cleanup_error = None
+    try:
+        adapter.restore_primary(original_profile, invalid_pair)
+        _wait_link_protected(
+            environment, port, profile["primary_ckn"])
+        _wait_peer_protected(
+            adapter,
+            original_profile,
+            profile["primary_ckn"],
+        )
+    except BaseException as error:
+        cleanup_error = error
+    finally:
+        adapter.commit_profile(original_profile)
+
+    if body_error is not None:
+        if cleanup_error is not None:
+            logger.error(
+                "Primary mismatch cleanup failed after scenario error: %r; "
+                "diagnostics=%s",
+                cleanup_error,
+                _safe_diagnostics(environment, port),
+            )
+        raise body_error.with_traceback(body_traceback)
+    if cleanup_error is not None:
+        raise cleanup_error
 
 
-def _restore_primary_match(
-        environment, port, adapter, current_pair, original_pair):
-    adapter.rotate("primary", current_pair, original_pair)
-    _wait_link_protected(
-        environment, port, environment["profile"]["primary_ckn"])
-    _wait_peer_protected(
-        adapter,
-        environment["peer_profiles"][port],
-        environment["profile"]["primary_ckn"],
+@contextmanager
+def _ceos_fallback_mismatch(
+        environment, port, adapter, invalid_pair):
+    profile = environment["profile"]
+    original_profile = dict(environment["peer_profiles"][port])
+    original_pair = (
+        original_profile["fallback_cak"],
+        original_profile["fallback_ckn"],
     )
+    mismatched_profile = adapter.profile_with_pair(
+        original_profile, "fallback", invalid_pair)
+    previous_last_updated = _snapshot(
+        environment, port).session.get("last_updated")
+    body_error = None
+    body_traceback = None
+
+    try:
+        adapter.delete_fallback(original_pair)
+        _wait_link_blocked(
+            environment, port,
+            (profile["primary_ckn"], profile["fallback_ckn"]),
+            previous_last_updated=previous_last_updated)
+        adapter.add_fallback(invalid_pair)
+        _wait_link_blocked(
+            environment, port,
+            (profile["primary_ckn"], profile["fallback_ckn"]))
+        _wait_peer_blocked(
+            adapter,
+            (
+                mismatched_profile["primary_ckn"],
+                mismatched_profile["fallback_ckn"],
+            ),
+        )
+        adapter.commit_profile(mismatched_profile)
+        yield adapter
+    except BaseException as error:
+        body_error = error
+        body_traceback = error.__traceback__
+
+    cleanup_error = None
+    try:
+        adapter.restore_fallback(original_profile, invalid_pair)
+        _wait_link_protected(
+            environment, port, profile["fallback_ckn"],
+            require_all_live=False)
+        _wait_peer_protected(
+            adapter,
+            original_profile,
+            profile["fallback_ckn"],
+            require_all_live=False,
+        )
+    except BaseException as error:
+        cleanup_error = error
+    finally:
+        adapter.commit_profile(original_profile)
+
+    if body_error is not None:
+        if cleanup_error is not None:
+            logger.error(
+                "Fallback mismatch cleanup failed after scenario error: %r; "
+                "diagnostics=%s",
+                cleanup_error,
+                _safe_diagnostics(environment, port),
+            )
+        raise body_error.with_traceback(body_traceback)
+    if cleanup_error is not None:
+        raise cleanup_error
 
 
 def _select_routed_link(environment, upstream_links):
@@ -1000,19 +1136,10 @@ def test_primary_mismatch_fallback_takeover_and_recovery_is_hitless(
     port, _ = _select_routed_link(environment, upstream_links)
     invalid_pair = generate_macsec_key_pair(
         profile["cipher_suite"])
-    adapter = None
-    original_pair = None
 
-    try:
-        with _TrafficWindow(environment, upstream_links) as traffic:
-            adapter, original_pair = _establish_primary_mismatch(
-                environment, port, invalid_pair)
+    with _TrafficWindow(environment, upstream_links) as traffic:
+        with _primary_mismatch(environment, port, invalid_pair):
             traffic.assert_zero_loss()
-    finally:
-        if adapter is not None:
-            _restore_primary_match(
-                environment, port, adapter,
-                invalid_pair, original_pair)
 
 
 def test_fallback_rotation_rejected_while_fallback_is_principal(
@@ -1024,10 +1151,8 @@ def test_fallback_rotation_rejected_while_fallback_is_principal(
     port, _ = _select_routed_link(environment, upstream_links)
     invalid_pair = generate_macsec_key_pair(profile["cipher_suite"])
     replacement_pair = generate_macsec_key_pair(profile["cipher_suite"])
-    adapter, original_pair = _establish_primary_mismatch(
-        environment, port, invalid_pair)
 
-    try:
+    with _primary_mismatch(environment, port, invalid_pair):
         before = _snapshot(environment, port)
         before_roles = {
             ckn: (
@@ -1063,9 +1188,6 @@ def test_fallback_rotation_rejected_while_fallback_is_principal(
                 profile, profile["fallback_ckn"],
                 require_all_live=False)
             traffic.assert_zero_loss()
-    finally:
-        _restore_primary_match(
-            environment, port, adapter, invalid_pair, original_pair)
 
 
 @pytest.mark.stress_test
@@ -1635,32 +1757,23 @@ def test_both_invalid_tears_down_and_fallback_recovers(
     original_profile_name = environment["neighbor_profiles"][port]
     original_peer_profile = dict(environment["peer_profiles"][port])
     temp_profile_name = None
-    primary_pair = (
-        original_peer_profile["primary_cak"],
-        original_peer_profile["primary_ckn"],
-    )
-    fallback_pair = (
-        original_peer_profile["fallback_cak"],
-        original_peer_profile["fallback_ckn"],
-    )
     invalid_primary = (invalid_primary_cak, invalid_primary_ckn)
     invalid_fallback = (invalid_fallback_cak, invalid_fallback_ckn)
-    dut_last_updated = _snapshot(
-        environment, port).session.get("last_updated")
-    peer_last_updated = adapter.publication_marker()
-    ceos_primary_invalid = False
-    ceos_fallback_invalid = False
-
-    try:
-        if adapter.provider == "ceos":
-            adapter.rotate("primary", primary_pair, invalid_primary)
-            ceos_primary_invalid = True
-            _wait_link_protected(
-                environment, port, profile["fallback_ckn"],
-                require_all_live=False)
-            adapter.rotate("fallback", fallback_pair, invalid_fallback)
-            ceos_fallback_invalid = True
-        else:
+    if adapter.provider == "ceos":
+        with _primary_mismatch(environment, port, invalid_primary):
+            with _ceos_fallback_mismatch(
+                    environment, port, adapter, invalid_fallback):
+                traffic_results = _selected_link_ping_results(
+                    environment, upstream_links, port)
+                assert not any(traffic_results), (
+                    "Traffic still forwarded with both CAKs mismatched: "
+                    "dut_to_peer={}, peer_to_dut={}"
+                ).format(*traffic_results)
+    else:
+        dut_last_updated = _snapshot(
+            environment, port).session.get("last_updated")
+        peer_last_updated = adapter.publication_marker()
+        try:
             temp_profile_name = "MKA_BOTH_INVALID_{}".format(
                 adapter.peer_port)
             both_invalid_profile = dict(original_peer_profile)
@@ -1674,49 +1787,34 @@ def test_both_invalid_tears_down_and_fallback_recovers(
             adapter.create_profile(temp_profile_name, both_invalid_profile)
             adapter.rebind(temp_profile_name, both_invalid_profile)
 
-        _wait_link_blocked(
-            environment, port,
-            (profile["primary_ckn"], profile["fallback_ckn"]),
-            previous_last_updated=dut_last_updated)
-        _wait_peer_blocked(
-            adapter, (invalid_primary_ckn, invalid_fallback_ckn),
-            previous_last_updated=peer_last_updated)
-        traffic_results = _selected_link_ping_results(
-            environment, upstream_links, port)
-        assert not any(traffic_results), (
-            "Traffic still forwarded with both CAKs mismatched: "
-            "dut_to_peer={}, peer_to_dut={}"
-        ).format(*traffic_results)
+            _wait_link_blocked(
+                environment, port,
+                (profile["primary_ckn"], profile["fallback_ckn"]),
+                previous_last_updated=dut_last_updated)
+            _wait_peer_blocked(
+                adapter, (invalid_primary_ckn, invalid_fallback_ckn),
+                previous_last_updated=peer_last_updated)
+            traffic_results = _selected_link_ping_results(
+                environment, upstream_links, port)
+            assert not any(traffic_results), (
+                "Traffic still forwarded with both CAKs mismatched: "
+                "dut_to_peer={}, peer_to_dut={}"
+            ).format(*traffic_results)
 
-        if adapter.provider == "ceos":
-            adapter.rotate("fallback", invalid_fallback, fallback_pair)
-            ceos_fallback_invalid = False
-            _wait_link_protected(
-                environment, port, profile["fallback_ckn"])
-            adapter.rotate("primary", invalid_primary, primary_pair)
-            ceos_primary_invalid = False
-        else:
             adapter.rebind(original_profile_name, original_peer_profile)
             delete_macsec_profile(adapter.host, temp_profile_name)
             temp_profile_name = None
-        _wait_link_protected(
-            environment, port, profile["primary_ckn"])
-        _wait_peer_protected(
-            adapter, original_peer_profile,
-            original_peer_profile["primary_ckn"])
-        assert _selected_link_ping_succeeds(
-            environment, upstream_links, port), \
-            "Traffic did not recover after restoring a matching profile"
-    finally:
-        if temp_profile_name:
-            adapter.rebind(original_profile_name, original_peer_profile)
-            delete_macsec_profile(adapter.host, temp_profile_name)
-        if ceos_fallback_invalid:
-            adapter.rotate("fallback", invalid_fallback, fallback_pair)
-        if ceos_primary_invalid:
-            adapter.rotate("primary", invalid_primary, primary_pair)
-        _wait_link_protected(
-            environment, port, profile["primary_ckn"])
-        _wait_peer_protected(
-            adapter, original_peer_profile,
-            original_peer_profile["primary_ckn"])
+        finally:
+            if temp_profile_name:
+                adapter.rebind(
+                    original_profile_name, original_peer_profile)
+                delete_macsec_profile(adapter.host, temp_profile_name)
+
+    _wait_link_protected(
+        environment, port, profile["primary_ckn"])
+    _wait_peer_protected(
+        adapter, original_peer_profile,
+        original_peer_profile["primary_ckn"])
+    assert _selected_link_ping_succeeds(
+        environment, upstream_links, port), \
+        "Traffic did not recover after restoring a matching profile"

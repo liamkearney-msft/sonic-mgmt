@@ -12,16 +12,22 @@ HELPER_PATH = (
     Path(__file__).resolve().parents[2] / "macsec" / "macsec_config_helper.py"
 )
 PROFILE_PATH = HELPER_PATH.with_name("profile.json")
+MACSEC_PLUGIN_PATH = HELPER_PATH.with_name("__init__.py")
 
 
 def _load_profile_helpers():
     source = HELPER_PATH.read_text()
     tree = ast.parse(source)
     names = {
+        "_macsec_feature_enabled",
+        "_macsec_processes_running",
+        "_macsec_sonic_hosts",
         "_build_macsec_profile_options",
         "_build_eos_macsec_profile_lines",
         "_eos_macsec_key_line",
         "_parse_wpa_global_socket",
+        "disable_macsec_feature",
+        "enable_macsec_feature",
         "macsec_profile_has_fallback",
         "ensure_macsec_profile_fallback",
         "generate_macsec_key_pair",
@@ -35,12 +41,36 @@ def _load_profile_helpers():
     ]
     module = ast.Module(body=nodes, type_ignores=[])
     namespace = {
+        "EosHost": type("EosHost", (), {}),
         "re": re,
         "secrets": secrets,
         "cisco_type7": cisco_type7,
+        "wait_until": lambda timeout, interval, delay, function: function(),
     }
     exec(compile(module, str(HELPER_PATH), "exec"), namespace)
     return namespace
+
+
+def _load_macsec_feature_fixture():
+    tree = ast.parse(MACSEC_PLUGIN_PATH.read_text())
+    plugin = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef)
+        and node.name == "MacsecPlugin"
+    )
+    fixture = next(
+        node for node in plugin.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "macsec_feature"
+    )
+    fixture.decorator_list = []
+    namespace = {}
+    exec(
+        compile(ast.Module(body=[fixture], type_ignores=[]),
+                str(MACSEC_PLUGIN_PATH), "exec"),
+        namespace,
+    )
+    return namespace["macsec_feature"]
 
 
 PROFILE_HELPERS = _load_profile_helpers()
@@ -50,6 +80,8 @@ _build_eos_macsec_profile_lines = PROFILE_HELPERS[
     "_build_eos_macsec_profile_lines"]
 _eos_macsec_key_line = PROFILE_HELPERS["_eos_macsec_key_line"]
 _parse_wpa_global_socket = PROFILE_HELPERS["_parse_wpa_global_socket"]
+disable_macsec_feature = PROFILE_HELPERS["disable_macsec_feature"]
+enable_macsec_feature = PROFILE_HELPERS["enable_macsec_feature"]
 macsec_profile_has_fallback = PROFILE_HELPERS[
     "macsec_profile_has_fallback"]
 ensure_macsec_profile_fallback = PROFILE_HELPERS[
@@ -59,6 +91,131 @@ generate_per_interface_macsec_profile = PROFILE_HELPERS[
     "generate_per_interface_macsec_profile"]
 generate_per_interface_macsec_profiles = PROFILE_HELPERS[
     "generate_per_interface_macsec_profiles"]
+macsec_feature_fixture = _load_macsec_feature_fixture()
+
+
+class _FeatureHost:
+    def __init__(self, hostname, enabled, asics=1, fail_enable=False):
+        self.hostname = hostname
+        self.enabled = enabled
+        self.asics = asics
+        self.fail_enable = fail_enable
+        self.commands = []
+
+    def get_feature_status(self):
+        return {
+            "macsec": "enabled" if self.enabled else "disabled"
+        }, True
+
+    def command(self, command, **kwargs):
+        self.commands.append((command, kwargs))
+        if command.endswith("enabled"):
+            if self.fail_enable:
+                raise RuntimeError("enable failed")
+            self.enabled = True
+        elif command.endswith("disabled"):
+            self.enabled = False
+        return {"failed": False}
+
+    def shell(self, command):
+        count = self.asics if self.enabled else 0
+        return {"stdout_lines": ["running"] * count}
+
+    def num_asics(self):
+        return self.asics
+
+
+def _neighbors(*hosts):
+    return {
+        "neighbor-{}".format(index): {"host": host}
+        for index, host in enumerate(hosts)
+    }
+
+
+def test_enable_macsec_feature_preserves_initially_enabled_host():
+    """Leave an initially enabled MACsec feature unchanged at teardown."""
+    dut = _FeatureHost("dut", enabled=True, asics=2)
+    changed_hosts = enable_macsec_feature(dut, {})
+    assert changed_hosts == []
+    assert dut.commands == []
+    disable_macsec_feature(dut, {}, changed_hosts=changed_hosts)
+    assert dut.enabled
+
+
+def test_enable_macsec_feature_restores_initially_disabled_hosts():
+    """Return exactly the hosts that the fixture must disable afterward."""
+    dut = _FeatureHost("dut", enabled=False, asics=2)
+    peer = _FeatureHost("peer", enabled=True)
+    changed_hosts = enable_macsec_feature(dut, _neighbors(peer))
+    assert changed_hosts == [dut]
+    assert dut.enabled
+    assert peer.enabled
+    disable_macsec_feature(
+        dut, _neighbors(peer), changed_hosts=changed_hosts)
+    assert not dut.enabled
+    assert peer.enabled
+
+
+def test_enable_macsec_feature_rolls_back_partial_setup_failure():
+    """Restore every initially disabled host when setup raises midway."""
+    dut = _FeatureHost("dut", enabled=False, asics=2)
+    peer = _FeatureHost("peer", enabled=False, fail_enable=True)
+    with pytest.raises(RuntimeError, match="enable failed"):
+        enable_macsec_feature(dut, _neighbors(peer))
+    assert not dut.enabled
+    assert not peer.enabled
+    assert [command for command, _ in dut.commands] == [
+        "sudo config feature state macsec enabled",
+        "sudo config feature state macsec disabled",
+    ]
+    assert [command for command, _ in peer.commands] == [
+        "sudo config feature state macsec enabled",
+        "sudo config feature state macsec disabled",
+    ]
+
+
+def test_macsec_feature_fixture_leaves_initially_enabled_state():
+    """Do not disable an environment that the fixture did not enable."""
+    stopped = []
+    fixture = macsec_feature_fixture(
+        None,
+        lambda: [],
+        lambda changed: stopped.append(changed),
+    )
+    next(fixture)
+    with pytest.raises(StopIteration):
+        next(fixture)
+    assert stopped == []
+
+
+def test_macsec_feature_fixture_restores_initially_disabled_state():
+    """Disable exactly the hosts enabled for this fixture invocation."""
+    changed = [object()]
+    stopped = []
+    fixture = macsec_feature_fixture(
+        None,
+        lambda: changed,
+        lambda hosts: stopped.append(hosts),
+    )
+    next(fixture)
+    with pytest.raises(StopIteration):
+        next(fixture)
+    assert stopped == [changed]
+
+
+def test_macsec_feature_fixture_restores_after_dependent_setup_failure():
+    """Run teardown when another fixture fails after MACsec was enabled."""
+    changed = [object()]
+    stopped = []
+    fixture = macsec_feature_fixture(
+        None,
+        lambda: changed,
+        lambda hosts: stopped.append(hosts),
+    )
+    next(fixture)
+    with pytest.raises(RuntimeError, match="dependent setup failed"):
+        fixture.throw(RuntimeError("dependent setup failed"))
+    assert stopped == [changed]
 
 
 def test_build_profile_options_with_fallback():

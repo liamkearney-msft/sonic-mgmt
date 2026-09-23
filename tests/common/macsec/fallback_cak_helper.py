@@ -27,6 +27,7 @@ class MutationResult:
     operation: str
     supported: bool = True
     diagnostics: str = ""
+    profile: dict = None
 
 
 @dataclass
@@ -250,7 +251,19 @@ class PeerAdapter:
     def peer_port(self):
         return self.neighbor["port"]
 
-    def rotate(self, role, old_pair, new_pair):
+    @staticmethod
+    def profile_with_pair(profile, role, pair):
+        updated = dict(profile)
+        updated["{}_cak".format(role)] = pair[0]
+        updated["{}_ckn".format(role)] = pair[1]
+        return updated
+
+    def commit_profile(self, profile):
+        self.environment["peer_profiles"][self.port] = dict(profile)
+
+    def rotate(
+            self, role, old_pair, new_pair, commit=True,
+            base_profile=None):
         update_macsec_profile_key(
             self.host,
             self.profile_name,
@@ -260,11 +273,49 @@ class PeerAdapter:
             new_pair[1],
             is_fallback=role == "fallback",
         )
-        updated = dict(self.environment["peer_profiles"][self.port])
-        updated["{}_cak".format(role)] = new_pair[0]
-        updated["{}_ckn".format(role)] = new_pair[1]
-        self.environment["peer_profiles"][self.port] = updated
-        return MutationResult(self.provider, "rotate_{}".format(role))
+        updated = self.profile_with_pair(
+            base_profile or self.environment["peer_profiles"][self.port],
+            role,
+            new_pair,
+        )
+        if commit:
+            self.commit_profile(updated)
+        return MutationResult(
+            self.provider,
+            "rotate_{}".format(role),
+            profile=updated,
+        )
+
+    def restore_primary(self, original_profile, mismatched_pair):
+        configured = get_macsec_profile_config(
+            self.host, self.peer_port, self.profile_name)
+        configured_ckn = configured.get("primary_ckn", "").lower()
+        original_pair = (
+            original_profile["primary_cak"],
+            original_profile["primary_ckn"],
+        )
+        if configured_ckn == original_pair[1].lower():
+            return MutationResult(
+                self.provider,
+                "restore_primary",
+                profile=dict(original_profile),
+            )
+        if configured_ckn != mismatched_pair[1].lower():
+            raise AssertionError(
+                "Peer primary changed to an unexpected CKN during cleanup")
+        result = self.rotate(
+            "primary",
+            mismatched_pair,
+            original_pair,
+            commit=False,
+            base_profile=self.profile_with_pair(
+                original_profile, "primary", mismatched_pair),
+        )
+        return MutationResult(
+            result.provider,
+            "restore_primary",
+            profile=dict(original_profile),
+        )
 
     def delete_primary_if_supported(self, primary_pair):
         return MutationResult(
@@ -410,6 +461,140 @@ class EosPeerAdapter(PeerAdapter):
             ],
         )
         return MutationResult(self.provider, "add_primary")
+
+    def delete_fallback(self, fallback_pair):
+        self.host.eos_config(
+            lines=[self._key_line(
+                fallback_pair[0],
+                fallback_pair[1],
+                fallback=True,
+                remove=True,
+            )],
+            parents=[
+                "mac security",
+                "profile {}".format(self.profile_name),
+            ],
+        )
+        return MutationResult(self.provider, "delete_fallback")
+
+    def add_fallback(self, fallback_pair):
+        self.host.eos_config(
+            lines=[self._key_line(
+                fallback_pair[0],
+                fallback_pair[1],
+                fallback=True,
+            )],
+            parents=[
+                "mac security",
+                "profile {}".format(self.profile_name),
+            ],
+        )
+        return MutationResult(self.provider, "add_fallback")
+
+    def primary_removed_errors(self, original_profile):
+        snapshot = self.snapshot(original_profile)
+        primary_ckn = original_profile["primary_ckn"].lower()
+        fallback_ckn = original_profile["fallback_ckn"].lower()
+        errors = []
+        if snapshot["configured_ckns"] != {fallback_ckn}:
+            errors.append(
+                "configured CKN set does not contain only fallback")
+        if set(snapshot["participants"]) != {fallback_ckn}:
+            errors.append(
+                "runtime participant set does not contain only fallback")
+        if primary_ckn in snapshot["participants"]:
+            errors.append("removed primary remains in runtime participants")
+        fallback = snapshot["participants"].get(fallback_ckn, {})
+        if not fallback.get("success"):
+            errors.append("fallback is not successful")
+        if not fallback.get("active"):
+            errors.append("fallback is not active")
+        if fallback.get("live_peers", 0) < 1:
+            errors.append("fallback has no live peer")
+        if not snapshot["controlled_port"]:
+            errors.append("cEOS controlled port is closed")
+        return errors
+
+    def restore_primary(self, original_profile, mismatched_pair):
+        snapshot = self.snapshot(original_profile)
+        configured_ckns = snapshot["configured_ckns"]
+        original_pair = (
+            original_profile["primary_cak"],
+            original_profile["primary_ckn"],
+        )
+        original_ckn = original_pair[1].lower()
+        mismatched_ckn = mismatched_pair[1].lower()
+        fallback_ckn = original_profile["fallback_ckn"].lower()
+        unexpected = configured_ckns.difference({
+            original_ckn, mismatched_ckn, fallback_ckn})
+        if unexpected:
+            raise AssertionError(
+                "Peer profile contains unexpected CKNs during cleanup")
+
+        lines = []
+        if mismatched_ckn in configured_ckns:
+            lines.append(self._key_line(
+                mismatched_pair[0], mismatched_pair[1], remove=True))
+        if original_ckn not in configured_ckns:
+            lines.append(self._key_line(
+                original_pair[0], original_pair[1]))
+        if lines:
+            self.host.eos_config(
+                lines=lines,
+                parents=[
+                    "mac security",
+                    "profile {}".format(self.profile_name),
+                ],
+            )
+        return MutationResult(
+            self.provider,
+            "restore_primary",
+            profile=dict(original_profile),
+        )
+
+    def restore_fallback(self, original_profile, mismatched_pair):
+        snapshot = self.snapshot(original_profile)
+        configured_ckns = snapshot["configured_ckns"]
+        original_pair = (
+            original_profile["fallback_cak"],
+            original_profile["fallback_ckn"],
+        )
+        original_ckn = original_pair[1].lower()
+        mismatched_ckn = mismatched_pair[1].lower()
+        primary_ckn = original_profile["primary_ckn"].lower()
+        unexpected = configured_ckns.difference({
+            primary_ckn, original_ckn, mismatched_ckn})
+        if unexpected:
+            raise AssertionError(
+                "Peer profile contains unexpected CKNs during cleanup")
+
+        lines = []
+        if mismatched_ckn in configured_ckns:
+            lines.append(self._key_line(
+                mismatched_pair[0],
+                mismatched_pair[1],
+                fallback=True,
+                remove=True,
+            ))
+        if original_ckn not in configured_ckns:
+            lines.append(self._key_line(
+                original_pair[0],
+                original_pair[1],
+                fallback=True,
+            ))
+        if lines:
+            self.host.eos_config(
+                lines=lines,
+                parents=[
+                    "mac security",
+                    "profile {}".format(self.profile_name),
+                ],
+            )
+        return MutationResult(
+            self.provider,
+            "restore_fallback",
+            profile=dict(original_profile),
+        )
 
     def snapshot(self, profile=None):
         profile = profile or self.environment["peer_profiles"][self.port]

@@ -7,7 +7,10 @@ from passlib.hash import cisco_type7
 
 from tests.common.macsec.macsec_helper import get_mka_session, getns_prefix, wait_all_complete, \
      submit_async_task
-from tests.common.macsec.macsec_platform_helper import global_cmd, find_portchannel_from_member, get_portchannel
+from tests.common.macsec.macsec_platform_helper import (
+    find_portchannel_from_member,
+    get_portchannel,
+)
 from tests.common.config_reload import config_reload
 from tests.common.devices.eos import EosHost
 from tests.common.utilities import wait_until
@@ -443,29 +446,79 @@ def replace_macsec_port(host, port, profile_name):
     enable_macsec_port(host, port, profile_name)
 
 
+def _macsec_sonic_hosts(duthost, macsec_nbrhosts):
+    hosts = []
+    seen = set()
+    for host in [duthost] + [
+            neighbor["host"] for neighbor in macsec_nbrhosts.values()]:
+        if isinstance(host, EosHost):
+            continue
+        identity = getattr(host, "hostname", id(host))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        hosts.append(host)
+    return hosts
+
+
+def _macsec_feature_enabled(host):
+    features, succeeded = host.get_feature_status()
+    assert succeeded and "macsec" in features, \
+        "Unable to read MACsec feature state on {}".format(host.hostname)
+    return features["macsec"] in ("enabled", "always_enabled")
+
+
+def _macsec_processes_running(host):
+    expected = max(1, host.num_asics())
+    containers = host.shell(
+        "docker ps | grep macsec | grep -v grep")["stdout_lines"]
+    managers = host.shell(
+        "ps -ef | grep macsecmgrd | grep -v grep")["stdout_lines"]
+    return len(containers) >= expected and len(managers) >= expected
+
+
+def disable_macsec_feature(
+        duthost, macsec_nbrhosts, changed_hosts=None):
+    hosts = (
+        _macsec_sonic_hosts(duthost, macsec_nbrhosts)
+        if changed_hosts is None else list(changed_hosts)
+    )
+    failures = []
+    for host in hosts:
+        result = host.command(
+            "sudo config feature state macsec disabled",
+            module_ignore_errors=True,
+        )
+        if result.get("failed"):
+            failures.append(host.hostname)
+    assert not failures, \
+        "Failed to disable MACsec feature on {}".format(failures)
+
+
 def enable_macsec_feature(duthost, macsec_nbrhosts):
-    nbrhosts = macsec_nbrhosts
-    num_asics = duthost.num_asics()
-    global_cmd(duthost, nbrhosts, "sudo config feature state macsec enabled")
-
-    def check_macsec_enabled():
-        if len(duthost.shell("docker ps | grep macsec | grep -v grep")["stdout_lines"]) < num_asics:
-            return False
-        if len(duthost.shell("ps -ef | grep macsecmgrd | grep -v grep")["stdout_lines"]) < num_asics:
-            return False
-        for nbr in [n["host"] for n in list(nbrhosts.values())]:
-            if isinstance(nbr, EosHost):
+    """Enable MACsec and return only hosts changed from disabled state."""
+    hosts = _macsec_sonic_hosts(duthost, macsec_nbrhosts)
+    changed_hosts = []
+    try:
+        for host in hosts:
+            if _macsec_feature_enabled(host):
                 continue
-            if len(nbr.shell("docker ps | grep macsec | grep -v grep")["stdout_lines"]) < 1:
-                return False
-            if len(nbr.shell("ps -ef | grep macsecmgrd | grep -v grep")["stdout_lines"]) < 1:
-                return False
-        return True
-    assert wait_until(180, 5, 10, check_macsec_enabled)
+            changed_hosts.append(host)
+            host.command("sudo config feature state macsec enabled")
 
-
-def disable_macsec_feature(duthost, macsec_nbrhosts):
-    global_cmd(duthost, macsec_nbrhosts, "sudo config feature state macsec disabled")
+        assert wait_until(
+            180, 5, 10,
+            lambda: all(_macsec_processes_running(host) for host in hosts),
+        ), "MACsec service processes did not become ready"
+    except BaseException:
+        try:
+            disable_macsec_feature(
+                duthost, macsec_nbrhosts, changed_hosts=changed_hosts)
+        except BaseException:
+            logging.exception(
+                "Failed to roll back partial MACsec feature setup")
+        raise
+    return changed_hosts
 
 
 def _wait_for_macsec_cleanup_with_vs_recovery(host, interfaces, is_dut):

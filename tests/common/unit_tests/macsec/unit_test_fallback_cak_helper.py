@@ -1,6 +1,6 @@
 import ast
 import hashlib
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -160,6 +160,78 @@ def _load_traffic_window():
     return namespace["_TrafficWindow"], namespace, stopped
 
 
+def _load_primary_mismatch(
+        adapter, wait_link, wait_peer, wait_removed):
+    source = FALLBACK_TEST_PATH.read_text()
+    tree = ast.parse(source)
+    mismatch = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_primary_mismatch"
+    )
+
+    class _Logger:
+        def __init__(self):
+            self.errors = []
+
+        def error(self, *args):
+            self.errors.append(args)
+
+    logger = _Logger()
+    namespace = {
+        "contextmanager": contextmanager,
+        "peer_adapter": lambda environment, port: adapter,
+        "_wait_link_protected": wait_link,
+        "_wait_peer_protected": wait_peer,
+        "_wait_peer_primary_removed": wait_removed,
+        "_safe_diagnostics": lambda environment, port: {"redacted": True},
+        "logger": logger,
+    }
+    exec(
+        compile(ast.Module(body=[mismatch], type_ignores=[]),
+                str(FALLBACK_TEST_PATH), "exec"),
+        namespace,
+    )
+    return namespace["_primary_mismatch"], logger
+
+
+def _load_fallback_mismatch(
+        adapter, wait_link, wait_peer, wait_blocked):
+    source = FALLBACK_TEST_PATH.read_text()
+    tree = ast.parse(source)
+    mismatch = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_ceos_fallback_mismatch"
+    )
+
+    class _Logger:
+        def __init__(self):
+            self.errors = []
+
+        def error(self, *args):
+            self.errors.append(args)
+
+    logger = _Logger()
+    namespace = {
+        "contextmanager": contextmanager,
+        "_snapshot": lambda environment, port: type(
+            "Snapshot", (), {"session": {"last_updated": "old"}})(),
+        "_wait_link_blocked": wait_blocked,
+        "_wait_peer_blocked": lambda *args, **kwargs: None,
+        "_wait_link_protected": wait_link,
+        "_wait_peer_protected": wait_peer,
+        "_safe_diagnostics": lambda environment, port: {"redacted": True},
+        "logger": logger,
+    }
+    exec(
+        compile(ast.Module(body=[mismatch], type_ignores=[]),
+                str(FALLBACK_TEST_PATH), "exec"),
+        namespace,
+    )
+    return namespace["_ceos_fallback_mismatch"], logger
+
+
 def _profile():
     return {
         "name": "fallback",
@@ -261,6 +333,7 @@ def _environment(host):
     return {
         "duthost": object(),
         "links": {"Ethernet0": {"host": host, "port": "Ethernet4"}},
+        "profile": dict(profile),
         "neighbor_profiles": {"Ethernet0": "fallback"},
         "neighbor_priorities": {"Ethernet0": 64},
         "peer_profiles": {"Ethernet0": dict(profile)},
@@ -286,6 +359,51 @@ class _Host:
 class _EosFakeHost(EosHost, _Host):
     def __init__(self):
         _Host.__init__(self)
+
+
+class _MismatchAdapter:
+    def __init__(
+            self, supports_primary_delete=False,
+            restore_error=None):
+        self.supports_primary_delete = supports_primary_delete
+        self.restore_error = restore_error
+        self.calls = []
+        self.committed_profiles = []
+
+    @staticmethod
+    def profile_with_pair(profile, role, pair):
+        updated = dict(profile)
+        updated["{}_cak".format(role)] = pair[0]
+        updated["{}_ckn".format(role)] = pair[1]
+        return updated
+
+    def delete_primary_if_supported(self, pair):
+        self.calls.append(("delete", pair))
+
+    def add_primary(self, pair):
+        self.calls.append(("add", pair))
+
+    def delete_fallback(self, pair):
+        self.calls.append(("delete-fallback", pair))
+
+    def add_fallback(self, pair):
+        self.calls.append(("add-fallback", pair))
+
+    def rotate(self, role, old_pair, new_pair, **kwargs):
+        self.calls.append(("rotate", role, old_pair, new_pair, kwargs))
+
+    def commit_profile(self, profile):
+        self.committed_profiles.append(dict(profile))
+
+    def restore_primary(self, original_profile, mismatched_pair):
+        self.calls.append(("restore", mismatched_pair))
+        if self.restore_error:
+            raise self.restore_error
+
+    def restore_fallback(self, original_profile, mismatched_pair):
+        self.calls.append(("restore-fallback", mismatched_pair))
+        if self.restore_error:
+            raise self.restore_error
 
 
 def test_link_snapshot_accepts_complete_protected_state():
@@ -441,6 +559,29 @@ def test_sonic_adapter_rotates_and_tracks_profile(monkeypatch):
     assert unsupported.supported is False
 
 
+def test_adapter_can_defer_profile_commit_until_runtime_verification(
+        monkeypatch):
+    """Keep rollback state authoritative until mutation verification passes."""
+    monkeypatch.setitem(
+        HELPERS, "update_macsec_profile_key",
+        lambda *args, **kwargs: None)
+    environment = _environment(_Host())
+    original = dict(environment["peer_profiles"]["Ethernet0"])
+    adapter = PeerAdapter(environment, "Ethernet0")
+    result = adapter.rotate(
+        "primary",
+        (original["primary_cak"], original["primary_ckn"]),
+        ("new-cak", "new-ckn"),
+        commit=False,
+        base_profile=original,
+    )
+    assert environment["peer_profiles"]["Ethernet0"] == original
+    assert result.profile["primary_ckn"] == "new-ckn"
+    adapter.commit_profile(result.profile)
+    assert environment["peer_profiles"]["Ethernet0"]["primary_ckn"] == (
+        "new-ckn")
+
+
 def test_sonic_adapter_rebind_and_restore_order(monkeypatch):
     """Apply destructive profile changes through one ordered adapter path."""
     calls = []
@@ -539,6 +680,106 @@ def test_ceos_adapter_uses_exact_supported_key_lines():
     assert added.operation == "add_primary"
 
 
+def test_ceos_primary_removal_requires_config_and_runtime_absence():
+    """Reject a cEOS deletion until only the live fallback actor remains."""
+    adapter = EosPeerAdapter(_environment(_EosFakeHost()), "Ethernet0")
+    adapter.snapshot = lambda profile=None: {
+        "configured_ckns": {"ccdd"},
+        "participants": {
+            "ccdd": {
+                "success": True,
+                "active": True,
+                "live_peers": 1,
+            },
+        },
+        "controlled_port": True,
+    }
+    assert adapter.primary_removed_errors(_profile()) == []
+    adapter.snapshot = lambda profile=None: {
+        "configured_ckns": {"aabb", "ccdd"},
+        "participants": {
+            "aabb": {
+                "success": True,
+                "active": True,
+                "live_peers": 1,
+            },
+            "ccdd": {
+                "success": True,
+                "active": True,
+                "live_peers": 1,
+            },
+        },
+        "controlled_port": True,
+    }
+    errors = adapter.primary_removed_errors(_profile())
+    assert "configured CKN set does not contain only fallback" in errors
+    assert "removed primary remains in runtime participants" in errors
+
+
+def test_ceos_restore_primary_handles_each_partial_mutation():
+    """Restore original config after delete-only or invalid-primary setup."""
+    host = _EosFakeHost()
+    adapter = EosPeerAdapter(_environment(host), "Ethernet0")
+    invalid_pair = ("invalid-cak", "EEFF")
+    adapter.snapshot = lambda profile=None: {
+        "configured_ckns": {"ccdd"},
+        "participants": {},
+        "controlled_port": False,
+    }
+    adapter.restore_primary(_profile(), invalid_pair)
+    adapter.snapshot = lambda profile=None: {
+        "configured_ckns": {"ccdd", "eeff"},
+        "participants": {},
+        "controlled_port": False,
+    }
+    adapter.restore_primary(_profile(), invalid_pair)
+    assert host.eos_config_calls == [
+        {
+            "lines": ["key AABB 7 primary-secret"],
+            "parents": ["mac security", "profile fallback"],
+        },
+        {
+            "lines": [
+                "no key EEFF 7 invalid-cak",
+                "key AABB 7 primary-secret",
+            ],
+            "parents": ["mac security", "profile fallback"],
+        },
+    ]
+
+
+def test_ceos_fallback_mutations_use_exact_supported_key_lines():
+    """Delete, add, and restore fallback with full cEOS key syntax."""
+    host = _EosFakeHost()
+    adapter = EosPeerAdapter(_environment(host), "Ethernet0")
+    invalid_pair = ("invalid-cak", "EEFF")
+    adapter.delete_fallback(("fallback-secret", "CCDD"))
+    adapter.add_fallback(invalid_pair)
+    adapter.snapshot = lambda profile=None: {
+        "configured_ckns": {"aabb", "eeff"},
+        "participants": {},
+        "controlled_port": False,
+    }
+    adapter.restore_fallback(_profile(), invalid_pair)
+    assert host.eos_config_calls == [
+        {
+            "lines": ["no key CCDD 7 fallback-secret fallback"],
+            "parents": ["mac security", "profile fallback"],
+        },
+        {
+            "lines": ["key EEFF 7 invalid-cak fallback"],
+            "parents": ["mac security", "profile fallback"],
+        },
+        {
+            "lines": [
+                "no key EEFF 7 invalid-cak fallback",
+                "key CCDD 7 fallback-secret fallback",
+            ],
+            "parents": ["mac security", "profile fallback"],
+        },
+    ]
+
+
 def test_ceos_blocked_state_rejects_stale_runtime_participant():
     """Require exact cEOS configured and runtime CKN sets when blocked."""
     adapter = EosPeerAdapter(_environment(_EosFakeHost()), "Ethernet0")
@@ -562,6 +803,140 @@ def test_peer_adapter_selects_provider():
         EosPeerAdapter)
     assert type(peer_adapter(
         _environment(_Host()), "Ethernet0")) is PeerAdapter
+
+
+def test_primary_mismatch_context_uses_ceos_delete_first_and_restores():
+    """Delete the live cEOS primary before installing a mismatch."""
+    adapter = _MismatchAdapter(supports_primary_delete=True)
+    waits = []
+    mismatch, _ = _load_primary_mismatch(
+        adapter,
+        lambda *args, **kwargs: waits.append(("link", args[2])),
+        lambda *args, **kwargs: waits.append(("peer", args[2])),
+        lambda *args, **kwargs: waits.append(("removed", None)),
+    )
+    environment = _environment(_Host())
+    invalid_pair = ("invalid-cak", "EEFF")
+    with mismatch(environment, "Ethernet0", invalid_pair):
+        waits.append(("body", None))
+    assert [call[0] for call in adapter.calls] == [
+        "delete", "add", "restore"]
+    assert waits == [
+        ("link", "CCDD"),
+        ("removed", None),
+        ("link", "CCDD"),
+        ("peer", "CCDD"),
+        ("body", None),
+        ("link", "AABB"),
+        ("peer", "AABB"),
+    ]
+    assert adapter.committed_profiles[0]["primary_ckn"] == "EEFF"
+    assert adapter.committed_profiles[-1]["primary_ckn"] == "AABB"
+
+
+def test_primary_mismatch_context_restores_after_setup_failure():
+    """Own rollback before the first mutating operation can fail."""
+    adapter = _MismatchAdapter(supports_primary_delete=True)
+    calls = []
+
+    def _wait_link(*args, **kwargs):
+        calls.append("wait-link")
+        if len(calls) == 1:
+            raise AssertionError("fallback did not establish")
+
+    mismatch, _ = _load_primary_mismatch(
+        adapter, _wait_link,
+        lambda *args, **kwargs: None,
+        lambda *args, **kwargs: None,
+    )
+    environment = _environment(_Host())
+    with pytest.raises(
+            AssertionError, match="fallback did not establish"):
+        with mismatch(
+                environment, "Ethernet0", ("invalid-cak", "EEFF")):
+            pass
+    assert [call[0] for call in adapter.calls] == ["delete", "restore"]
+    assert environment["peer_profiles"]["Ethernet0"]["primary_ckn"] == (
+        "AABB")
+    assert adapter.committed_profiles[-1]["primary_ckn"] == "AABB"
+
+
+def test_primary_mismatch_context_preserves_body_error_on_cleanup_failure():
+    """Keep the scenario failure authoritative when restoration also fails."""
+    adapter = _MismatchAdapter(
+        supports_primary_delete=False,
+        restore_error=RuntimeError("restore failed"),
+    )
+    mismatch, logger = _load_primary_mismatch(
+        adapter,
+        lambda *args, **kwargs: None,
+        lambda *args, **kwargs: None,
+        lambda *args, **kwargs: None,
+    )
+    environment = _environment(_Host())
+    with pytest.raises(ValueError, match="scenario failed"):
+        with mismatch(
+                environment, "Ethernet0", ("invalid-cak", "EEFF")):
+            raise ValueError("scenario failed")
+    assert [call[0] for call in adapter.calls] == ["rotate", "restore"]
+    assert logger.errors
+    assert adapter.committed_profiles[-1]["primary_ckn"] == "AABB"
+
+
+def test_fallback_mismatch_context_restores_after_setup_failure():
+    """Restore the cEOS fallback after a blocked-state setup failure."""
+    adapter = _MismatchAdapter()
+
+    def _wait_blocked(*args, **kwargs):
+        raise AssertionError("link did not block")
+
+    mismatch, _ = _load_fallback_mismatch(
+        adapter,
+        lambda *args, **kwargs: None,
+        lambda *args, **kwargs: None,
+        _wait_blocked,
+    )
+    environment = _environment(_Host())
+    environment["peer_profiles"]["Ethernet0"]["primary_ckn"] = "EEFF"
+    with pytest.raises(AssertionError, match="link did not block"):
+        with mismatch(
+                environment,
+                "Ethernet0",
+                adapter,
+                ("invalid-fallback-cak", "FF00")):
+            pass
+    assert [call[0] for call in adapter.calls] == [
+        "delete-fallback", "restore-fallback"]
+    assert adapter.committed_profiles[-1]["fallback_ckn"] == "CCDD"
+
+
+def test_rejected_rotation_setup_is_owned_by_mismatch_context():
+    """Keep setup, verdict, and restoration in one failure-safe scope."""
+    tree = ast.parse(FALLBACK_TEST_PATH.read_text())
+    function = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == (
+            "test_fallback_rotation_rejected_while_fallback_is_principal")
+    )
+    mismatch_scope = next(
+        node for node in ast.walk(function)
+        if isinstance(node, ast.With)
+        and any(
+            isinstance(item.context_expr, ast.Call)
+            and isinstance(item.context_expr.func, ast.Name)
+            and item.context_expr.func.id == "_primary_mismatch"
+            for item in node.items
+        )
+    )
+    calls = {
+        node.func.id
+        for node in ast.walk(mismatch_scope)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+    }
+    assert "_profile_update" in calls
+    assert "_TrafficWindow" in calls
 
 
 def test_traffic_window_stops_each_stream_once_with_strict_verdict():

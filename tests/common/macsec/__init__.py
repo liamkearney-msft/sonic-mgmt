@@ -93,20 +93,27 @@ class MacsecPlugin(object):
     @pytest.fixture(scope="module")
     def start_macsec_service(self, macsec_duthost, macsec_nbrhosts):
         def __start_macsec_service():
-            enable_macsec_feature(macsec_duthost, macsec_nbrhosts)
+            return enable_macsec_feature(macsec_duthost, macsec_nbrhosts)
         return __start_macsec_service
 
     @pytest.fixture(scope="module")
     def stop_macsec_service(self, macsec_duthost, macsec_nbrhosts):
-        def __stop_macsec_service():
-            disable_macsec_feature(macsec_duthost, macsec_nbrhosts)
+        def __stop_macsec_service(changed_hosts=None):
+            disable_macsec_feature(
+                macsec_duthost,
+                macsec_nbrhosts,
+                changed_hosts=changed_hosts,
+            )
         return __stop_macsec_service
 
     @pytest.fixture(scope="module")
     def macsec_feature(self, start_macsec_service, stop_macsec_service):
-        start_macsec_service()
-        yield
-        stop_macsec_service()
+        changed_hosts = start_macsec_service()
+        try:
+            yield
+        finally:
+            if changed_hosts:
+                stop_macsec_service(changed_hosts)
 
     @pytest.fixture(scope="module")
     def startup_macsec(self, request, macsec_duthost, ctrl_links, macsec_profile, port_profiles, tbinfo):
