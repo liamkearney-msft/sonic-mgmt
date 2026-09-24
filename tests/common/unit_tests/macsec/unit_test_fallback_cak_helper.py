@@ -169,7 +169,9 @@ def _load_ping_helpers():
         "_ping_observation_result",
         "_read_ping_output",
         "_ping_process_running",
+        "_drain_ping_observation",
         "_stop_ping",
+        "_macsecmgrd_restart_known_failure",
     }
     functions = [
         node for node in tree.body
@@ -438,22 +440,30 @@ class _PingHost:
     def __init__(
             self, pre_stop_output, final_output,
             initially_running=True, signal_failed=False,
-            exits_after_signal=True):
+            exits_after_signal=True, drain_output=None):
         self.pre_stop_output = pre_stop_output
+        self.drain_output = (
+            pre_stop_output if drain_output is None else drain_output)
         self.final_output = final_output
         self.running = initially_running
         self.signal_failed = signal_failed
         self.exits_after_signal = exits_after_signal
         self.signal_sent = False
+        self.running_read_count = 0
         self.commands = []
 
     def shell(self, command, module_ignore_errors=False):
         self.commands.append(command)
         if command.startswith("cat "):
+            if not self.signal_sent:
+                self.running_read_count += 1
             return {
                 "stdout": (
                     self.final_output if self.signal_sent
-                    else self.pre_stop_output),
+                    else (
+                        self.pre_stop_output
+                        if self.running_read_count == 1
+                        else self.drain_output)),
                 "failed": False,
             }
         if "kill -0" in command:
@@ -1025,22 +1035,24 @@ def test_rejected_rotation_setup_is_owned_by_mismatch_context():
 def test_ping_stop_excludes_only_the_inflight_trailing_probe():
     """Exclude a post-boundary final probe without tolerating measured loss."""
     helpers = _load_ping_helpers()
-    pre_stop = _ping_output(range(1, 828))
-    final = _ping_output(range(1, 828), transmitted=828, received=827)
-    host = _PingHost(pre_stop, final)
+    transition_end = _ping_output(range(1, 828))
+    drained = _ping_output(range(1, 831))
+    final = _ping_output(range(1, 831), transmitted=831, received=830)
+    host = _PingHost(
+        transition_end, final, drain_output=drained)
     result = helpers["_stop_ping"]({
         "host": host,
         "path": "/tmp/ping.log",
         "pid": 42,
     })
     assert result == {
-        "transmitted": 827,
-        "received": 827,
+        "transmitted": 830,
+        "received": 830,
         "loss_percent": 0.0,
-        "summary_transmitted": 828,
-        "summary_received": 827,
+        "summary_transmitted": 831,
+        "summary_received": 830,
         "summary_loss_percent": 0.1,
-        "observation_boundary": 827,
+        "observation_boundary": 830,
     }
     assert "sudo kill -INT 42" in host.commands
     assert "rm -f /tmp/ping.log" in host.commands
@@ -1049,21 +1061,32 @@ def test_ping_stop_excludes_only_the_inflight_trailing_probe():
 def test_ping_stop_rejects_interior_loss_despite_trailing_race():
     """Reject any gap before the pre-SIGINT observation boundary."""
     helpers = _load_ping_helpers()
-    sequences = [sequence for sequence in range(1, 828)
-                 if sequence != 417]
-    pre_stop = _ping_output(
-        sequences,
+    transition_sequences = [
+        sequence for sequence in range(1, 828)
+        if sequence != 417]
+    drained_sequences = [
+        sequence for sequence in range(1, 831)
+        if sequence != 417]
+    transition_end = _ping_output(
+        transition_sequences,
+        extra_lines=(
+            "downstream monitor icmp_seq=417 is not a ping reply",
+        ),
+    )
+    drained = _ping_output(
+        drained_sequences,
         extra_lines=(
             "downstream monitor icmp_seq=417 is not a ping reply",
         ),
     )
     final = _ping_output(
-        sequences, transmitted=828, received=826,
+        drained_sequences, transmitted=831, received=829,
         extra_lines=(
             "downstream monitor icmp_seq=417 is not a ping reply",
         ),
     )
-    host = _PingHost(pre_stop, final)
+    host = _PingHost(
+        transition_end, final, drain_output=drained)
     with pytest.raises(
             AssertionError,
             match="Traffic loss detected during MACsec transition"):
@@ -1073,9 +1096,33 @@ def test_ping_stop_rejects_interior_loss_despite_trailing_race():
             "pid": 42,
         })
     observation = helpers["_ping_observation_result"](
-        pre_stop, final)
-    assert observation["boundary"] == 827
+        drained, final)
+    assert observation["boundary"] == 830
     assert observation["missing_sequences"] == [417]
+
+
+def test_ping_drain_exposes_lost_final_transition_probe():
+    """Turn a lost transition-tail probe into an interior sequence gap."""
+    helpers = _load_ping_helpers()
+    transition_end = _ping_output(range(1, 828))
+    drained_sequences = list(range(1, 828)) + [829, 830, 831]
+    drained = _ping_output(drained_sequences)
+    final = _ping_output(
+        drained_sequences, transmitted=832, received=830)
+    host = _PingHost(
+        transition_end, final, drain_output=drained)
+    with pytest.raises(
+            AssertionError,
+            match="Traffic loss detected during MACsec transition"):
+        helpers["_stop_ping"]({
+            "host": host,
+            "path": "/tmp/ping.log",
+            "pid": 42,
+        })
+    observation = helpers["_ping_observation_result"](
+        drained, final)
+    assert observation["boundary"] == 831
+    assert observation["missing_sequences"] == [828]
 
 
 def test_ping_stop_rejects_process_that_exited_before_boundary():
@@ -1098,6 +1145,25 @@ def test_ping_stop_rejects_process_that_exited_before_boundary():
             "pid": 42,
         })
     assert "rm -f /tmp/ping.log" in host.commands
+
+
+@pytest.mark.parametrize(
+    "conf_name, asic_type, expected",
+    [
+        ("vms26-t2-7800-1", "broadcom", True),
+        ("vms26-t2-7800-1", "vs", False),
+        ("vms27-t2-7800-1", "broadcom", False),
+    ],
+)
+def test_macsecmgrd_restart_skip_is_physical_vms26_only(
+        conf_name, asic_type, expected):
+    """Skip only the affected physical testbed, never VS or other labs."""
+    helpers = _load_ping_helpers()
+    duthost = type("Dut", (), {
+        "facts": {"asic_type": asic_type},
+    })()
+    assert helpers["_macsecmgrd_restart_known_failure"](
+        duthost, {"conf-name": conf_name}) is expected
 
 
 def test_traffic_window_stops_each_stream_once_with_strict_verdict():
