@@ -1,4 +1,6 @@
 import logging
+from contextlib import contextmanager
+
 import pytest
 
 from tests.common.macsec.recovery_helpers import (
@@ -36,8 +38,10 @@ def macsec_loganalyzer_ignore(loganalyzer, macsec_duthost):
     """
     if loganalyzer and macsec_duthost:
         loganalyzer[macsec_duthost.hostname].ignore_regex.extend([
-            r".*SAI_API_MACSEC:brcm_sai_dnx_get_macsec_sa_attribute.*Invalid object ID.*",
-            r".*macsec\d*#wpa_supplicant.*KaY: The key server is not in my live peers list.*",
+            r".*SAI_API_MACSEC:brcm_sai_dnx_get_macsec_sa_attribute"
+            r".*Invalid object ID.*",
+            r".*macsec\d*#wpa_supplicant.*KaY: "
+            r"The key server is not in my live peers list.*",
             r".*macsec\d*#wpa_supplicant.*KaY: "
             r"Reject distributed SAK since I'm a key server.*",
             r".*kernel:.*e1000.*Reset adapter.*",
@@ -50,9 +54,103 @@ pytestmark = [
 ]
 
 
+def _macsec_recovery_supported(duthost):
+    """Return whether recovery helpers support this DUT layout."""
+    return not duthost.is_multi_asic
+
+
+@pytest.fixture(scope="module", autouse=True)
+def macsec_recovery_platform(macsec_duthost):
+    """Skip before host-DB/container mutations on unsupported chassis."""
+    if not _macsec_recovery_supported(macsec_duthost):
+        pytest.skip(
+            "MACsec recovery helpers require single-ASIC service, container, "
+            "and CONFIG_DB semantics; multi-ASIC recovery is unsupported")
+
+
+def _profile_runtime_fields(duthost, profile_name):
+    priority = duthost.shell(
+        "sonic-db-cli CONFIG_DB HGET 'MACSEC_PROFILE|{}' priority".format(
+            profile_name),
+        module_ignore_errors=True,
+    )["stdout"].strip() or "64"
+    rekey_period = duthost.shell(
+        "sonic-db-cli CONFIG_DB HGET "
+        "'MACSEC_PROFILE|{}' rekey_period".format(profile_name),
+        module_ignore_errors=True,
+    )["stdout"].strip() or "0"
+    return priority, rekey_period
+
+
+def _set_profile_runtime_fields(
+        duthost, profile_name, priority, rekey_period):
+    duthost.shell(
+        "sonic-db-cli CONFIG_DB HSET 'MACSEC_PROFILE|{}' "
+        "priority {} rekey_period {}".format(
+            profile_name, priority, rekey_period),
+        module_ignore_errors=False,
+    )
+
+
+@contextmanager
+def _forced_dut_key_server(
+        duthost, profile_name, ctrl_links,
+        policy, cipher_suite, send_sci):
+    orig_priority, orig_rekey = _profile_runtime_fields(
+        duthost, profile_name)
+    logger.info(
+        "force_dut_key_server: original priority=%s rekey_period=%s, "
+        "forcing priority to 0",
+        orig_priority,
+        orig_rekey,
+    )
+    mutated = False
+    body_error = None
+    body_traceback = None
+
+    try:
+        mutated = True
+        _set_profile_runtime_fields(
+            duthost, profile_name, "0", orig_rekey)
+        graceful_restart_macsec(duthost)
+        assert wait_for_mka_converged(
+            duthost, ctrl_links, policy, cipher_suite, send_sci), \
+            "MKA did not converge after forcing DUT KS priority"
+        yield
+    except BaseException as error:
+        body_error = error
+        body_traceback = error.__traceback__
+
+    cleanup_error = None
+    if mutated:
+        try:
+            logger.info(
+                "force_dut_key_server teardown: restoring priority=%s "
+                "rekey_period=%s",
+                orig_priority,
+                orig_rekey,
+            )
+            _set_profile_runtime_fields(
+                duthost, profile_name, orig_priority, orig_rekey)
+            graceful_restart_macsec(duthost)
+        except BaseException as error:
+            cleanup_error = error
+
+    if body_error is not None:
+        if cleanup_error is not None:
+            logger.error(
+                "Failed to restore MACsec profile after recovery error: %r",
+                cleanup_error,
+            )
+        raise body_error.with_traceback(body_traceback)
+    if cleanup_error is not None:
+        raise cleanup_error
+
+
 @pytest.fixture
 def force_dut_key_server(macsec_duthost, profile_name, ctrl_links,
-                         policy, cipher_suite, send_sci):
+                         policy, cipher_suite, send_sci,
+                         macsec_recovery_platform):
     """
     Lower the DUT's MACSEC_PROFILE priority below the peer's so the DUT
     deterministically wins MKA Key Server election on every ctrl_link.
@@ -69,41 +167,14 @@ def force_dut_key_server(macsec_duthost, profile_name, ctrl_links,
     that an advance-timeout error mid-test can't leak a non-zero rekey_period
     into the next profile's run.
     """
-    duthost = macsec_duthost
-
-    orig_priority = duthost.shell(
-        "sonic-db-cli CONFIG_DB HGET 'MACSEC_PROFILE|{}' priority".format(
-            profile_name),
-        module_ignore_errors=True,
-    )["stdout"].strip() or "64"
-    orig_rekey = duthost.shell(
-        "sonic-db-cli CONFIG_DB HGET 'MACSEC_PROFILE|{}' rekey_period".format(
-            profile_name),
-        module_ignore_errors=True,
-    )["stdout"].strip() or "0"
-    logger.info("force_dut_key_server: original priority=%s rekey_period=%s, "
-                "forcing priority to 0", orig_priority, orig_rekey)
-
-    duthost.shell(
-        "sonic-db-cli CONFIG_DB HSET 'MACSEC_PROFILE|{}' priority 0".format(
-            profile_name),
-        module_ignore_errors=False,
-    )
-    graceful_restart_macsec(duthost)
-    assert wait_for_mka_converged(
-        duthost, ctrl_links, policy, cipher_suite, send_sci), \
-        "MKA did not converge after forcing DUT KS priority"
-
-    yield
-
-    logger.info("force_dut_key_server teardown: restoring priority=%s "
-                "rekey_period=%s", orig_priority, orig_rekey)
-    duthost.shell(
-        "sonic-db-cli CONFIG_DB HSET 'MACSEC_PROFILE|{}' priority {} "
-        "rekey_period {}".format(profile_name, orig_priority, orig_rekey),
-        module_ignore_errors=False,
-    )
-    graceful_restart_macsec(duthost)
+    with _forced_dut_key_server(
+            macsec_duthost,
+            profile_name,
+            ctrl_links,
+            policy,
+            cipher_suite,
+            send_sci):
+        yield
 
 
 @pytest.mark.backstop
@@ -156,7 +227,8 @@ def test_dirty_container_kill_preserves_sak_consistency(
         "MKA did not re-converge within {}s after dirty restart".format(
             MKA_CONVERGE_TIMEOUT)
 
-    logger.info("Step 6a: confirming MKA actually re-keyed (silent-pass guard)")
+    logger.info(
+        "Step 6a: confirming MKA actually re-keyed (silent-pass guard)")
     post_recovery_saks = snapshot_appl_db_saks(duthost, ctrl_links)
     changed = [
         k for k, v in pre_kill_saks.items()
