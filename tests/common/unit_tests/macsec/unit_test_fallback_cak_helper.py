@@ -1,5 +1,6 @@
 import ast
 import hashlib
+import re
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -158,6 +159,33 @@ def _load_traffic_window():
         namespace,
     )
     return namespace["_TrafficWindow"], namespace, stopped
+
+
+def _load_ping_helpers():
+    source = FALLBACK_TEST_PATH.read_text()
+    tree = ast.parse(source)
+    names = {
+        "_parse_ping_output",
+        "_ping_observation_result",
+        "_read_ping_output",
+        "_ping_process_running",
+        "_stop_ping",
+    }
+    functions = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+    namespace = {
+        "re": re,
+        "wait_until": (
+            lambda timeout, interval, delay, function: function()),
+    }
+    exec(
+        compile(ast.Module(body=functions, type_ignores=[]),
+                str(FALLBACK_TEST_PATH), "exec"),
+        namespace,
+    )
+    return namespace
 
 
 def _load_primary_mismatch(
@@ -404,6 +432,61 @@ class _MismatchAdapter:
         self.calls.append(("restore-fallback", mismatched_pair))
         if self.restore_error:
             raise self.restore_error
+
+
+class _PingHost:
+    def __init__(
+            self, pre_stop_output, final_output,
+            initially_running=True, signal_failed=False,
+            exits_after_signal=True):
+        self.pre_stop_output = pre_stop_output
+        self.final_output = final_output
+        self.running = initially_running
+        self.signal_failed = signal_failed
+        self.exits_after_signal = exits_after_signal
+        self.signal_sent = False
+        self.commands = []
+
+    def shell(self, command, module_ignore_errors=False):
+        self.commands.append(command)
+        if command.startswith("cat "):
+            return {
+                "stdout": (
+                    self.final_output if self.signal_sent
+                    else self.pre_stop_output),
+                "failed": False,
+            }
+        if "kill -0" in command:
+            if self.signal_sent and self.exits_after_signal:
+                self.running = False
+            return {"failed": not self.running}
+        if "kill -INT" in command:
+            self.signal_sent = True
+            return {"failed": self.signal_failed}
+        if "kill -TERM" in command:
+            self.running = False
+            return {"failed": False}
+        if command.startswith("rm -f "):
+            return {"failed": False}
+        raise AssertionError("Unexpected command {}".format(command))
+
+
+def _ping_output(
+        sequences, transmitted=None, received=None, extra_lines=()):
+    lines = [
+        "[1.0] 64 bytes from 10.0.0.1: icmp_seq={} ttl=64 time=0.1 ms"
+        .format(sequence)
+        for sequence in sequences
+    ]
+    lines.extend(extra_lines)
+    if transmitted is not None:
+        lines.extend([
+            "--- 10.0.0.1 ping statistics ---",
+            "{} packets transmitted, {} received, "
+            "0.1% packet loss, time 1ms".format(
+                transmitted, received),
+        ])
+    return "\n".join(lines)
 
 
 def test_link_snapshot_accepts_complete_protected_state():
@@ -937,6 +1020,84 @@ def test_rejected_rotation_setup_is_owned_by_mismatch_context():
     }
     assert "_profile_update" in calls
     assert "_TrafficWindow" in calls
+
+
+def test_ping_stop_excludes_only_the_inflight_trailing_probe():
+    """Exclude a post-boundary final probe without tolerating measured loss."""
+    helpers = _load_ping_helpers()
+    pre_stop = _ping_output(range(1, 828))
+    final = _ping_output(range(1, 828), transmitted=828, received=827)
+    host = _PingHost(pre_stop, final)
+    result = helpers["_stop_ping"]({
+        "host": host,
+        "path": "/tmp/ping.log",
+        "pid": 42,
+    })
+    assert result == {
+        "transmitted": 827,
+        "received": 827,
+        "loss_percent": 0.0,
+        "summary_transmitted": 828,
+        "summary_received": 827,
+        "summary_loss_percent": 0.1,
+        "observation_boundary": 827,
+    }
+    assert "sudo kill -INT 42" in host.commands
+    assert "rm -f /tmp/ping.log" in host.commands
+
+
+def test_ping_stop_rejects_interior_loss_despite_trailing_race():
+    """Reject any gap before the pre-SIGINT observation boundary."""
+    helpers = _load_ping_helpers()
+    sequences = [sequence for sequence in range(1, 828)
+                 if sequence != 417]
+    pre_stop = _ping_output(
+        sequences,
+        extra_lines=(
+            "downstream monitor icmp_seq=417 is not a ping reply",
+        ),
+    )
+    final = _ping_output(
+        sequences, transmitted=828, received=826,
+        extra_lines=(
+            "downstream monitor icmp_seq=417 is not a ping reply",
+        ),
+    )
+    host = _PingHost(pre_stop, final)
+    with pytest.raises(
+            AssertionError,
+            match="Traffic loss detected during MACsec transition"):
+        helpers["_stop_ping"]({
+            "host": host,
+            "path": "/tmp/ping.log",
+            "pid": 42,
+        })
+    observation = helpers["_ping_observation_result"](
+        pre_stop, final)
+    assert observation["boundary"] == 827
+    assert observation["missing_sequences"] == [417]
+
+
+def test_ping_stop_rejects_process_that_exited_before_boundary():
+    """Do not accept a summary from a ping that died before shutdown."""
+    helpers = _load_ping_helpers()
+    output = _ping_output(
+        range(1, 20), transmitted=19, received=19)
+    host = _PingHost(
+        output,
+        output,
+        initially_running=False,
+        signal_failed=True,
+    )
+    with pytest.raises(
+            AssertionError,
+            match="exited before the observation window closed"):
+        helpers["_stop_ping"]({
+            "host": host,
+            "path": "/tmp/ping.log",
+            "pid": 42,
+        })
+    assert "rm -f /tmp/ping.log" in host.commands
 
 
 def test_traffic_window_stops_each_stream_once_with_strict_verdict():

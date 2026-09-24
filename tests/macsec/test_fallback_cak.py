@@ -572,49 +572,146 @@ def _start_ping(host, port, destination, suffix):
     }
 
 
-def _stop_ping(ping, assert_loss=True, phase_diagnostics=None):
-    ping["host"].shell(
-        "sudo kill -INT {}".format(ping["pid"]), module_ignore_errors=True)
-
-    def _has_summary():
-        result = ping["host"].shell(
-            "cat {}".format(ping["path"]), module_ignore_errors=True)
-        return "packet loss" in result.get("stdout", "")
-
-    assert wait_until(15, 1, 0, _has_summary), (
-        "Continuous ping did not produce a summary: {}"
-    ).format(ping)
-    output = ping["host"].shell("cat {}".format(ping["path"]))["stdout"]
-    ping["host"].shell(
-        "rm -f {}".format(ping["path"]), module_ignore_errors=True)
-    match = re.search(
-        r"(\d+) packets transmitted, (\d+) (?:packets )?received,.*?"
-        r"([\d.]+)% packet loss",
-        output,
-        re.DOTALL,
+def _parse_ping_output(output):
+    """Return successful reply sequences and the final ping summary."""
+    reply_pattern = re.compile(
+        r"^\s*(?:\[[^\]]+\]\s*)?\d+\s+bytes\s+from\b.*?"
+        r"\bicmp_seq[= ](\d+)\b",
+        re.MULTILINE,
     )
-    assert match, "Unable to parse ping output:\n{}".format(output)
-    transmitted, received = int(match.group(1)), int(match.group(2))
-    received_sequences = {
-        int(sequence)
-        for sequence in re.findall(r"icmp_seq[= ](\d+)", output)
-    }
-    missing_sequences = (
-        sorted(set(range(1, transmitted + 1)) - received_sequences)
-        if received_sequences else [])
-    if assert_loss:
-        assert transmitted >= 10, (
-            "Traffic sample was too short:\n{}"
-        ).format(output)
-        assert transmitted == received and float(match.group(3)) == 0.0, (
-            "Traffic loss detected during MACsec transition:\n{}\n"
-            "Missing ICMP sequences: {}\nPhase diagnostics: {}"
-        ).format(
-            output, missing_sequences[:200], phase_diagnostics or [])
+    summary_pattern = re.compile(
+        r"^\s*(\d+) packets transmitted, "
+        r"(\d+) (?:packets )?received,.*?"
+        r"([\d.]+)% packet loss",
+        re.MULTILINE,
+    )
+    summary = summary_pattern.search(output)
     return {
-        "transmitted": transmitted,
-        "received": received,
-        "loss_percent": float(match.group(3)),
+        "received_sequences": {
+            int(sequence)
+            for sequence in reply_pattern.findall(output)
+        },
+        "summary": (
+            {
+                "transmitted": int(summary.group(1)),
+                "received": int(summary.group(2)),
+                "loss_percent": float(summary.group(3)),
+            }
+            if summary else None
+        ),
+    }
+
+
+def _ping_observation_result(pre_stop_output, final_output):
+    """Measure loss only through the last reply seen before shutdown."""
+    pre_stop = _parse_ping_output(pre_stop_output)
+    final = _parse_ping_output(final_output)
+    received_before_stop = pre_stop["received_sequences"]
+    if not received_before_stop:
+        return {
+            "errors": ["no ping replies were observed before shutdown"],
+            "boundary": None,
+            "missing_sequences": [],
+            "summary": final["summary"],
+        }
+
+    boundary = max(received_before_stop)
+    received_by_exit = final["received_sequences"]
+    missing_sequences = sorted(
+        set(range(1, boundary + 1)) - received_by_exit)
+    errors = []
+    if boundary < 10:
+        errors.append(
+            "traffic sample ended at sequence {}, expected at least 10"
+            .format(boundary))
+    if missing_sequences:
+        errors.append(
+            "missing ping sequences within observation window")
+    return {
+        "errors": errors,
+        "boundary": boundary,
+        "missing_sequences": missing_sequences,
+        "summary": final["summary"],
+    }
+
+
+def _read_ping_output(ping, ignore_errors=False):
+    result = ping["host"].shell(
+        "cat {}".format(ping["path"]),
+        module_ignore_errors=ignore_errors,
+    )
+    return result.get("stdout", "")
+
+
+def _ping_process_running(ping):
+    result = ping["host"].shell(
+        "sudo kill -0 {}".format(ping["pid"]),
+        module_ignore_errors=True,
+    )
+    return not result.get("failed")
+
+
+def _stop_ping(ping, assert_loss=True, phase_diagnostics=None):
+    pre_stop_output = _read_ping_output(ping, ignore_errors=True)
+    was_running = _ping_process_running(ping)
+    signal_result = ping["host"].shell(
+        "sudo kill -INT {}".format(ping["pid"]),
+        module_ignore_errors=True,
+    )
+    exited = wait_until(
+        15, 1, 0, lambda: not _ping_process_running(ping))
+    if not exited:
+        ping["host"].shell(
+            "sudo kill -TERM {}".format(ping["pid"]),
+            module_ignore_errors=True,
+        )
+
+    try:
+        output = _read_ping_output(ping)
+    finally:
+        ping["host"].shell(
+            "rm -f {}".format(ping["path"]),
+            module_ignore_errors=True,
+        )
+
+    parsed = _parse_ping_output(output)
+    summary = parsed["summary"]
+    assert was_running, (
+        "Continuous ping exited before the observation window closed: {}"
+    ).format(ping)
+    assert not signal_result.get("failed"), (
+        "Unable to stop continuous ping cleanly: {}"
+    ).format(ping)
+    assert exited, "Continuous ping did not exit after SIGINT: {}".format(
+        ping)
+    assert summary, "Unable to parse ping summary:\n{}".format(output)
+
+    observation = _ping_observation_result(pre_stop_output, output)
+    if assert_loss:
+        assert not observation["errors"], (
+            "Traffic loss detected during MACsec transition:\n{}\n"
+            "Observation boundary: {}\nMissing ICMP sequences: {}\n"
+            "Final ping summary: {}\nPhase diagnostics: {}"
+        ).format(
+            output,
+            observation["boundary"],
+            observation["missing_sequences"][:200],
+            summary,
+            phase_diagnostics or [],
+        )
+    boundary = observation["boundary"]
+    return {
+        "transmitted": boundary,
+        "received": (
+            boundary - len(observation["missing_sequences"])
+            if boundary is not None else 0),
+        "loss_percent": (
+            0.0 if boundary and not observation["missing_sequences"]
+            else summary["loss_percent"]),
+        "summary_transmitted": summary["transmitted"],
+        "summary_received": summary["received"],
+        "summary_loss_percent": summary["loss_percent"],
+        "observation_boundary": boundary,
     }
 
 
