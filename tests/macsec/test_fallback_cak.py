@@ -815,6 +815,21 @@ def _selected_link_ping_succeeds(environment, upstream_links, port):
         environment, upstream_links, port))
 
 
+def _wait_for_validated_state(timeout, interval, validator):
+    """Wait for no validation errors, including one final boundary check."""
+    attempts = []
+
+    def _ready():
+        errors = validator()
+        attempts.append(errors)
+        return not errors
+
+    ready = wait_until(timeout, interval, 0, _ready)
+    if not ready:
+        ready = _ready()
+    return ready, attempts[-1], attempts
+
+
 def _macsecmgrd_process_ready(host, container):
     result = host.command(
         "docker exec {} supervisorctl status macsecmgrd".format(
@@ -1639,7 +1654,7 @@ def test_multi_port_preflight_is_all_or_nothing(
     try:
         adapter.rotate("fallback", old_pair, mismatched_pair)
 
-        def _preconditions_ready():
+        def _precondition_errors():
             peer_states = {
                 port: peer_adapter(
                     environment, port).normalized_state()
@@ -1657,7 +1672,7 @@ def test_multi_port_preflight_is_all_or_nothing(
                 port: state["configured_ckns"]
                 for port, state in peer_states.items()
             }
-            return not validate_multi_port_alternate_state(
+            return validate_multi_port_alternate_state(
                 participants_by_port,
                 old_pair[1],
                 unsafe_port,
@@ -1666,10 +1681,18 @@ def test_multi_port_preflight_is_all_or_nothing(
                 peer_configured_ckns_by_port,
             )
 
-        assert wait_until(
-            _protocol_timeout(environment, unsafe_port, 4), 1, 0,
-            _preconditions_ready,
-        ), "Multi-port preconditions failed: unsafe={}, safe={}".format(
+        ready, errors, attempts = _wait_for_validated_state(
+            _protocol_timeout(environment, unsafe_port, 4),
+            1,
+            _precondition_errors,
+        )
+        assert ready, (
+            "Multi-port preconditions failed after {} evaluations: "
+            "attempt_errors={}, final_errors={}, unsafe={}, safe={}"
+        ).format(
+            len(attempts),
+            attempts,
+            errors,
             _diagnostics(environment, unsafe_port),
             _diagnostics(environment, safe_port),
         )

@@ -172,6 +172,7 @@ def _load_ping_helpers():
         "_drain_ping_observation",
         "_stop_ping",
         "_macsecmgrd_restart_known_failure",
+        "_wait_for_validated_state",
     }
     functions = [
         node for node in tree.body
@@ -1164,6 +1165,52 @@ def test_macsecmgrd_restart_skip_is_physical_vms26_only(
     })()
     assert helpers["_macsecmgrd_restart_known_failure"](
         duthost, {"conf-name": conf_name}) is expected
+
+
+def test_validated_state_accepts_safe_final_boundary_snapshot():
+    """Accept convergence found by the explicit final boundary evaluation."""
+    helpers = _load_ping_helpers()
+    states = iter([
+        ["unsafe alternate still converging"],
+        [],
+    ])
+
+    def _wait_until(timeout, interval, delay, condition):
+        assert not condition()
+        return False
+
+    helpers["wait_until"] = _wait_until
+    ready, errors, attempts = helpers["_wait_for_validated_state"](
+        8, 1, lambda: next(states))
+    assert ready
+    assert errors == []
+    assert attempts == [
+        ["unsafe alternate still converging"],
+        [],
+    ]
+
+
+def test_validated_state_rejects_unsafe_final_boundary_snapshot():
+    """Do not weaken any predicate when the final snapshot stays unsafe."""
+    helpers = _load_ping_helpers()
+    states = iter([
+        ["unsafe alternate retains a live peer"],
+        ["unsafe alternate retains a live peer"],
+    ])
+
+    def _wait_until(timeout, interval, delay, condition):
+        assert not condition()
+        return False
+
+    helpers["wait_until"] = _wait_until
+    ready, errors, attempts = helpers["_wait_for_validated_state"](
+        8, 1, lambda: next(states))
+    assert not ready
+    assert errors == ["unsafe alternate retains a live peer"]
+    assert attempts == [
+        ["unsafe alternate retains a live peer"],
+        ["unsafe alternate retains a live peer"],
+    ]
 
 
 def test_traffic_window_stops_each_stream_once_with_strict_verdict():
