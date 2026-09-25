@@ -11,6 +11,7 @@ from tests.common.macsec.macsec_platform_helper import (
     find_portchannel_from_member,
     get_portchannel,
 )
+from tests.common.macsec.failure_safe_cleanup import FailureSafeCleanup
 from tests.common.config_reload import config_reload
 from tests.common.devices.eos import EosHost
 from tests.common.utilities import wait_until
@@ -399,6 +400,32 @@ def delete_macsec_profile(host, profile_name):
         host.command(cmd, module_ignore_errors=True)
 
 
+def _portchannel_member_command(host, port, portchannel, operation):
+    host.command(
+        "sudo config portchannel {} member {} {} {}".format(
+            getns_prefix(host, port),
+            operation,
+            portchannel,
+            port,
+        ))
+
+
+def _macsec_port_command(host, port, operation, profile_name=None):
+    command = "config macsec {} port {} {}".format(
+        getns_prefix(host, port), operation, port)
+    if profile_name is not None:
+        command += " {}".format(profile_name)
+    host.command(command)
+
+
+def _macsec_port_profile(host, port):
+    return host.command(
+        "sonic-db-cli {} CONFIG_DB HGET 'PORT|{}' macsec".format(
+            getns_prefix(host, port), port),
+        module_ignore_errors=True,
+    ).get("stdout", "").strip()
+
+
 def enable_macsec_port(host, port, profile_name):
     if isinstance(host, EosHost):
         host.eos_config(
@@ -410,14 +437,25 @@ def enable_macsec_port(host, port, profile_name):
 
     dnx_platform = host.facts.get("platform_asic") == 'broadcom-dnx'
 
-    if dnx_platform and pc:
-        host.command("sudo config portchannel {} member del {} {}".format(getns_prefix(host, port), pc["name"], port))
+    if not (dnx_platform and pc):
+        _macsec_port_command(host, port, "add", profile_name)
+        return
 
-    cmd = "config macsec {} port add {} {}".format(getns_prefix(host, port), port, profile_name)
-    host.command(cmd)
+    with FailureSafeCleanup(
+            "DNX MACsec port enable") as cleanup:
+        _portchannel_member_command(
+            host, port, pc["name"], "del")
+        cleanup.callback(
+            _portchannel_member_command,
+            host, port, pc["name"], "add")
 
-    if dnx_platform and pc:
-        host.command("sudo config portchannel {} member add {} {}".format(getns_prefix(host, port), pc["name"], port))
+        _macsec_port_command(host, port, "add", profile_name)
+        cleanup.callback(
+            _macsec_port_command, host, port, "del")
+
+        _portchannel_member_command(
+            host, port, pc["name"], "add")
+        cleanup.dismiss()
 
 
 def disable_macsec_port(host, port):
@@ -430,14 +468,30 @@ def disable_macsec_port(host, port):
     pc = find_portchannel_from_member(port, get_portchannel(host))
     dnx_platform = host.facts.get("platform_asic") == 'broadcom-dnx'
 
-    if dnx_platform and pc:
-        host.command("sudo config portchannel {} member del {} {}".format(getns_prefix(host, port), pc["name"], port))
+    if not (dnx_platform and pc):
+        _macsec_port_command(host, port, "del")
+        return
 
-    cmd = "config macsec {} port del {}".format(getns_prefix(host, port), port)
-    host.command(cmd)
+    profile_name = _macsec_port_profile(host, port)
+    assert profile_name, \
+        "Unable to determine MACsec profile before DNX port disable"
 
-    if dnx_platform and pc:
-        host.command("sudo config portchannel {} member add {} {}".format(getns_prefix(host, port), pc["name"], port))
+    with FailureSafeCleanup(
+            "DNX MACsec port disable") as cleanup:
+        _portchannel_member_command(
+            host, port, pc["name"], "del")
+        cleanup.callback(
+            _portchannel_member_command,
+            host, port, pc["name"], "add")
+
+        _macsec_port_command(host, port, "del")
+        cleanup.callback(
+            _macsec_port_command,
+            host, port, "add", profile_name)
+
+        _portchannel_member_command(
+            host, port, pc["name"], "add")
+        cleanup.dismiss()
 
 
 def replace_macsec_port(host, port, profile_name):

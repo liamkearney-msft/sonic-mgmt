@@ -1,4 +1,5 @@
 import ast
+import importlib.util
 import json
 import re
 import secrets
@@ -13,6 +14,14 @@ HELPER_PATH = (
 )
 PROFILE_PATH = HELPER_PATH.with_name("profile.json")
 MACSEC_PLUGIN_PATH = HELPER_PATH.with_name("__init__.py")
+FAILURE_SAFE_CLEANUP_PATH = HELPER_PATH.with_name(
+    "failure_safe_cleanup.py")
+
+FAILURE_SAFE_CLEANUP_SPEC = importlib.util.spec_from_file_location(
+    "failure_safe_cleanup", FAILURE_SAFE_CLEANUP_PATH)
+FAILURE_SAFE_CLEANUP = importlib.util.module_from_spec(
+    FAILURE_SAFE_CLEANUP_SPEC)
+FAILURE_SAFE_CLEANUP_SPEC.loader.exec_module(FAILURE_SAFE_CLEANUP)
 
 
 def _load_profile_helpers():
@@ -26,8 +35,13 @@ def _load_profile_helpers():
         "_build_eos_macsec_profile_lines",
         "_eos_macsec_key_line",
         "_parse_wpa_global_socket",
+        "_portchannel_member_command",
+        "_macsec_port_command",
+        "_macsec_port_profile",
         "disable_macsec_feature",
+        "disable_macsec_port",
         "enable_macsec_feature",
+        "enable_macsec_port",
         "macsec_profile_has_fallback",
         "ensure_macsec_profile_fallback",
         "generate_macsec_key_pair",
@@ -42,6 +56,10 @@ def _load_profile_helpers():
     module = ast.Module(body=nodes, type_ignores=[])
     namespace = {
         "EosHost": type("EosHost", (), {}),
+        "FailureSafeCleanup": FAILURE_SAFE_CLEANUP.FailureSafeCleanup,
+        "find_portchannel_from_member": lambda port, portchannels: None,
+        "get_portchannel": lambda host: {},
+        "getns_prefix": lambda host, port: "",
         "re": re,
         "secrets": secrets,
         "cisco_type7": cisco_type7,
@@ -81,7 +99,9 @@ _build_eos_macsec_profile_lines = PROFILE_HELPERS[
 _eos_macsec_key_line = PROFILE_HELPERS["_eos_macsec_key_line"]
 _parse_wpa_global_socket = PROFILE_HELPERS["_parse_wpa_global_socket"]
 disable_macsec_feature = PROFILE_HELPERS["disable_macsec_feature"]
+disable_macsec_port = PROFILE_HELPERS["disable_macsec_port"]
 enable_macsec_feature = PROFILE_HELPERS["enable_macsec_feature"]
+enable_macsec_port = PROFILE_HELPERS["enable_macsec_port"]
 macsec_profile_has_fallback = PROFILE_HELPERS[
     "macsec_profile_has_fallback"]
 ensure_macsec_profile_fallback = PROFILE_HELPERS[
@@ -125,11 +145,121 @@ class _FeatureHost:
         return self.asics
 
 
+class _MutationHost:
+    def __init__(self, fail_command=None):
+        self.facts = {"platform_asic": "broadcom-dnx"}
+        self.fail_command = fail_command
+        self.failed_once = False
+        self.commands = []
+
+    def command(self, command, **kwargs):
+        self.commands.append(command)
+        if (
+                self.fail_command == command
+                and not self.failed_once):
+            self.failed_once = True
+            raise RuntimeError("mutation failed")
+        if " HGET " in command:
+            return {"stdout": "profile"}
+        return {"stdout": ""}
+
+
 def _neighbors(*hosts):
     return {
         "neighbor-{}".format(index): {"host": host}
         for index, host in enumerate(hosts)
     }
+
+
+MEMBER_DEL = (
+    "sudo config portchannel -n asic0 member del "
+    "PortChannel1 Ethernet0"
+)
+MEMBER_ADD = (
+    "sudo config portchannel -n asic0 member add "
+    "PortChannel1 Ethernet0"
+)
+MACSEC_ADD = (
+    "config macsec -n asic0 port add Ethernet0 profile"
+)
+MACSEC_DEL = "config macsec -n asic0 port del Ethernet0"
+PROFILE_READ = (
+    "sonic-db-cli -n asic0 CONFIG_DB HGET "
+    "'PORT|Ethernet0' macsec"
+)
+
+
+def _prepare_dnx_mutation():
+    PROFILE_HELPERS["getns_prefix"] = (
+        lambda host, port: "-n asic0")
+    PROFILE_HELPERS["get_portchannel"] = (
+        lambda host: {"PortChannel1": {}})
+    PROFILE_HELPERS["find_portchannel_from_member"] = (
+        lambda port, portchannels: {"name": "PortChannel1"})
+
+
+@pytest.mark.parametrize(
+    "failed_command, expected_commands",
+    [
+        (MEMBER_DEL, [MEMBER_DEL]),
+        (MACSEC_ADD, [MEMBER_DEL, MACSEC_ADD, MEMBER_ADD]),
+        (
+            MEMBER_ADD,
+            [MEMBER_DEL, MACSEC_ADD, MEMBER_ADD,
+             MACSEC_DEL, MEMBER_ADD],
+        ),
+    ],
+)
+def test_dnx_enable_rolls_back_each_partial_mutation(
+        failed_command, expected_commands):
+    """Restore DNX membership and MACsec state at every enable boundary."""
+    _prepare_dnx_mutation()
+    host = _MutationHost(fail_command=failed_command)
+    with pytest.raises(RuntimeError, match="mutation failed"):
+        enable_macsec_port(host, "Ethernet0", "profile")
+    assert host.commands == expected_commands
+
+
+@pytest.mark.parametrize(
+    "failed_command, expected_commands",
+    [
+        (MEMBER_DEL, [PROFILE_READ, MEMBER_DEL]),
+        (
+            MACSEC_DEL,
+            [PROFILE_READ, MEMBER_DEL, MACSEC_DEL, MEMBER_ADD],
+        ),
+        (
+            MEMBER_ADD,
+            [PROFILE_READ, MEMBER_DEL, MACSEC_DEL, MEMBER_ADD,
+             MACSEC_ADD, MEMBER_ADD],
+        ),
+    ],
+)
+def test_dnx_disable_rolls_back_each_partial_mutation(
+        failed_command, expected_commands):
+    """Restore DNX membership and profile at every disable boundary."""
+    _prepare_dnx_mutation()
+    host = _MutationHost(fail_command=failed_command)
+    with pytest.raises(RuntimeError, match="mutation failed"):
+        disable_macsec_port(host, "Ethernet0")
+    assert host.commands == expected_commands
+
+
+def test_dnx_enable_success_dismisses_internal_rollback():
+    """Do not undo a fully successful DNX MACsec enable transaction."""
+    _prepare_dnx_mutation()
+    host = _MutationHost()
+    enable_macsec_port(host, "Ethernet0", "profile")
+    assert host.commands == [MEMBER_DEL, MACSEC_ADD, MEMBER_ADD]
+
+
+def test_dnx_disable_success_dismisses_internal_rollback():
+    """Do not undo a fully successful DNX MACsec disable transaction."""
+    _prepare_dnx_mutation()
+    host = _MutationHost()
+    disable_macsec_port(host, "Ethernet0")
+    assert host.commands == [
+        PROFILE_READ, MEMBER_DEL, MACSEC_DEL, MEMBER_ADD]
 
 
 def test_enable_macsec_feature_preserves_initially_enabled_host():

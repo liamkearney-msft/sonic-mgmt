@@ -25,14 +25,18 @@ SPEC.loader.exec_module(HELPERS)
 
 
 class _Logger:
+    def __init__(self):
+        self.errors = []
+
     def error(self, *args):
-        pass
+        self.errors.append(args)
 
     def exception(self, *args):
-        pass
+        self.errors.append(args)
 
 
-HELPERS.logger = _Logger()
+LOGGER = _Logger()
+HELPERS.logger = LOGGER
 FailureSafeCleanup = HELPERS.FailureSafeCleanup
 preserve_config_db_files = HELPERS.preserve_config_db_files
 
@@ -82,8 +86,12 @@ def test_config_backup_restores_files_after_transition_failure(failure):
         "mktemp -d /tmp/macsec_config_backup.XXXXXX",
         "sudo cp -a /etc/sonic/config_db*.json "
         "/tmp/macsec_config_backup.ABC123/",
+        "cd /tmp/macsec_config_backup.ABC123 && "
+        "sudo sha256sum config_db*.json > config_db.sha256",
         "sudo cp -a /tmp/macsec_config_backup.ABC123/"
         "config_db*.json /etc/sonic/",
+        "cd /etc/sonic && sudo sha256sum -c "
+        "/tmp/macsec_config_backup.ABC123/config_db.sha256",
         "sudo rm -rf -- /tmp/macsec_config_backup.ABC123",
     ]
 
@@ -94,9 +102,12 @@ def test_config_backup_cleanup_failure_does_not_mask_body_error():
     with pytest.raises(ValueError, match="traffic failed"):
         with preserve_config_db_files(host):
             raise ValueError("traffic failed")
-    assert any(
+    assert not any(
         command.startswith("sudo rm -rf --")
         for command, _ in host.commands)
+    assert any(
+        "/tmp/macsec_config_backup.ABC123" in str(error)
+        for error in LOGGER.errors)
 
 
 def test_config_backup_restore_failure_surfaces_after_success():
@@ -107,6 +118,47 @@ def test_config_backup_restore_failure_surfaces_after_success():
             match="preserving SONiC configuration"):
         with preserve_config_db_files(host):
             pass
+    assert not any(
+        command.startswith("sudo rm -rf --")
+        for command, _ in host.commands)
+
+
+def test_config_backup_verification_failure_retains_backup():
+    """Retain the only backup when restored file checksums do not match."""
+    host = _Host(fail_fragment="sha256sum -c")
+    with pytest.raises(
+            RuntimeError,
+            match="preserving SONiC configuration"):
+        with preserve_config_db_files(host):
+            pass
+    assert not any(
+        command.startswith("sudo rm -rf --")
+        for command, _ in host.commands)
+
+
+def test_config_backup_removal_failure_reports_retained_path():
+    """Surface a retained verified backup when directory removal fails."""
+    host = _Host(fail_fragment="sudo rm -rf --")
+    with pytest.raises(
+            RuntimeError,
+            match="preserving SONiC configuration"):
+        with preserve_config_db_files(host):
+            pass
+    assert any(
+        "/tmp/macsec_config_backup.ABC123" in str(error)
+        for error in LOGGER.errors)
+
+
+def test_incomplete_backup_is_removed_before_any_transition():
+    """Remove an unusable partial backup because no config was mutated."""
+    host = _Host(fail_fragment="/etc/sonic/config_db*.json")
+    with pytest.raises(
+            RuntimeError,
+            match="preserving SONiC configuration"):
+        with preserve_config_db_files(host):
+            pass
+    assert host.commands[-1][0] == (
+        "sudo rm -rf -- /tmp/macsec_config_backup.ABC123")
 
 
 def test_cleanup_stack_restores_only_successful_partial_mutations():

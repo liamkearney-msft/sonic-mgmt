@@ -33,6 +33,9 @@ class FailureSafeCleanup(AbstractContextManager):
         if first_error is not None:
             raise first_error
 
+    def dismiss(self):
+        self._callbacks = []
+
     def __exit__(self, exc_type, exc_value, traceback):
         try:
             self.restore()
@@ -65,27 +68,72 @@ def preserve_config_db_files(host):
         raise RuntimeError("Unable to create MACsec config backup directory")
     quoted_dir = shlex.quote(backup_dir)
 
-    cleanup = FailureSafeCleanup("Persisted CONFIG_DB")
-    cleanup.callback(
-        _checked_shell, host, "sudo rm -rf -- {}".format(quoted_dir))
     try:
         _checked_shell(
             host,
             "sudo cp -a /etc/sonic/config_db*.json {}/".format(
                 quoted_dir),
         )
-        cleanup.callback(
-            _checked_shell,
+        _checked_shell(
+            host,
+            "cd {} && sudo sha256sum config_db*.json "
+            "> config_db.sha256".format(quoted_dir),
+        )
+    except BaseException:
+        try:
+            _checked_shell(
+                host, "sudo rm -rf -- {}".format(quoted_dir))
+        except BaseException:
+            logger.exception(
+                "Failed to remove incomplete CONFIG_DB backup %s",
+                backup_dir,
+            )
+        raise
+
+    body_error = None
+    body_traceback = None
+    try:
+        yield
+    except BaseException as error:
+        body_error = error
+        body_traceback = error.__traceback__
+
+    restore_error = None
+    try:
+        _checked_shell(
             host,
             "sudo cp -a {}"
             "/config_db*.json /etc/sonic/".format(quoted_dir),
         )
-        with cleanup:
-            yield
-    except BaseException:
+        _checked_shell(
+            host,
+            "cd /etc/sonic && sudo sha256sum -c "
+            "{}/config_db.sha256".format(quoted_dir),
+        )
+    except BaseException as error:
+        restore_error = error
+        logger.error(
+            "Persisted CONFIG_DB restore failed; backup retained at %s",
+            backup_dir,
+        )
+    else:
         try:
-            cleanup.restore()
-        except BaseException:
-            logger.exception(
-                "Persisted CONFIG_DB cleanup failed during setup")
-        raise
+            _checked_shell(
+                host, "sudo rm -rf -- {}".format(quoted_dir))
+        except BaseException as error:
+            restore_error = error
+            logger.error(
+                "Persisted CONFIG_DB was restored, but backup removal "
+                "failed; backup retained at %s",
+                backup_dir,
+            )
+
+    if body_error is not None:
+        if restore_error is not None:
+            logger.error(
+                "Persisted CONFIG_DB cleanup failed after test error: %r",
+                restore_error,
+            )
+        raise body_error.with_traceback(body_traceback)
+    if restore_error is not None:
+        raise restore_error
