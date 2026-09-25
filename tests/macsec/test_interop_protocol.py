@@ -5,6 +5,7 @@ import ipaddress
 from tests.common.utilities import wait_until
 from tests.common.macsec.macsec_helper import getns_prefix
 from tests.common.macsec.macsec_config_helper import disable_macsec_port, enable_macsec_port
+from tests.common.macsec.failure_safe_cleanup import FailureSafeCleanup
 from tests.common.macsec.macsec_platform_helper import find_portchannel_from_member, \
     get_portchannel, get_lldp_list, sonic_db_cli
 from tests.common.helpers.snmp_helpers import get_snmp_output
@@ -33,21 +34,41 @@ class TestInteropProtocol():
                 pc["status"], pc
             )
 
-        disable_macsec_port(duthost, ctrl_port)
-        # Remove ethernet interface <ctrl_port> from PortChannel interface <pc>
-        duthost.command("sudo config portchannel {} member del {} {}"
-                        .format(getns_prefix(duthost, ctrl_port), pc["name"], ctrl_port))
-        assert wait_until(90, 1, 0, lambda: get_portchannel(duthost)[pc["name"]]["status"] == "Dw"), (
-            "PortChannel status did not reach 'Dw' within the specified timeout. "
-            "Current status: '{}'.".format(
-                get_portchannel(duthost)[pc["name"]]["status"]
+        with FailureSafeCleanup(
+                "MACsec PortChannel interoperability") as cleanup:
+            disable_macsec_port(duthost, ctrl_port)
+            cleanup.callback(
+                enable_macsec_port,
+                duthost,
+                ctrl_port,
+                get_port_profile_name(ctrl_port),
             )
-        )
+            # Remove ethernet interface <ctrl_port> from PortChannel.
+            duthost.command(
+                "sudo config portchannel {} member del {} {}".format(
+                    getns_prefix(duthost, ctrl_port),
+                    pc["name"],
+                    ctrl_port,
+                ))
+            cleanup.callback(
+                duthost.command,
+                "sudo config portchannel {} member add {} {}".format(
+                    getns_prefix(duthost, ctrl_port),
+                    pc["name"],
+                    ctrl_port,
+                ),
+                _run_last=True,
+            )
+            assert wait_until(
+                90, 1, 0,
+                lambda: get_portchannel(
+                    duthost)[pc["name"]]["status"] == "Dw",
+            ), (
+                "PortChannel status did not reach 'Dw' within the "
+                "specified timeout. Current status: '{}'.".format(
+                    get_portchannel(duthost)[pc["name"]]["status"])
+            )
 
-        enable_macsec_port(duthost, ctrl_port, get_port_profile_name(ctrl_port))
-        # Add ethernet interface <ctrl_port> back to PortChannel interface <pc>
-        duthost.command("sudo config portchannel {} member add {} {}"
-                        .format(getns_prefix(duthost, ctrl_port), pc["name"], ctrl_port))
         assert wait_until(
             90, 1, 0,
             lambda: find_portchannel_from_member(ctrl_port, get_portchannel(duthost))["status"] == "Up"
@@ -85,26 +106,44 @@ class TestInteropProtocol():
                     nbr["name"], get_lldp_list(duthost)
                 )
 
-            disable_macsec_port(duthost, ctrl_port)
-            disable_macsec_port(nbr["host"], nbr["port"])
-            wait_until(20, 3, 0,
-                       lambda: not duthost.iface_macsec_ok(ctrl_port) and
-                       not nbr["host"].iface_macsec_ok(nbr["port"]))
-            assert wait_until(
-                LLDP_TIMEOUT,
-                LLDP_ADVERTISEMENT_INTERVAL,
-                0,
-                lambda: nbr["name"] in get_lldp_list(duthost)
-            ), \
-                "LLDP neighbor '{}' not found. Current LLDP list: {}".format(
-                    nbr["name"], get_lldp_list(duthost)
+            with FailureSafeCleanup(
+                    "MACsec LLDP interoperability") as cleanup:
+                disable_macsec_port(duthost, ctrl_port)
+                cleanup.callback(
+                    enable_macsec_port,
+                    duthost,
+                    ctrl_port,
+                    get_port_profile_name(ctrl_port),
+                )
+                disable_macsec_port(nbr["host"], nbr["port"])
+                cleanup.callback(
+                    enable_macsec_port,
+                    nbr["host"],
+                    nbr["port"],
+                    get_port_profile_name(ctrl_port),
+                )
+                wait_until(
+                    20, 3, 0,
+                    lambda: all((
+                        not duthost.iface_macsec_ok(ctrl_port),
+                        not nbr["host"].iface_macsec_ok(nbr["port"]),
+                    )))
+                assert wait_until(
+                    LLDP_TIMEOUT,
+                    LLDP_ADVERTISEMENT_INTERVAL,
+                    0,
+                    lambda: nbr["name"] in get_lldp_list(duthost)
+                ), (
+                    "LLDP neighbor '{}' not found. Current LLDP list: {}"
+                    .format(nbr["name"], get_lldp_list(duthost))
                 )
 
-            enable_macsec_port(duthost, ctrl_port, get_port_profile_name(ctrl_port))
-            enable_macsec_port(nbr["host"], nbr["port"], get_port_profile_name(ctrl_port))
-            wait_until(20, 3, 0,
-                       lambda: duthost.iface_macsec_ok(ctrl_port) and
-                       nbr["host"].iface_macsec_ok(nbr["port"]))
+            wait_until(
+                20, 3, 0,
+                lambda: all((
+                    duthost.iface_macsec_ok(ctrl_port),
+                    nbr["host"].iface_macsec_ok(nbr["port"]),
+                )))
             assert wait_until(
                 LLDP_TIMEOUT,
                 LLDP_ADVERTISEMENT_INTERVAL,
@@ -145,34 +184,53 @@ class TestInteropProtocol():
                 )
             )
 
-        # Check the BGP sessions are present after port macsec disabled
-        for ctrl_port, nbr in list(ctrl_links.items()):
-            # With dnx platform skip portchannel interfaces.
-            dnx_platform = duthost.facts.get("platform_asic") == 'broadcom-dnx'
-            if dnx_platform:
-                pc = find_portchannel_from_member(ctrl_port, get_portchannel(duthost))
-                if pc:
-                    continue
-            disable_macsec_port(duthost, ctrl_port)
-            disable_macsec_port(nbr["host"], nbr["port"])
-            wait_until(BGP_TIMEOUT, 3, 0,
-                       lambda: not duthost.iface_macsec_ok(ctrl_port) and
-                       not nbr["host"].iface_macsec_ok(nbr["port"]))
-            # BGP session should keep established even after holdtime
-            assert wait_until(
-                BGP_TIMEOUT, BGP_KEEPALIVE, BGP_HOLDTIME,
-                check_bgp_established, ctrl_port, upstream_links[ctrl_port]
-            ), (
-                "BGP session for control port '{}' did not reach 'Established'. "
-                "Upstream link details: {}.".format(
-                    ctrl_port, upstream_links[ctrl_port]
+        with FailureSafeCleanup(
+                "MACsec BGP interoperability") as cleanup:
+            # Keep the original cumulative disabled-link phase.
+            for ctrl_port, nbr in list(ctrl_links.items()):
+                # With dnx platform skip portchannel interfaces.
+                dnx_platform = (
+                    duthost.facts.get("platform_asic") == 'broadcom-dnx')
+                if dnx_platform:
+                    pc = find_portchannel_from_member(
+                        ctrl_port, get_portchannel(duthost))
+                    if pc:
+                        continue
+                disable_macsec_port(duthost, ctrl_port)
+                cleanup.callback(
+                    enable_macsec_port,
+                    duthost,
+                    ctrl_port,
+                    get_port_profile_name(ctrl_port),
                 )
-            )
+                disable_macsec_port(nbr["host"], nbr["port"])
+                cleanup.callback(
+                    enable_macsec_port,
+                    nbr["host"],
+                    nbr["port"],
+                    get_port_profile_name(ctrl_port),
+                )
+                wait_until(
+                    BGP_TIMEOUT, 3, 0,
+                    lambda: all((
+                        not duthost.iface_macsec_ok(ctrl_port),
+                        not nbr["host"].iface_macsec_ok(nbr["port"]),
+                    )))
+                # BGP should keep established even after holdtime.
+                assert wait_until(
+                    BGP_TIMEOUT, BGP_KEEPALIVE, BGP_HOLDTIME,
+                    check_bgp_established,
+                    ctrl_port,
+                    upstream_links[ctrl_port],
+                ), (
+                    "BGP session for control port '{}' did not reach "
+                    "'Established'. Upstream link details: {}.".format(
+                        ctrl_port, upstream_links[ctrl_port])
+                )
+            cleanup.restore()
 
-        # Check the BGP sessions are present after port macsec enabled
+        # Check the BGP sessions are present after port macsec is restored.
         for ctrl_port, nbr in list(ctrl_links.items()):
-            enable_macsec_port(duthost, ctrl_port, get_port_profile_name(ctrl_port))
-            enable_macsec_port(nbr["host"], nbr["port"], get_port_profile_name(ctrl_port))
             wait_until(BGP_TIMEOUT, 3, 0,
                        lambda: duthost.iface_macsec_ok(ctrl_port) and
                        nbr["host"].iface_macsec_ok(nbr["port"]))
