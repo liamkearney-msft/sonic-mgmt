@@ -1,5 +1,6 @@
 import ast
 import hashlib
+import importlib.util
 import re
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
@@ -15,6 +16,23 @@ MKA_HELPER_PATH = HELPER_PATH.with_name("mka_state_helper.py")
 FALLBACK_TEST_PATH = (
     Path(__file__).resolve().parents[3] / "macsec" / "test_fallback_cak.py"
 )
+FAILURE_SAFE_CLEANUP_PATH = HELPER_PATH.with_name(
+    "failure_safe_cleanup.py")
+FAILURE_SAFE_SPEC = importlib.util.spec_from_file_location(
+    "failure_safe_cleanup_for_scenarios", FAILURE_SAFE_CLEANUP_PATH)
+FAILURE_SAFE_MODULE = importlib.util.module_from_spec(FAILURE_SAFE_SPEC)
+FAILURE_SAFE_SPEC.loader.exec_module(FAILURE_SAFE_MODULE)
+
+
+def _load_scenario(name, namespace):
+    tree = ast.parse(FALLBACK_TEST_PATH.read_text())
+    function = next(node for node in tree.body
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name == name)
+    function.decorator_list = []
+    exec(compile(ast.Module(body=[function], type_ignores=[]),
+                 str(FALLBACK_TEST_PATH), "exec"), namespace)
+    return namespace[name]
 
 
 def _load_mka_validator():
@@ -1031,6 +1049,482 @@ def test_rejected_rotation_setup_is_owned_by_mismatch_context():
     }
     assert "_profile_update" in calls
     assert "_TrafficWindow" in calls
+
+
+def test_bidirectional_traffic_cleans_first_stream_on_second_start_failure():
+    """The first ping must be stopped if the peer ping fails to start."""
+    tree = ast.parse(FALLBACK_TEST_PATH.read_text())
+    function = next(node for node in tree.body
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name == "_start_bidirectional_traffic")
+    stopped = []
+    started = []
+    host = object()
+    neighbor = {"host": host, "port": "Ethernet1"}
+
+    class Dut:
+        def command(self, *args, **kwargs):
+            return {"failed": False}
+
+    class Peer:
+        def shell(self, *args, **kwargs):
+            return {"failed": False}
+
+    neighbor["host"] = Peer()
+
+    def start(*args):
+        started.append(args)
+        if len(started) == 2:
+            raise RuntimeError("peer startup failed")
+        return "first"
+
+    namespace = {
+        "_select_routed_link": lambda environment, links: (
+            "Ethernet0", neighbor),
+        "get_ipnetns_prefix": lambda host, port: "",
+        "_ping_namespace_prefix": lambda host, port: "",
+        "_start_ping": start,
+        "cleanup_all": lambda traffic, cleanup: [
+            cleanup(ping) for ping in traffic],
+        "_abort_partial_ping": lambda ping: stopped.append(ping),
+        "logger": type("Logger", (), {"exception": lambda *args: None})(),
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]),
+                 str(FALLBACK_TEST_PATH), "exec"), namespace)
+    with pytest.raises(RuntimeError, match="peer startup failed"):
+        namespace["_start_bidirectional_traffic"](
+            {"duthost": Dut()}, {
+                "Ethernet0": {
+                    "local_ipv4_addr": "192.0.2.1",
+                    "peer_ipv4_addr": "192.0.2.2",
+                }})
+    assert stopped == ["first"]
+
+
+def test_partial_ping_abort_signals_and_checks_exit_without_draining():
+    """A failed peer startup cannot strand a DUT ping awaiting ten replies."""
+    tree = ast.parse(FALLBACK_TEST_PATH.read_text())
+    function = next(node for node in tree.body
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name == "_abort_partial_ping")
+
+    class Host:
+        def __init__(self):
+            self.commands = []
+
+        def shell(self, command, **kwargs):
+            self.commands.append(command)
+            return {"failed": False}
+
+    host = Host()
+    namespace = {
+        "wait_until": lambda timeout, interval, delay, ready: ready(),
+        "_ping_process_running": lambda ping: False,
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]),
+                 str(FALLBACK_TEST_PATH), "exec"), namespace)
+    namespace["_abort_partial_ping"]({
+        "host": host, "pid": 42, "path": "/tmp/ping.log"})
+    assert host.commands == [
+        "sudo kill -INT 42", "rm -f /tmp/ping.log"]
+
+
+def test_eos_ping_namespace_prefix_for_raw_shell():
+    """Raw shell pings use the EOS network namespace, unlike eos_command."""
+    tree = ast.parse(FALLBACK_TEST_PATH.read_text())
+    function = next(node for node in tree.body
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name == "_ping_namespace_prefix")
+
+    class EosHost:
+        def __init__(self, vrf):
+            self.bgp_vrf = vrf
+
+    namespace = {
+        "EosHost": EosHost,
+        "get_ipnetns_prefix": lambda host, port: "sonic-prefix",
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]),
+                 str(FALLBACK_TEST_PATH), "exec"), namespace)
+    assert namespace["_ping_namespace_prefix"](
+        EosHost("red"), "Ethernet1") == "sudo ip netns exec ns-red"
+    assert namespace["_ping_namespace_prefix"](
+        EosHost(None), "Ethernet1") == ""
+    assert namespace["_ping_namespace_prefix"](
+        object(), "Ethernet0") == "sonic-prefix"
+
+
+def test_eos_continuous_and_one_shot_pings_use_vrf_namespace():
+    """Both raw-shell probes target the converged EOS route namespace."""
+    tree = ast.parse(FALLBACK_TEST_PATH.read_text())
+    names = {
+        "_ping_namespace_prefix", "_start_ping",
+        "_selected_link_ping_results",
+    }
+    functions = [
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name in names
+    ]
+
+    class EosHost:
+        bgp_vrf = "red"
+
+        def __init__(self):
+            self.commands = []
+
+        def shell(self, command, **kwargs):
+            self.commands.append(command)
+            if command.startswith("nohup "):
+                return {"stdout_lines": ["42"]}
+            return {"failed": False}
+
+    class Dut:
+        def command(self, command, **kwargs):
+            return {"failed": False}
+
+    namespace = {
+        "EosHost": EosHost,
+        "get_ipnetns_prefix": lambda host, port: "",
+    }
+    exec(compile(ast.Module(body=functions, type_ignores=[]),
+                 str(FALLBACK_TEST_PATH), "exec"), namespace)
+    peer = EosHost()
+    ping = namespace["_start_ping"](
+        peer, "Ethernet1", "192.0.2.1", "test")
+    assert ping["pid"] == 42
+    assert any(
+        "nohup sudo ip netns exec ns-red ping -D" in command
+        for command in peer.commands)
+    environment = {
+        "duthost": Dut(),
+        "links": {
+            "Ethernet0": {"host": peer, "port": "Ethernet1"}},
+    }
+    assert namespace["_selected_link_ping_results"](
+        environment, {
+            "Ethernet0": {
+                "local_ipv4_addr": "192.0.2.1",
+                "peer_ipv4_addr": "192.0.2.2",
+            }}, "Ethernet0") == (True, True)
+    assert "sudo ip netns exec ns-red ping -c 3 192.0.2.2" in (
+        peer.commands)
+
+
+@pytest.mark.parametrize("failed_step", ["delete", "fallback_wait"])
+def test_ceos_delete_restores_on_partial_mutation_or_failed_wait(failed_step):
+    """Restore the peer before the traffic verdict even when setup fails."""
+    events = []
+    profile = {
+        "primary_cak": "primary", "primary_ckn": "aa",
+        "fallback_ckn": "bb",
+    }
+    environment = {
+        "profile": profile,
+        "peer_profiles": {"port": profile},
+    }
+
+    class Adapter:
+        supports_primary_delete = True
+
+        def delete_primary_if_supported(self, pair):
+            events.append("delete")
+            if failed_step == "delete":
+                raise RuntimeError("delete failed after mutation")
+
+        def add_primary(self, pair):
+            events.append("restore")
+
+    class Traffic:
+        def __init__(self, *args):
+            pass
+
+        def __enter__(self):
+            events.append("traffic-start")
+            return self
+
+        def __exit__(self, *args):
+            events.append("traffic-stop")
+
+        def assert_zero_loss(self):
+            events.append("strict-verdict")
+
+    def wait_link(*args, **kwargs):
+        events.append("fallback-wait" if "require_all_live" in kwargs
+                      else "primary-wait")
+        if failed_step == "fallback_wait" and "require_all_live" in kwargs:
+            raise AssertionError("fallback did not converge")
+
+    adapter = Adapter()
+    namespace = {
+        "_select_routed_link": lambda *args: ("port", {}),
+        "peer_adapter": lambda *args: adapter,
+        "_TrafficWindow": Traffic,
+        "FailureSafeCleanup": FAILURE_SAFE_MODULE.FailureSafeCleanup,
+        "_restore_deleted_primary": lambda *args: (
+            adapter.add_primary(("primary", "aa")),
+            wait_link(),
+            events.append("peer-primary-wait")),
+        "_wait_link_protected": wait_link,
+        "_wait_peer_primary_removed": lambda *args: events.append(
+            "peer-removed-wait"),
+    }
+    scenario = _load_scenario(
+        "test_ceos_primary_key_delete_fails_over_hitlessly", namespace)
+    expected_error = (
+        "delete failed after mutation" if failed_step == "delete"
+        else "fallback did not converge")
+    with pytest.raises((RuntimeError, AssertionError),
+                       match=expected_error):
+        scenario(environment, {"port": {}})
+    assert "restore" in events
+    assert "strict-verdict" not in events
+    assert events.index("restore") < events.index("traffic-stop")
+
+
+@pytest.mark.parametrize(
+    "scenario_name,role",
+    [
+        ("test_primary_rotation_and_recovery_are_hitless", "primary"),
+        ("test_fallback_rotation_keeps_primary_and_traffic", "fallback"),
+    ],
+)
+@pytest.mark.parametrize("fail_peer", [False, True])
+def test_hitless_rotation_measures_full_recovery_and_restores_partial_peer(
+        scenario_name, role, fail_peer):
+    """Include remaining peers and cleanup in the strict traffic window."""
+    events = []
+    profile = {
+        "name": "profile", "primary_cak": "cak1",
+        "primary_ckn": "aa", "fallback_cak": "cak2",
+        "fallback_ckn": "bb", "cipher_suite": "suite",
+        "rekey_period": 10,
+    }
+    environment = {
+        "profile": profile, "duthost": object(),
+        "links": {"selected": {}, "remaining": {}},
+        "peer_profiles": {
+            "selected": dict(profile), "remaining": dict(profile)},
+    }
+
+    class Adapter:
+        def __init__(self, port):
+            self.port = port
+
+        def rotate(self, *args):
+            events.append("rotate-" + self.port)
+            if fail_peer and self.port == "remaining":
+                raise RuntimeError("partial peer mutation")
+
+    class Traffic:
+        def __init__(self, *args):
+            pass
+
+        def __enter__(self):
+            events.append("traffic-start")
+            return self
+
+        def __exit__(self, *args):
+            events.append("traffic-stop")
+
+        def assert_zero_loss(self):
+            events.append("strict-verdict")
+
+    def restore(*args):
+        events.append("restore")
+        assert events[0] == "traffic-start"
+        assert "traffic-stop" not in events
+        attempted = args[-2]
+        assert attempted == ["selected", "remaining"]
+
+    namespace = {
+        "_select_routed_link": lambda *args: ("selected", {}),
+        "remaining_link_items": lambda *args: [("remaining", {})],
+        "peer_adapter": lambda env, port: Adapter(port),
+        "_TrafficWindow": Traffic,
+        "FailureSafeCleanup": FAILURE_SAFE_MODULE.FailureSafeCleanup,
+        "_restore_rotation": restore,
+        "_profile_update": lambda *args, **kwargs: events.append(
+            "dut-update"),
+        "generate_macsec_key_pair": lambda suite: ("new-cak", "cc"),
+        "_wait_link_protected": lambda *args, **kwargs: None,
+        "_wait_peer_protected": lambda *args, **kwargs: None,
+        "_wait_environment": lambda *args: events.append("all-ready"),
+        "_wait_active_key_stable": lambda *args: "identity",
+    }
+    scenario = _load_scenario(scenario_name, namespace)
+    if fail_peer:
+        with pytest.raises(RuntimeError, match="partial peer mutation"):
+            scenario(environment, {"selected": {}})
+        assert "strict-verdict" not in events
+    else:
+        scenario(environment, {"selected": {}})
+        assert events.index("all-ready") < events.index("restore")
+        assert events.index("restore") < events.index("strict-verdict")
+    assert events.index("restore") < events.index("traffic-stop")
+
+
+def test_primary_mismatch_strict_verdict_follows_context_recovery():
+    """The original primary is restored before closing the hitless window."""
+    events = []
+
+    class Traffic:
+        def __init__(self, *args):
+            pass
+
+        def __enter__(self):
+            events.append("traffic-start")
+            return self
+
+        def __exit__(self, *args):
+            events.append("traffic-stop")
+
+        def assert_zero_loss(self):
+            events.append("strict-verdict")
+
+    @contextmanager
+    def mismatch(*args):
+        events.append("mismatch")
+        yield
+        events.append("restore")
+
+    namespace = {
+        "_select_routed_link": lambda *args: ("port", {}),
+        "generate_macsec_key_pair": lambda *args: ("cak", "cc"),
+        "peer_adapter": lambda *args: object(),
+        "_primary_mismatch": mismatch,
+        "_TrafficWindow": Traffic,
+    }
+    scenario = _load_scenario(
+        "test_primary_mismatch_fallback_takeover_and_recovery_is_hitless",
+        namespace)
+    scenario(
+        {"profile": {"cipher_suite": "suite"}},
+        {"port": {}})
+    assert events == [
+        "traffic-start", "mismatch", "restore",
+        "strict-verdict", "traffic-stop"]
+
+
+def test_rotation_restore_continues_peers_after_dut_rollback_failure():
+    """A broken namespace cannot prevent restoration of either peer."""
+    events = []
+    profile = {
+        "name": "profile", "primary_cak": "new",
+        "primary_ckn": "cc", "fallback_cak": "fallback",
+        "fallback_ckn": "bb",
+    }
+    original = dict(
+        profile, primary_cak="original", primary_ckn="aa")
+    environment = {
+        "duthost": object(), "profile": profile,
+        "links": {"a": {}, "b": {}},
+        "peer_profiles": {
+            "a": dict(original), "b": dict(original)},
+    }
+
+    def restore_dut(*args, **kwargs):
+        events.append("restore-dut")
+        raise RuntimeError("asic0 failed")
+
+    def restore_peer(env, port, role, original_profile, new_pair):
+        events.append("restore-" + port)
+        if port == "a":
+            raise RuntimeError("peer a failed")
+
+    namespace = {
+        "_capture_environment_last_updated": lambda *args, **kwargs: {},
+        "restore_macsec_profile_key": restore_dut,
+        "_restore_peer_step": restore_peer,
+        "logger": type("Logger", (), {
+            "error": lambda *args: None})(),
+    }
+    restore = _load_scenario("_restore_rotation", namespace)
+    with pytest.raises(RuntimeError, match="asic0 failed"):
+        restore(environment, "primary", original,
+                {"a": dict(original), "b": dict(original)},
+                ("new", "cc"), ["a", "b"], [False])
+    assert events == [
+        "restore-dut", "restore-a", "restore-b"]
+    assert profile["primary_ckn"] == "aa"
+
+
+def test_deleted_primary_restore_verifies_after_partial_add_failure():
+    """Even a timed-out add attempts both DUT and peer recovery checks."""
+    events = []
+
+    class Adapter:
+        def add_primary(self, pair):
+            events.append("add")
+            raise RuntimeError("add timed out after mutation")
+
+    namespace = {
+        "_wait_link_protected": lambda *args: events.append("dut-ready"),
+        "_wait_peer_protected": lambda *args: events.append("peer-ready"),
+        "logger": type("Logger", (), {
+            "error": lambda *args: None})(),
+    }
+    restore = _load_scenario("_restore_deleted_primary", namespace)
+    with pytest.raises(RuntimeError, match="add timed out"):
+        restore(
+            {"profile": {"primary_ckn": "aa"},
+             "peer_profiles": {"port": {}}},
+            "port", Adapter(), ("cak", "aa"))
+    assert events == ["add", "dut-ready", "peer-ready"]
+
+
+def test_rotation_stress_restores_partial_peer_before_dut_on_failure():
+    """A peer update error leaves its cleanup on the LIFO stack."""
+    events = []
+    profile = {
+        "name": "static", "primary_cak": "cak1", "primary_ckn": "aa",
+        "fallback_cak": "cak2", "fallback_ckn": "bb",
+        "cipher_suite": "suite",
+    }
+    environment = {
+        "profile": profile, "duthost": object(),
+        "links": {"port": {"host": object(), "port": "Ethernet1"}},
+        "neighbor_profiles": {"port": "peer-profile"},
+        "peer_profiles": {"port": dict(profile)},
+    }
+
+    class Traffic:
+        def __init__(self, *args):
+            pass
+
+        def __enter__(self):
+            events.append("traffic-start")
+            return self
+
+        def __exit__(self, *args):
+            events.append("traffic-stop")
+
+        def assert_zero_loss(self):
+            events.append("strict-verdict")
+
+    def rotate(host, *args, **kwargs):
+        events.append("dut-update" if host is environment["duthost"]
+                      else "peer-update")
+        if host is not environment["duthost"]:
+            raise RuntimeError("peer update failed after mutation")
+
+    namespace = {
+        "FALLBACK_PROFILE": "static",
+        "STRESS_ROTATIONS": 1,
+        "_TrafficWindow": Traffic,
+        "FailureSafeCleanup": FAILURE_SAFE_MODULE.FailureSafeCleanup,
+        "generate_macsec_key_pair": lambda suite: ("cak-new", "cc"),
+        "_profile_update": rotate,
+        "_restore_peer_step": lambda *args: events.append("restore-peer"),
+        "_restore_dut_step": lambda *args: events.append("restore-dut"),
+        "_wait_stress_recovered": lambda *args: events.append("healthy"),
+    }
+    scenario = _load_scenario(
+        "test_back_to_back_cak_rotation_stress", namespace)
+    with pytest.raises(RuntimeError, match="peer update failed"):
+        scenario(environment, {"port": {}})
+    assert events == [
+        "traffic-start", "dut-update", "peer-update",
+        "restore-peer", "restore-dut", "healthy", "traffic-stop"]
 
 
 def test_ping_stop_excludes_only_the_inflight_trailing_probe():

@@ -24,7 +24,9 @@ from tests.common.macsec.macsec_config_helper import (
     macsec_profile_has_fallback,
     set_macsec_profile,
     update_macsec_profile_key,
+    restore_macsec_profile_key,
 )
+from tests.common.macsec.failure_safe_cleanup import FailureSafeCleanup
 from tests.common.macsec.macsec_helper import (
     get_appl_db,
     get_ipnetns_prefix,
@@ -247,6 +249,120 @@ def _wait_peer_primary_removed(
     assert wait_until(timeout, 2, 0, _removed), (
         "{} peer did not remove the original primary: {}; diagnostics={}"
     ).format(adapter.provider, errors[0], adapter.diagnostics())
+
+
+def _restore_deleted_primary(environment, port, adapter, primary_pair):
+    errors = []
+    for restore in (
+        lambda: adapter.add_primary(primary_pair),
+        lambda: _wait_link_protected(
+            environment, port, environment["profile"]["primary_ckn"]),
+        lambda: _wait_peer_protected(
+            adapter, environment["peer_profiles"][port],
+            primary_pair[1]),
+    ):
+        try:
+            restore()
+        except BaseException as error:
+            errors.append(error)
+    if errors:
+        for error in errors[1:]:
+            logger.error("Additional cEOS primary restore failure: %r",
+                         error)
+        raise errors[0]
+
+
+def _restore_rotation(
+        environment, role, original_profile, peer_originals,
+        new_pair, attempted_ports, fully_rotated):
+    profile = environment["profile"]
+    old_pair = (
+        original_profile["{}_cak".format(role)],
+        original_profile["{}_ckn".format(role)],
+    )
+    snapshots = None
+    errors = []
+    try:
+        snapshots = _capture_environment_last_updated(
+            environment,
+            dut_ports=tuple(environment["links"]),
+            peer_ports=tuple(attempted_ports))
+    except BaseException as error:
+        errors.append(error)
+
+    try:
+        restore_macsec_profile_key(
+            environment["duthost"], profile["name"],
+            old_pair[0], old_pair[1], new_pair[0], new_pair[1],
+            is_fallback=role == "fallback")
+    except BaseException as error:
+        errors.append(error)
+
+    for port in attempted_ports:
+        restored = peer_originals[port]
+        try:
+            _restore_peer_step(
+                environment, port, role, restored, new_pair)
+        except BaseException as error:
+            errors.append(error)
+
+    profile["{}_cak".format(role)] = old_pair[0]
+    profile["{}_ckn".format(role)] = old_pair[1]
+    if not errors:
+        try:
+            if fully_rotated[0]:
+                _wait_restored_environment_published(
+                    environment, snapshots,
+                    original_profile["primary_ckn"],
+                    "original {} cleanup".format(role))
+            else:
+                assert wait_until(
+                    MKA_STATE_PUBLISH_TIMEOUT, 2, 0,
+                    _environment_is_healthy, environment,
+                ), "MKA did not recover after partial {} rotation".format(
+                    role)
+        except BaseException as error:
+            errors.append(error)
+    if errors:
+        for error in errors[1:]:
+            logger.error("Additional MACsec rotation cleanup failure: %r",
+                         error)
+        raise errors[0]
+
+
+def _restore_dut_step(environment, role, old_pair, new_pair):
+    profile = environment["profile"]
+    try:
+        restore_macsec_profile_key(
+            environment["duthost"], profile["name"],
+            old_pair[0], old_pair[1], new_pair[0], new_pair[1],
+            is_fallback=role == "fallback")
+    finally:
+        profile["{}_cak".format(role)] = old_pair[0]
+        profile["{}_ckn".format(role)] = old_pair[1]
+
+
+def _restore_peer_step(environment, port, role, old_profile, new_pair):
+    old_pair = (
+        old_profile["{}_cak".format(role)],
+        old_profile["{}_ckn".format(role)],
+    )
+    try:
+        adapter = peer_adapter(environment, port)
+        if adapter.provider == "ceos":
+            if role == "primary":
+                adapter.restore_primary(old_profile, new_pair)
+            else:
+                adapter.restore_fallback(old_profile, new_pair)
+        else:
+            restore_macsec_profile_key(
+                adapter.host, adapter.profile_name,
+                old_pair[0], old_pair[1], new_pair[0], new_pair[1],
+                is_fallback=role == "fallback",
+                namespace_options=[
+                    get_namespace_option(adapter.host, adapter.peer_port)])
+    finally:
+        environment["peer_profiles"][port] = dict(old_profile)
 
 
 def _wait_link_blocked(
@@ -530,6 +646,24 @@ def _configure_environment_rekey_period(environment, rekey_period):
         _restart_sonic_macsec(host)
 
 
+def _restore_rekey_period(environment, original_period):
+    try:
+        _configure_environment_rekey_period(environment, original_period)
+    finally:
+        environment["profile"]["rekey_period"] = original_period
+    assert wait_until(
+        MKA_CONVERGE_TIMEOUT, 3, 0,
+        _environment_is_healthy, environment,
+    ), "MKA did not recover after boundary stress cleanup"
+
+
+def _wait_stress_recovered(environment):
+    assert wait_until(
+        MKA_CONVERGE_TIMEOUT, 3, 0,
+        _environment_is_healthy, environment,
+    ), "MKA did not recover after CAK rotation stress"
+
+
 def _environment_is_healthy(
         environment, principal_ckn=None, require_all_live=True,
         validate_peers=True):
@@ -560,16 +694,25 @@ def _environment_is_healthy(
 def _start_ping(host, port, destination, suffix):
     path = "/tmp/macsec_fallback_{}_{}.log".format(port, suffix)
     host.shell("rm -f {}".format(path), module_ignore_errors=True)
-    prefix = "" if isinstance(host, EosHost) else get_ipnetns_prefix(
-        host, port)
+    prefix = _ping_namespace_prefix(host, port)
     command = "{} ping -D -i 0.1 {}".format(prefix, destination)
     result = host.shell(
         "nohup {} > {} 2>&1 < /dev/null & echo $!".format(command, path))
+    pid = int(result["stdout_lines"][-1])
+    assert pid > 0, "Continuous ping did not return a valid process ID"
     return {
         "host": host,
         "path": path,
-        "pid": int(result["stdout_lines"][-1]),
+        "pid": pid,
     }
+
+
+def _ping_namespace_prefix(host, port):
+    if isinstance(host, EosHost):
+        return (
+            "sudo ip netns exec ns-{}".format(host.bgp_vrf)
+            if host.bgp_vrf else "")
+    return get_ipnetns_prefix(host, port)
 
 
 def _parse_ping_output(output):
@@ -759,6 +902,29 @@ def _cleanup_traffic(traffic, assert_loss, phase_diagnostics=None):
             phase_diagnostics=phase_diagnostics))
 
 
+def _abort_partial_ping(ping):
+    """Stop an unobserved startup stream without requiring a ping summary."""
+    host = ping["host"]
+    pid = ping["pid"]
+    try:
+        signal = host.shell(
+            "sudo kill -INT {}".format(pid), module_ignore_errors=True)
+        exited = wait_until(
+            15, 1, 0, lambda: not _ping_process_running(ping))
+        if not exited:
+            term = host.shell(
+                "sudo kill -TERM {}".format(pid), module_ignore_errors=True)
+            terminated = wait_until(
+                5, 1, 0, lambda: not _ping_process_running(ping))
+            assert not term.get("failed") and terminated, (
+                "Unable to terminate partially started continuous ping")
+        assert not signal.get("failed") and exited, (
+            "Unable to stop partially started continuous ping")
+    finally:
+        host.shell("rm -f {}".format(ping["path"]),
+                   module_ignore_errors=True)
+
+
 def _start_bidirectional_traffic(environment, upstream_links):
     duthost = environment["duthost"]
     port, neighbor = _select_routed_link(environment, upstream_links)
@@ -771,19 +937,25 @@ def _start_bidirectional_traffic(environment, upstream_links):
     )["failed"], "Unable to warm the DUT-to-neighbor traffic path"
     assert not neighbor["host"].shell(
         "{} ping -c 3 {}".format(
-            "" if isinstance(neighbor["host"], EosHost)
-            else get_ipnetns_prefix(
+            _ping_namespace_prefix(
                 neighbor["host"], neighbor["port"]),
             link["peer_ipv4_addr"]),
         module_ignore_errors=True,
     )["failed"], "Unable to warm the neighbor-to-DUT traffic path"
-    return [
-        _start_ping(
-            duthost, port, link["local_ipv4_addr"], "dut_to_neighbor"),
-        _start_ping(
+    traffic = []
+    try:
+        traffic.append(_start_ping(
+            duthost, port, link["local_ipv4_addr"], "dut_to_neighbor"))
+        traffic.append(_start_ping(
             neighbor["host"], neighbor["port"],
-            link["peer_ipv4_addr"], "neighbor_to_dut"),
-    ]
+            link["peer_ipv4_addr"], "neighbor_to_dut"))
+    except BaseException:
+        try:
+            cleanup_all(traffic, _abort_partial_ping)
+        except BaseException:
+            logger.exception("Partial traffic startup cleanup failed")
+        raise
+    return traffic
 
 
 def _selected_link_ping_results(environment, upstream_links, port):
@@ -798,8 +970,7 @@ def _selected_link_ping_results(environment, upstream_links, port):
     )
     peer_result = neighbor["host"].shell(
         "{} ping -c 3 {}".format(
-            "" if isinstance(neighbor["host"], EosHost)
-            else get_ipnetns_prefix(
+            _ping_namespace_prefix(
                 neighbor["host"], neighbor["port"]),
             link["peer_ipv4_addr"]),
         module_ignore_errors=True,
@@ -1114,14 +1285,15 @@ def test_ceos_primary_key_delete_fails_over_hitlessly(
         pytest.skip(adapter.primary_delete_unsupported_reason)
 
     with _TrafficWindow(environment, upstream_links) as traffic:
-        adapter.delete_primary_if_supported(primary_pair)
-        _wait_link_protected(
-            environment, port, profile["fallback_ckn"],
-            require_all_live=False)
-        adapter.add_primary(primary_pair)
-        _wait_link_protected(
-            environment, port, profile["primary_ckn"])
-        _wait_peer_protected(adapter, profile, profile["primary_ckn"])
+        with FailureSafeCleanup("cEOS primary deletion") as cleanup:
+            cleanup.callback(
+                _restore_deleted_primary,
+                environment, port, adapter, primary_pair)
+            adapter.delete_primary_if_supported(primary_pair)
+            _wait_link_protected(
+                environment, port, profile["fallback_ckn"],
+                require_all_live=False)
+            _wait_peer_primary_removed(adapter, profile)
         traffic.assert_zero_loss()
 
 
@@ -1136,9 +1308,19 @@ def test_primary_rotation_and_recovery_are_hitless(
     selected_port, _ = _select_routed_link(environment, upstream_links)
     adapter = peer_adapter(environment, selected_port)
     updated_ports = []
+    fully_rotated = [False]
+    original_profile = dict(profile)
+    peer_originals = {
+        port: dict(environment["peer_profiles"][port])
+        for port in environment["links"]
+    }
 
-    try:
-        with _TrafficWindow(environment, upstream_links) as traffic:
+    with _TrafficWindow(environment, upstream_links) as traffic:
+        with FailureSafeCleanup("primary rotation") as cleanup:
+            cleanup.callback(
+                _restore_rotation, environment, "primary",
+                original_profile, peer_originals, new_pair, updated_ports,
+                fully_rotated)
             _profile_update(
                 duthost, profile["name"], old_pair[0], old_pair[1],
                 new_pair[0], new_pair[1])
@@ -1148,35 +1330,20 @@ def test_primary_rotation_and_recovery_are_hitless(
                     environment, port, profile["fallback_ckn"],
                     require_all_live=False)
 
-            adapter.rotate("primary", old_pair, new_pair)
             updated_ports.append(selected_port)
+            adapter.rotate("primary", old_pair, new_pair)
             _wait_link_protected(
                 environment, selected_port, new_pair[1])
             _wait_peer_protected(adapter, profile, new_pair[1])
-            traffic.assert_zero_loss()
 
-        for port, _ in remaining_link_items(
-                environment["links"], selected_port):
-            peer_adapter(environment, port).rotate(
-                "primary", old_pair, new_pair)
-            updated_ports.append(port)
-        _wait_environment(environment, new_pair[1])
-    finally:
-        snapshots = _capture_environment_last_updated(
-            environment,
-            dut_ports=tuple(environment["links"]),
-            peer_ports=tuple(updated_ports),
-        )
-        _profile_update(
-            duthost, profile["name"], new_pair[0], new_pair[1],
-            old_pair[0], old_pair[1])
-        for port in updated_ports:
-            peer_adapter(environment, port).rotate(
-                "primary", new_pair, old_pair)
-        profile["primary_cak"], profile["primary_ckn"] = old_pair
-        _wait_restored_environment_published(
-            environment, snapshots, old_pair[1],
-            "original primary cleanup")
+            for port, _ in remaining_link_items(
+                    environment["links"], selected_port):
+                updated_ports.append(port)
+                peer_adapter(environment, port).rotate(
+                    "primary", old_pair, new_pair)
+            _wait_environment(environment, new_pair[1])
+            fully_rotated[0] = True
+        traffic.assert_zero_loss()
 
 
 def test_fallback_rotation_keeps_primary_and_traffic(
@@ -1190,16 +1357,26 @@ def test_fallback_rotation_keeps_primary_and_traffic(
     selected_port, _ = _select_routed_link(environment, upstream_links)
     adapter = peer_adapter(environment, selected_port)
     updated_neighbors = []
+    fully_rotated = [False]
+    original_profile = dict(profile)
+    peer_originals = {
+        port: dict(environment["peer_profiles"][port])
+        for port in environment["links"]
+    }
     initial_key = _wait_active_key_stable(environment, selected_port)
 
-    try:
-        with _TrafficWindow(environment, upstream_links) as traffic:
+    with _TrafficWindow(environment, upstream_links) as traffic:
+        with FailureSafeCleanup("fallback rotation") as cleanup:
+            cleanup.callback(
+                _restore_rotation, environment, "fallback",
+                original_profile, peer_originals, new_pair,
+                updated_neighbors, fully_rotated)
             _profile_update(
                 duthost, profile["name"], old_pair[0], old_pair[1],
                 new_pair[0], new_pair[1], is_fallback=True)
             profile["fallback_cak"], profile["fallback_ckn"] = new_pair
-            adapter.rotate("fallback", old_pair, new_pair)
             updated_neighbors.append(selected_port)
+            adapter.rotate("fallback", old_pair, new_pair)
             _wait_link_protected(
                 environment, selected_port, profile["primary_ckn"])
             _wait_peer_protected(
@@ -1208,30 +1385,14 @@ def test_fallback_rotation_keeps_primary_and_traffic(
                 assert _snapshot(
                     environment, selected_port
                 ).active_key_identity() == initial_key
-            traffic.assert_zero_loss()
-
-        for port, _ in remaining_link_items(
-                environment["links"], selected_port):
-            peer_adapter(environment, port).rotate(
-                "fallback", old_pair, new_pair)
-            updated_neighbors.append(port)
-        _wait_environment(environment, profile["primary_ckn"])
-    finally:
-        snapshots = _capture_environment_last_updated(
-            environment,
-            dut_ports=tuple(environment["links"]),
-            peer_ports=tuple(updated_neighbors),
-        )
-        _profile_update(
-            duthost, profile["name"], new_pair[0], new_pair[1],
-            old_pair[0], old_pair[1], is_fallback=True)
-        for port in updated_neighbors:
-            peer_adapter(environment, port).rotate(
-                "fallback", new_pair, old_pair)
-        profile["fallback_cak"], profile["fallback_ckn"] = old_pair
-        _wait_restored_environment_published(
-            environment, snapshots, profile["primary_ckn"],
-            "original fallback cleanup")
+            for port, _ in remaining_link_items(
+                    environment["links"], selected_port):
+                updated_neighbors.append(port)
+                peer_adapter(environment, port).rotate(
+                    "fallback", old_pair, new_pair)
+            _wait_environment(environment, profile["primary_ckn"])
+            fully_rotated[0] = True
+        traffic.assert_zero_loss()
 
 
 def test_crossed_roles_follow_key_server_primary(
@@ -1287,7 +1448,8 @@ def test_primary_mismatch_fallback_takeover_and_recovery_is_hitless(
 
     with _TrafficWindow(environment, upstream_links) as traffic:
         with _primary_mismatch(environment, port, invalid_pair):
-            traffic.assert_zero_loss()
+            pass
+        traffic.assert_zero_loss()
 
 
 def test_fallback_rotation_rejected_while_fallback_is_principal(
@@ -1351,10 +1513,10 @@ def test_cak_rotation_at_periodic_rekey_boundary(
     old_cak = profile["primary_cak"]
     old_ckn = profile["primary_ckn"]
     new_cak, new_ckn = generate_macsec_key_pair(profile["cipher_suite"])
-    dut_updated = False
-    updated_neighbors = []
 
-    try:
+    with FailureSafeCleanup("periodic CAK rotation") as cleanup:
+        cleanup.callback(
+            _restore_rekey_period, environment, original_period)
         _configure_environment_rekey_period(environment, 30)
         profile["rekey_period"] = 30
         assert wait_until(
@@ -1371,10 +1533,12 @@ def test_cak_rotation_at_periodic_rekey_boundary(
                     environment, port).active_key_identity() != before,
             ), "No periodic SAK rekey was observed"
 
+            cleanup.callback(
+                _restore_dut_step, environment, "primary",
+                (old_cak, old_ckn), (new_cak, new_ckn))
             _profile_update(
                 environment["duthost"], profile["name"],
                 old_cak, old_ckn, new_cak, new_ckn)
-            dut_updated = True
             profile["primary_cak"] = new_cak
             profile["primary_ckn"] = new_ckn
             assert wait_until(
@@ -1384,36 +1548,23 @@ def test_cak_rotation_at_periodic_rekey_boundary(
             ), "Fallback did not carry the post-SAK-boundary CAK rotation"
 
             for port, neighbor in environment["links"].items():
+                previous = dict(environment["peer_profiles"][port])
+                cleanup.callback(
+                    _restore_peer_step, environment, port, "primary",
+                    previous,
+                    (new_cak, new_ckn))
                 _profile_update(
                     neighbor["host"],
                     environment["neighbor_profiles"][port],
                     old_cak, old_ckn, new_cak, new_ckn)
-                updated_neighbors.append(port)
+                environment["peer_profiles"][port] = dict(
+                    previous,
+                    primary_cak=new_cak, primary_ckn=new_ckn)
             assert wait_until(
                 MKA_CONVERGE_TIMEOUT, 2, 0,
                 _environment_is_healthy, environment, new_ckn,
             ), "Primary did not recover after boundary CAK rotation"
             traffic.assert_zero_loss()
-    finally:
-        if dut_updated:
-            _profile_update(
-                environment["duthost"], profile["name"],
-                new_cak, new_ckn, old_cak, old_ckn)
-        for port in updated_neighbors:
-            neighbor = environment["links"][port]
-            _profile_update(
-                neighbor["host"],
-                environment["neighbor_profiles"][port],
-                new_cak, new_ckn, old_cak, old_ckn)
-        profile["primary_cak"] = old_cak
-        profile["primary_ckn"] = old_ckn
-        _configure_environment_rekey_period(
-            environment, original_period)
-        profile["rekey_period"] = original_period
-        assert wait_until(
-            MKA_CONVERGE_TIMEOUT, 3, 0,
-            _environment_is_healthy, environment,
-        ), "MKA did not recover after boundary stress cleanup"
 
 
 @pytest.mark.stress_test
@@ -1425,18 +1576,17 @@ def test_back_to_back_cak_rotation_stress(
     if profile["name"] != FALLBACK_PROFILE:
         pytest.skip("Rotation stress runs only on the static fallback profile")
 
-    original = dict(profile)
-    dut_pairs = {
-        role: (profile["{}_cak".format(role)],
-               profile["{}_ckn".format(role)])
-        for role in ("primary", "fallback")
-    }
     peer_pairs = {
-        port: dict(dut_pairs)
+        port: {
+            role: (profile["{}_cak".format(role)],
+                   profile["{}_ckn".format(role)])
+            for role in ("primary", "fallback")
+        }
         for port in environment["links"]
     }
     with _TrafficWindow(environment, upstream_links) as traffic:
-        try:
+        with FailureSafeCleanup("CAK rotation stress") as cleanup:
+            cleanup.callback(_wait_stress_recovered, environment)
             for iteration in range(STRESS_ROTATIONS):
                 is_fallback = iteration % 2 == 1
                 role = "fallback" if is_fallback else "primary"
@@ -1445,21 +1595,38 @@ def test_back_to_back_cak_rotation_stress(
                 new_cak, new_ckn = generate_macsec_key_pair(
                     profile["cipher_suite"])
 
+                cleanup.callback(
+                    _restore_dut_step, environment, role,
+                    (old_cak, old_ckn), (new_cak, new_ckn))
                 _profile_update(
                     environment["duthost"], profile["name"],
                     old_cak, old_ckn, new_cak, new_ckn,
                     is_fallback=is_fallback)
-                dut_pairs[role] = (new_cak, new_ckn)
                 profile["{}_cak".format(role)] = new_cak
                 profile["{}_ckn".format(role)] = new_ckn
 
                 for port, neighbor in environment["links"].items():
+                    previous = dict(environment["peer_profiles"][port])
+                    for peer_role in ("primary", "fallback"):
+                        previous["{}_cak".format(peer_role)] = (
+                            peer_pairs[port][peer_role][0])
+                        previous["{}_ckn".format(peer_role)] = (
+                            peer_pairs[port][peer_role][1])
+                    cleanup.callback(
+                        _restore_peer_step, environment, port, role,
+                        previous, (new_cak, new_ckn))
                     _profile_update(
                         neighbor["host"],
                         environment["neighbor_profiles"][port],
                         old_cak, old_ckn, new_cak, new_ckn,
                         is_fallback=is_fallback)
                     peer_pairs[port][role] = (new_cak, new_ckn)
+                    environment["peer_profiles"][port] = dict(
+                        previous,
+                        **{
+                            "{}_cak".format(role): new_cak,
+                            "{}_ckn".format(role): new_ckn,
+                        })
 
                 assert wait_until(
                     MKA_CONVERGE_TIMEOUT, 2, 0,
@@ -1471,35 +1638,6 @@ def test_back_to_back_cak_rotation_stress(
                         environment["duthost"], port,
                         neighbor["host"], neighbor["port"])
                     assert egress_sc and ingress_sc
-        finally:
-            for role, is_fallback in (
-                    ("primary", False), ("fallback", True)):
-                original_cak = original["{}_cak".format(role)]
-                original_ckn = original["{}_ckn".format(role)]
-                current_cak, current_ckn = dut_pairs[role]
-                if (current_cak, current_ckn) != (
-                        original_cak, original_ckn):
-                    _profile_update(
-                        environment["duthost"], profile["name"],
-                        current_cak, current_ckn,
-                        original_cak, original_ckn,
-                        is_fallback=is_fallback)
-                for port, neighbor in environment["links"].items():
-                    peer_cak, peer_ckn = peer_pairs[port][role]
-                    if (peer_cak, peer_ckn) != (
-                            original_cak, original_ckn):
-                        _profile_update(
-                            neighbor["host"],
-                            environment["neighbor_profiles"][port],
-                            peer_cak, peer_ckn,
-                            original_cak, original_ckn,
-                            is_fallback=is_fallback)
-                profile["{}_cak".format(role)] = original_cak
-                profile["{}_ckn".format(role)] = original_ckn
-            assert wait_until(
-                MKA_CONVERGE_TIMEOUT, 3, 0,
-                _environment_is_healthy, environment,
-            ), "MKA did not recover after CAK rotation stress"
         traffic.assert_zero_loss()
 
 

@@ -67,6 +67,48 @@ class _FakeHost:
         return self.result
 
 
+@pytest.mark.parametrize(
+    "failed_command", ["session HGETALL", "KEYS", "participant HGETALL"])
+@pytest.mark.parametrize("failure", [
+    {"failed": True}, {"failed": False, "rc": 1},
+])
+def test_mka_state_read_failure_is_not_empty_state(
+        failed_command, failure):
+    """A failed DB query must never look like completed disable teardown."""
+    class Host:
+        is_multi_asic = False
+
+        def command(self, command, **kwargs):
+            if (
+                    failed_command == "KEYS" and " KEYS " in command
+                    or failed_command == "session HGETALL"
+                    and "HGETALL 'MACSEC_MKA_SESSION_TABLE|" in command
+                    or failed_command == "participant HGETALL"
+                    and "HGETALL 'MACSEC_MKA_PARTICIPANT_TABLE|" in command):
+                return dict(failure, stdout_lines=[])
+            if " KEYS " in command and failed_command == (
+                    "participant HGETALL"):
+                return {
+                    "failed": False,
+                    "stdout_lines": [
+                        "MACSEC_MKA_PARTICIPANT_TABLE|Ethernet0|cc"]}
+            return {"failed": False, "stdout": "", "stdout_lines": []}
+
+    with pytest.raises(RuntimeError, match="Unable to read STATE_DB"):
+        MKA_STATE_HELPER.get_mka_state(Host(), "Ethernet0")
+
+
+def test_mka_state_successful_empty_reads_are_absent_rows():
+    """A successful empty HGETALL and KEYS is genuinely empty state."""
+    class Host:
+        is_multi_asic = False
+
+        def command(self, command, **kwargs):
+            return {"failed": False, "stdout": "", "stdout_lines": []}
+
+    assert MKA_STATE_HELPER.get_mka_state(Host(), "Ethernet0") == ({}, {})
+
+
 class _CommandHost:
     def __init__(self, results, multi_asic=False):
         self.results = results

@@ -1,6 +1,7 @@
 import ast
 import importlib.util
 import json
+import logging
 import re
 import secrets
 from pathlib import Path
@@ -92,6 +93,135 @@ def _load_macsec_feature_fixture():
 
 
 PROFILE_HELPERS = _load_profile_helpers()
+
+
+def _load_rotation_helpers():
+    tree = ast.parse(HELPER_PATH.read_text())
+    names = {
+        "_profile_namespace_options", "restore_macsec_profile_key",
+        "update_macsec_profile_key", "_eos_macsec_key_line",
+    }
+    nodes = [node for node in tree.body
+             if isinstance(node, ast.FunctionDef) and node.name in names]
+    namespace = {
+        "EosHost": type("EosHost", (), {}),
+        "logger": logging.getLogger(__name__),
+    }
+    exec(compile(ast.Module(body=nodes, type_ignores=[]),
+                 str(HELPER_PATH), "exec"), namespace)
+    return namespace
+
+
+@pytest.mark.parametrize("mutate_failed_namespace", [False, True])
+def test_partial_multi_asic_update_restores_only_mutated_namespaces(
+        mutate_failed_namespace):
+    """Rollback avoids reverse updates on an untouched namespace."""
+    helpers = _load_rotation_helpers()
+
+    class Host:
+        is_multi_asic = True
+        hostname = "dut"
+
+        def __init__(self):
+            self.ckns = {"asic0": "old", "asic1": "old"}
+            self.updates = []
+
+        def get_asic_namespace_list(self):
+            return ["asic0", "asic1"]
+
+        def command(self, command, **kwargs):
+            namespace = "asic1" if "-n asic1" in command else "asic0"
+            if "HGET" in command:
+                return {
+                    "failed": False, "stdout": self.ckns[namespace]}
+            old = command.split("--old_ckn ")[1].split()[0]
+            new = command.split("--new_ckn ")[1].split()[0]
+            self.updates.append((namespace, old, new))
+            if namespace == "asic1" and old == "old":
+                if mutate_failed_namespace:
+                    self.ckns[namespace] = new
+                return {"failed": True}
+            assert self.ckns[namespace] == old
+            self.ckns[namespace] = new
+            return {"failed": False}
+
+    host = Host()
+    with pytest.raises(AssertionError, match="Unexpected SONiC"):
+        helpers["update_macsec_profile_key"](
+            host, "profile", "cak-old", "old", "cak-new", "new")
+    assert host.ckns == {"asic0": "old", "asic1": "old"}
+    expected = [("asic0", "old", "new"), ("asic1", "old", "new")]
+    if mutate_failed_namespace:
+        expected += [("asic0", "new", "old"),
+                     ("asic1", "new", "old")]
+    else:
+        expected += [("asic0", "new", "old")]
+    assert host.updates == expected
+
+
+def test_restore_attempts_other_namespace_after_one_failure():
+    """A failed reverse update must not block independent namespaces."""
+    helpers = _load_rotation_helpers()
+
+    class Host:
+        is_multi_asic = True
+        hostname = "dut"
+
+        def __init__(self):
+            self.ckns = {"asic0": "new", "asic1": "new"}
+            self.updates = []
+
+        def get_asic_namespace_list(self):
+            return ["asic0", "asic1"]
+
+        def command(self, command, **kwargs):
+            namespace = "asic1" if "-n asic1" in command else "asic0"
+            if "HGET" in command:
+                return {"failed": False, "stdout": self.ckns[namespace]}
+            self.updates.append(namespace)
+            if namespace == "asic0":
+                return {"failed": True}
+            self.ckns[namespace] = "old"
+            return {"failed": False}
+
+    host = Host()
+    with pytest.raises(AssertionError, match="Unexpected SONiC"):
+        helpers["restore_macsec_profile_key"](
+            host, "profile", "cak-old", "old", "cak-new", "new")
+    assert host.updates == ["asic0", "asic1"]
+    assert host.ckns == {"asic0": "new", "asic1": "old"}
+
+
+def test_restore_keeps_other_namespace_after_state_read_error():
+    """An inaccessible namespace does not stop the readable one."""
+    helpers = _load_rotation_helpers()
+
+    class Host:
+        is_multi_asic = True
+        hostname = "dut"
+
+        def __init__(self):
+            self.ckns = {"asic0": "new", "asic1": "new"}
+
+        def get_asic_namespace_list(self):
+            return ["asic0", "asic1"]
+
+        def command(self, command, **kwargs):
+            namespace = "asic1" if "-n asic1" in command else "asic0"
+            if "HGET" in command:
+                if namespace == "asic0":
+                    return {"failed": True}
+                return {"failed": False, "stdout": self.ckns[namespace]}
+            self.ckns[namespace] = "old"
+            return {"failed": False}
+
+    host = Host()
+    with pytest.raises(RuntimeError, match="Unable to read MACsec profile"):
+        helpers["restore_macsec_profile_key"](
+            host, "profile", "cak-old", "old", "cak-new", "new")
+    assert host.ckns == {"asic0": "new", "asic1": "old"}
+
+
 _build_macsec_profile_options = PROFILE_HELPERS[
     "_build_macsec_profile_options"]
 _build_eos_macsec_profile_lines = PROFILE_HELPERS[

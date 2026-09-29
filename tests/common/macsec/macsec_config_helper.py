@@ -35,6 +35,7 @@ __all__ = [
     'generate_per_interface_macsec_profile',
     'generate_per_interface_macsec_profiles',
     'update_macsec_profile_key',
+    'restore_macsec_profile_key',
     'add_runtime_macsec_key',
     'delete_runtime_macsec_key',
     'list_runtime_macsec_participants',
@@ -188,9 +189,69 @@ def _eos_macsec_key_line(ckn, cak, is_fallback=False, remove=False):
     return line
 
 
+def _profile_namespace_options(host, namespace_option):
+    if namespace_option is not None:
+        return [namespace_option]
+    if host.is_multi_asic:
+        return [
+            "-n {}".format(namespace)
+            for namespace in host.get_asic_namespace_list()
+        ]
+    return [""]
+
+
+def restore_macsec_profile_key(
+        host, profile_name, old_cak, old_ckn, new_cak, new_ckn,
+        is_fallback=False, namespace_options=None):
+    """Restore only namespaces actually carrying the replacement CKN."""
+    if namespace_options is None:
+        namespace_options = _profile_namespace_options(host, None)
+    field = "fallback_ckn" if is_fallback else "primary_ckn"
+    first_error = None
+    for option in namespace_options:
+        try:
+            result = host.command(
+                "sonic-db-cli {} CONFIG_DB HGET 'MACSEC_PROFILE|{}' "
+                "{}".format(option, profile_name, field),
+                module_ignore_errors=True, verbose=False)
+            if result.get("failed") or result.get("rc", 0) != 0:
+                raise RuntimeError(
+                    "Unable to read MACsec profile in {}".format(option))
+            current = result.get("stdout", "").strip().lower()
+            if current == new_ckn.lower():
+                update_macsec_profile_key(
+                    host, profile_name, new_cak, new_ckn, old_cak, old_ckn,
+                    is_fallback=is_fallback, namespace_option=option,
+                    rollback_on_failure=False)
+                restored = host.command(
+                    "sonic-db-cli {} CONFIG_DB HGET 'MACSEC_PROFILE|{}' "
+                    "{}".format(option, profile_name, field),
+                    module_ignore_errors=True, verbose=False)
+                if (restored.get("failed") or
+                        restored.get("rc", 0) != 0 or
+                        restored.get("stdout", "").strip().lower()
+                        != old_ckn.lower()):
+                    raise RuntimeError(
+                        "MACsec profile restore did not persist in {}".format(
+                            option))
+            elif current != old_ckn.lower():
+                raise AssertionError(
+                    "Unexpected MACsec profile CKN in {}".format(option))
+        except BaseException as error:
+            if first_error is None:
+                first_error = error
+            else:
+                logger.error(
+                    "Additional MACsec profile restore failure in %s: %r",
+                    option, error)
+    if first_error is not None:
+        raise first_error
+
+
 def update_macsec_profile_key(
         host, profile_name, old_cak, old_ckn, new_cak, new_ckn,
-        is_fallback=False, namespace_option=None, expect_success=True):
+        is_fallback=False, namespace_option=None, expect_success=True,
+        rollback_on_failure=True):
     """Rotate one primary or fallback CAK/CKN pair without detaching ports."""
     if isinstance(host, EosHost):
         result = host.eos_config(
@@ -207,29 +268,37 @@ def update_macsec_profile_key(
         ).format(host.hostname)
         return [result]
 
-    if namespace_option is None:
-        namespace_options = [""]
-        if host.is_multi_asic:
-            namespace_options = [
-                "-n {}".format(namespace)
-                for namespace in host.get_asic_namespace_list()
-            ]
-    else:
-        namespace_options = [namespace_option]
+    namespace_options = _profile_namespace_options(host, namespace_option)
 
     results = []
-    for option in namespace_options:
-        command = (
-            "config macsec {} profile update {} "
-            "--old_ckn {} --new_ckn {} --new_cak {}"
-        ).format(option, profile_name, old_ckn, new_ckn, new_cak)
-        result = host.command(
-            command, module_ignore_errors=True, verbose=False)
-        results.append(result)
-        failed = result.get("failed", False)
-        assert failed != expect_success, (
-            "Unexpected SONiC MACsec key rotation result on {}"
-        ).format(host.hostname)
+    attempted = []
+    try:
+        for option in namespace_options:
+            command = (
+                "config macsec {} profile update {} "
+                "--old_ckn {} --new_ckn {} --new_cak {}"
+            ).format(option, profile_name, old_ckn, new_ckn, new_cak)
+            attempted.append(option)
+            result = host.command(
+                command, module_ignore_errors=True, verbose=False)
+            results.append(result)
+            failed = (
+                result.get("failed", False)
+                or result.get("rc", 0) != 0)
+            assert failed != expect_success, (
+                "Unexpected SONiC MACsec key rotation result on {}"
+            ).format(host.hostname)
+    except BaseException:
+        if rollback_on_failure:
+            try:
+                restore_macsec_profile_key(
+                    host, profile_name, old_cak, old_ckn, new_cak, new_ckn,
+                    is_fallback=is_fallback, namespace_options=attempted)
+            except BaseException:
+                logger.exception(
+                    "MACsec profile update rollback failed; "
+                    "attempted namespaces: %s", attempted)
+        raise
     return results
 
 

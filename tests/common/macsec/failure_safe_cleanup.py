@@ -30,6 +30,10 @@ class FailureSafeCleanup(AbstractContextManager):
             except BaseException as error:
                 if first_error is None:
                     first_error = error
+                else:
+                    logger.error(
+                        "%s additional cleanup failure: %r",
+                        self.description, error)
         if first_error is not None:
             raise first_error
 

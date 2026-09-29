@@ -315,8 +315,9 @@ def _read_hash(host, namespace_option, database, key):
     command = "sonic-db-cli {} {} HGETALL '{}'".format(
         namespace_option, database, key)
     result = host.command(command, module_ignore_errors=True)
-    if result.get("failed"):
-        return {}
+    if result.get("failed") or result.get("rc", 0) != 0:
+        raise RuntimeError(
+            "Unable to read {} HGETALL for {}".format(database, key))
     return parse_db_hash(result.get("stdout", ""))
 
 
@@ -338,7 +339,10 @@ def get_mka_state(host, interface):
     command = "sonic-db-cli {} STATE_DB KEYS '{}'".format(
         namespace_option, pattern)
     result = host.command(command, module_ignore_errors=True)
-    keys = result.get("stdout_lines", []) if not result.get("failed") else []
+    if result.get("failed") or result.get("rc", 0) != 0:
+        raise RuntimeError(
+            "Unable to read STATE_DB KEYS for {}".format(interface))
+    keys = result.get("stdout_lines", [])
 
     participants = {}
     for key in keys:
