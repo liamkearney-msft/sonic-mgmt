@@ -15,22 +15,14 @@ MKA_STATE_HELPER = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MKA_STATE_HELPER)
 
 find_secret_fields = MKA_STATE_HELPER.find_secret_fields
-fresh_mka_state_published = MKA_STATE_HELPER.fresh_mka_state_published
-classify_macsec_teardown = MKA_STATE_HELPER.classify_macsec_teardown
-classify_published_peer_teardown = (
-    MKA_STATE_HELPER.classify_published_peer_teardown
-)
 cleanup_all = MKA_STATE_HELPER.cleanup_all
 crossed_role_peer_key_server_supported = (
     MKA_STATE_HELPER.crossed_role_peer_key_server_supported
 )
-eos_key_replacement_status = MKA_STATE_HELPER.eos_key_replacement_status
-eos_key_deletion_status = MKA_STATE_HELPER.eos_key_deletion_status
 get_macsec_ingress_sc_state = (
     MKA_STATE_HELPER.get_macsec_ingress_sc_state
 )
 get_macsec_max_sa_per_sc = MKA_STATE_HELPER.get_macsec_max_sa_per_sc
-get_macsec_teardown_state = MKA_STATE_HELPER.get_macsec_teardown_state
 _mka_show_result_supported = MKA_STATE_HELPER._mka_show_result_supported
 _mka_state_cli_supported = MKA_STATE_HELPER.mka_state_cli_supported
 macsecmgrd_restart_ready = MKA_STATE_HELPER.macsecmgrd_restart_ready
@@ -39,7 +31,6 @@ mka_hello_timeout_seconds = MKA_STATE_HELPER.mka_hello_timeout_seconds
 parse_db_hash = MKA_STATE_HELPER.parse_db_hash
 parse_eos_profile_ckns = MKA_STATE_HELPER.parse_eos_profile_ckns
 parse_eos_mka_participants = MKA_STATE_HELPER.parse_eos_mka_participants
-quiescence_budget_seconds = MKA_STATE_HELPER.quiescence_budget_seconds
 remaining_link_items = MKA_STATE_HELPER.remaining_link_items
 select_independent_port_pair = MKA_STATE_HELPER.select_independent_port_pair
 validate_multi_port_alternate_state = (
@@ -618,58 +609,6 @@ def test_mka_hello_timeout_rejects_malformed(value):
             {"mka_hello_time_ms": value}, 4)
 
 
-def test_fresh_state_publication_is_separate_from_runtime_readiness():
-    """Require a fresh, in-sync STATE_DB timestamp after daemon resume."""
-    session = {
-        "query_status": "ok",
-        "config_status": "in-sync",
-        "last_updated": "new",
-    }
-    assert fresh_mka_state_published(session, "old")
-    assert not fresh_mka_state_published(session, "new")
-    assert not fresh_mka_state_published(
-        dict(session, query_status="error"), "old")
-
-
-def test_eos_key_replacement_status_and_rebind_decision():
-    """Require new CKN state and old actor absence after hot update."""
-    participants = {
-        "new": {
-            "success": False, "active": False, "failed": False,
-            "live_peers": 0,
-        },
-        "fallback": {
-            "success": True, "active": True, "failed": False,
-            "live_peers": 1,
-        },
-    }
-    assert eos_key_replacement_status(
-        {"new", "fallback"}, participants, "old", "new",
-        required_live_ckns={"fallback"}, controlled_port=True,
-        expected_configured_ckns={"new", "fallback"}) == []
-    errors = eos_key_replacement_status(
-        {"old", "fallback"}, {"old": {}, "fallback": participants["fallback"]},
-        "old", "new", required_live_ckns={"fallback"},
-        controlled_port=True,
-        expected_configured_ckns={"new", "fallback"})
-    assert "old CKN remains in runtime participants" in errors
-
-
-def test_eos_key_deletion_requires_actor_absence_and_live_survivor():
-    """Start protocol expiry only after config and runtime actor deletion."""
-    fallback = {
-        "success": True, "active": True, "failed": False,
-        "live_peers": 1,
-    }
-    assert eos_key_deletion_status(
-        {"fallback"}, {"fallback": fallback}, "primary",
-        {"fallback"}) == []
-    errors = eos_key_deletion_status(
-        {"fallback"}, {"primary": {}, "fallback": fallback},
-        "primary", {"fallback"})
-    assert "deleted CKN remains in runtime participants" in errors
-
-
 def test_select_independent_port_pair_rejects_shared_profile_scope():
     """Choose ports whose peer profile mutation cannot affect each other."""
     ports = ["Ethernet0", "Ethernet4", "Ethernet8"]
@@ -768,153 +707,6 @@ def test_macsecmgrd_restart_command():
     """Use supervisor restart in the selected namespace-local container."""
     assert macsecmgrd_restart_command(
         "macsec0") == "docker exec macsec0 supervisorctl restart macsecmgrd"
-
-
-def test_quiescence_budget_includes_measured_snapshot_cost():
-    """Allow protocol settling plus at least two full stable snapshots."""
-    assert quiescence_budget_seconds(12, 15.2, 2) == 58
-    assert quiescence_budget_seconds(12, 1, 2) == 18
-
-
-@pytest.mark.parametrize(
-    "participants, enable, egress, ingress, log_seen, expected",
-    [
-        ({"a": {"live_peers": "1"}}, "true", ["tx"], ["rx"], False,
-         "live-peers-remain"),
-        ({"a": {"live_peers": "0"}}, "true", ["tx"], ["rx"], False,
-         "controlled-port-propagation"),
-        ({"a": {"live_peers": "0"}}, "true", ["tx"], ["rx"], True,
-         "controlled-port-propagation"),
-        ({"a": {"live_peers": "0"}}, "false", ["tx"], [], True,
-         "secy-orch-sa-teardown"),
-        ({"a": {"live_peers": "0"}}, "false", [], [], False,
-         "complete-without-observed-log"),
-        ({"a": {"live_peers": "0"}}, "false", [], [], True, "complete"),
-    ],
-)
-def test_classify_macsec_teardown(
-        participants, enable, egress, ingress, log_seen, expected):
-    """Identify the first failed layer in both-invalid reconciliation."""
-    assert classify_macsec_teardown(
-        participants, enable, egress, ingress, log_seen) == expected
-
-
-def test_get_macsec_teardown_state_reads_port_and_sa_keys():
-    """Read namespace-local enable state and non-secret TX/RX SA keys."""
-    results = {
-        "sonic-db-cli -n asic0 APPL_DB HGETALL "
-        "'MACSEC_PORT_TABLE:Ethernet0'": {
-            "failed": False, "stdout": "{'enable': 'false'}"},
-        "sonic-db-cli -n asic0 APPL_DB KEYS "
-        "'MACSEC_EGRESS_SA_TABLE:Ethernet0:*'": {
-            "failed": False,
-            "stdout_lines": ["MACSEC_EGRESS_SA_TABLE:Ethernet0:0"]},
-        "sonic-db-cli -n asic0 APPL_DB KEYS "
-        "'MACSEC_INGRESS_SA_TABLE:Ethernet0:*'": {
-            "failed": False, "stdout_lines": []},
-    }
-    host = _CommandHost(results, multi_asic=True)
-    assert get_macsec_teardown_state(host, "Ethernet0") == {
-        "port_enable": "false",
-        "egress_sa_keys": ["MACSEC_EGRESS_SA_TABLE:Ethernet0:0"],
-        "ingress_sa_keys": [],
-    }
-
-
-@pytest.mark.parametrize(
-    "session, participants, enable, egress, ingress, controlled, expected",
-    [
-        (
-            {
-                "profile": "temp",
-                "query_status": "error",
-                "config_status": "in-sync",
-                "last_updated": "new",
-                "secured": "false",
-            },
-            {},
-            "false", [], [], False, "publication-pending",
-        ),
-        (
-            {
-                "profile": "temp",
-                "query_status": "ok",
-                "config_status": "in-sync",
-                "last_updated": "new",
-                "secured": "false",
-            },
-            {
-                "a": {"active": "true", "live_peers": "1"},
-                "b": {"active": "true", "live_peers": "0"},
-            },
-            "false", [], [], False, "live-peers-remain",
-        ),
-        (
-            {
-                "profile": "temp",
-                "query_status": "ok",
-                "config_status": "in-sync",
-                "last_updated": "new",
-                "secured": "false",
-            },
-            {
-                "a": {"active": "true", "live_peers": "0"},
-                "b": {"active": "true", "live_peers": "0"},
-            },
-            "true", [], [], True, "controlled-port-propagation",
-        ),
-        (
-            {
-                "profile": "temp",
-                "query_status": "ok",
-                "config_status": "in-sync",
-                "last_updated": "new",
-                "secured": "false",
-            },
-            {
-                "a": {"active": "true", "live_peers": "0"},
-                "b": {"active": "true", "live_peers": "0"},
-            },
-            "false", ["tx"], [], False, "secy-orch-sa-teardown",
-        ),
-        (
-            {
-                "profile": "temp",
-                "query_status": "ok",
-                "config_status": "in-sync",
-                "last_updated": "new",
-                "secured": "false",
-            },
-            {
-                "a": {"active": "true", "live_peers": "0"},
-                "b": {"active": "true", "live_peers": "0"},
-            },
-            "false", [], [], True,
-            "controlled-port-helper-inconsistency",
-        ),
-        (
-            {
-                "profile": "temp",
-                "query_status": "ok",
-                "config_status": "in-sync",
-                "last_updated": "new",
-                "secured": "false",
-            },
-            {
-                "a": {"active": "true", "live_peers": "0"},
-                "b": {"active": "true", "live_peers": "0"},
-            },
-            "false", [], [], False, "complete",
-        ),
-    ],
-)
-def test_classify_published_peer_teardown(
-        session, participants, enable, egress, ingress,
-        controlled, expected):
-    """Classify peer teardown at the first incomplete published layer."""
-    assert classify_published_peer_teardown(
-        session, participants, enable, egress, ingress,
-        controlled, "temp", {"a", "b"}, "old") == expected
 
 
 def test_validate_lifecycle_cleanup_state_requires_fresh_healthy_state():

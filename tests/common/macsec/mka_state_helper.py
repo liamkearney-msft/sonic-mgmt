@@ -9,8 +9,6 @@ MKA_PARTICIPANT_TABLE = "MACSEC_MKA_PARTICIPANT_TABLE"
 MACSEC_PORT_TABLE = "MACSEC_PORT_TABLE"
 MACSEC_INGRESS_SC_TABLE = "MACSEC_INGRESS_SC_TABLE"
 MACSEC_INGRESS_SA_TABLE = "MACSEC_INGRESS_SA_TABLE"
-MACSEC_EGRESS_SA_TABLE = "MACSEC_EGRESS_SA_TABLE"
-MACSEC_APPL_PORT_TABLE = "MACSEC_PORT_TABLE"
 
 REQUIRED_SESSION_FIELDS = {
     "profile",
@@ -183,73 +181,6 @@ def parse_eos_profile_ckns(output, profile_name):
             if match:
                 ckns.add(match.group(1).lower())
     return ckns
-
-
-def eos_key_replacement_status(
-        configured_ckns, participants, old_ckn, new_ckn,
-        required_live_ckns=(), controlled_port=True,
-        expected_configured_ckns=None):
-    """Classify whether an EOS key replacement reached the required runtime."""
-    old_ckn = old_ckn.lower()
-    new_ckn = new_ckn.lower()
-    required_live_ckns = {ckn.lower() for ckn in required_live_ckns}
-    errors = []
-
-    if expected_configured_ckns is not None:
-        expected_configured_ckns = {
-            ckn.lower() for ckn in expected_configured_ckns}
-        if configured_ckns != expected_configured_ckns:
-            errors.append("configured CKNs {}, expected {}".format(
-                sorted(configured_ckns),
-                sorted(expected_configured_ckns)))
-    if old_ckn in configured_ckns:
-        errors.append("old CKN remains in running config")
-    if new_ckn not in configured_ckns:
-        errors.append("new CKN missing from running config")
-    if old_ckn in participants:
-        errors.append("old CKN remains in runtime participants")
-    if new_ckn not in participants:
-        errors.append("new CKN missing from runtime participants")
-    if required_live_ckns and not controlled_port:
-        errors.append("controlled port is not open")
-    for ckn in required_live_ckns:
-        participant = participants.get(ckn, {})
-        if not participant.get("success"):
-            errors.append("{} is not successful".format(ckn))
-        if not participant.get("active"):
-            errors.append("{} is not active".format(ckn))
-        if participant.get("failed"):
-            errors.append("{} is failed".format(ckn))
-        if participant.get("live_peers", 0) < 1:
-            errors.append("{} has no live peer".format(ckn))
-    return errors
-
-
-def eos_key_deletion_status(
-        configured_ckns, participants, deleted_ckn,
-        remaining_ckns, controlled_port=True):
-    """Validate deleted EOS actor state and operational survivors."""
-    deleted_ckn = deleted_ckn.lower()
-    remaining_ckns = {ckn.lower() for ckn in remaining_ckns}
-    errors = []
-    if configured_ckns != remaining_ckns:
-        errors.append("configured CKNs {}, expected {}".format(
-            sorted(configured_ckns), sorted(remaining_ckns)))
-    if deleted_ckn in participants:
-        errors.append("deleted CKN remains in runtime participants")
-    if remaining_ckns and not controlled_port:
-        errors.append("controlled port is not open")
-    for ckn in remaining_ckns:
-        participant = participants.get(ckn, {})
-        if not participant.get("success"):
-            errors.append("{} is not successful".format(ckn))
-        if not participant.get("active"):
-            errors.append("{} is not active".format(ckn))
-        if participant.get("failed"):
-            errors.append("{} is failed".format(ckn))
-        if participant.get("live_peers", 0) < 1:
-            errors.append("{} has no live peer".format(ckn))
-    return errors
 
 
 def _mka_show_result_supported(result):
@@ -436,16 +367,6 @@ def mka_hello_timeout_seconds(session, intervals, default_hello_ms=2000):
     return max(1, int(math.ceil(intervals * hello_ms / 1000.0)))
 
 
-def fresh_mka_state_published(session, previous_last_updated):
-    """Return whether a fresh, usable MKA snapshot was published."""
-    return (
-        session.get("query_status") == "ok"
-        and session.get("config_status") == "in-sync"
-        and bool(session.get("last_updated"))
-        and session.get("last_updated") != previous_last_updated
-    )
-
-
 def get_macsec_max_sa_per_sc(host, interface):
     """Read max-SA capability after the namespace-local port is OK."""
     namespace_option = get_namespace_option(host, interface)
@@ -551,89 +472,6 @@ def macsecmgrd_restart_command(container):
     """Build the deterministic supervisor restart command."""
     return "docker exec {} supervisorctl restart macsecmgrd".format(
         container)
-
-
-def quiescence_budget_seconds(
-        settle_seconds, snapshot_seconds, poll_seconds, stable_polls=2):
-    """Budget settle time plus enough measured time for stable snapshots."""
-    sample_seconds = max(snapshot_seconds, poll_seconds)
-    return max(1, int(math.ceil(
-        settle_seconds + (stable_polls + 1) * sample_seconds)))
-
-
-def get_macsec_teardown_state(host, interface):
-    """Return non-secret port enable and SA-key state for teardown checks."""
-    namespace_option = get_namespace_option(host, interface)
-    port = _read_hash(
-        host, namespace_option, "APPL_DB",
-        "{}:{}".format(MACSEC_APPL_PORT_TABLE, interface))
-    state = {"port_enable": port.get("enable"), "egress_sa_keys": [],
-             "ingress_sa_keys": []}
-    for direction, table in (
-            ("egress_sa_keys", MACSEC_EGRESS_SA_TABLE),
-            ("ingress_sa_keys", MACSEC_INGRESS_SA_TABLE)):
-        result = host.command(
-            "sonic-db-cli {} APPL_DB KEYS '{}:{}:*'".format(
-                namespace_option, table, interface),
-            module_ignore_errors=True,
-            verbose=False,
-        )
-        state[direction] = sorted(
-            key.strip() for key in result.get("stdout_lines", [])
-            if key.strip())
-    return state
-
-
-def classify_macsec_teardown(
-        participants, port_enable, egress_sa_keys, ingress_sa_keys,
-        teardown_log_seen):
-    """Classify the first failed layer in no-live-CA teardown."""
-    live = {
-        ckn: int(participant.get("live_peers", "0"))
-        for ckn, participant in participants.items()
-    }
-    if any(count > 0 for count in live.values()):
-        return "live-peers-remain"
-    if port_enable != "false":
-        return "controlled-port-propagation"
-    if egress_sa_keys or ingress_sa_keys:
-        return "secy-orch-sa-teardown"
-    if not teardown_log_seen:
-        return "complete-without-observed-log"
-    return "complete"
-
-
-def classify_published_peer_teardown(
-        session, participants, port_enable, egress_sa_keys,
-        ingress_sa_keys, controlled_port, expected_profile,
-        expected_ckns, previous_last_updated):
-    """Classify the first incomplete layer in published peer teardown."""
-    if (
-            session.get("profile") != expected_profile
-            or session.get("query_status") != "ok"
-            or session.get("config_status") != "in-sync"
-            or not session.get("last_updated")
-            or session.get("last_updated") == previous_last_updated):
-        return "publication-pending"
-    if set(participants) != set(expected_ckns):
-        return "participant-set-mismatch"
-    if any(
-            participant.get("active") != "true"
-            for participant in participants.values()):
-        return "participant-inactive"
-    if any(
-            int(participant.get("live_peers", "0")) > 0
-            for participant in participants.values()):
-        return "live-peers-remain"
-    if session.get("secured") != "false":
-        return "published-secured-state"
-    if port_enable != "false":
-        return "controlled-port-propagation"
-    if egress_sa_keys or ingress_sa_keys:
-        return "secy-orch-sa-teardown"
-    if controlled_port:
-        return "controlled-port-helper-inconsistency"
-    return "complete"
 
 
 def validate_lifecycle_cleanup_state(

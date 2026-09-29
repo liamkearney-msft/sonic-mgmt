@@ -2,7 +2,6 @@ import ast
 import importlib.util
 import json
 import logging
-import re
 import secrets
 from pathlib import Path
 
@@ -35,7 +34,6 @@ def _load_profile_helpers():
         "_build_macsec_profile_options",
         "_build_eos_macsec_profile_lines",
         "_eos_macsec_key_line",
-        "_parse_wpa_global_socket",
         "_portchannel_member_command",
         "_macsec_port_command",
         "_macsec_port_profile",
@@ -61,7 +59,6 @@ def _load_profile_helpers():
         "find_portchannel_from_member": lambda port, portchannels: None,
         "get_portchannel": lambda host: {},
         "getns_prefix": lambda host, port: "",
-        "re": re,
         "secrets": secrets,
         "cisco_type7": cisco_type7,
         "wait_until": lambda timeout, interval, delay, function: function(),
@@ -227,7 +224,6 @@ _build_macsec_profile_options = PROFILE_HELPERS[
 _build_eos_macsec_profile_lines = PROFILE_HELPERS[
     "_build_eos_macsec_profile_lines"]
 _eos_macsec_key_line = PROFILE_HELPERS["_eos_macsec_key_line"]
-_parse_wpa_global_socket = PROFILE_HELPERS["_parse_wpa_global_socket"]
 disable_macsec_feature = PROFILE_HELPERS["disable_macsec_feature"]
 disable_macsec_port = PROFILE_HELPERS["disable_macsec_port"]
 enable_macsec_feature = PROFILE_HELPERS["enable_macsec_feature"]
@@ -731,20 +727,3 @@ def test_static_fallback_profile_runs_in_normal_profile_sweep():
     integrity_profile = profiles["MACSEC_PROFILE_FALLBACK_INTEGRITY"]
     assert integrity_profile["policy"] == "integrity"
     assert macsec_profile_has_fallback(integrity_profile)
-
-
-@pytest.mark.parametrize(
-    "socket_output, process_output, expected",
-    [
-        ("/run/wpa/global\n", "", "/run/wpa/global"),
-        ("", "wpa_supplicant -g /run/wpa/global -i Ethernet0",
-         "/run/wpa/global"),
-        ("", "wpa_supplicant -g/run/wpa/global -iEthernet0",
-         "/run/wpa/global"),
-        ("", "wpa_supplicant -iEthernet0", ""),
-    ],
-)
-def test_parse_wpa_global_socket(socket_output, process_output, expected):
-    """Discover the runtime control socket without a hard-coded path."""
-    assert _parse_wpa_global_socket(
-        socket_output, process_output) == expected

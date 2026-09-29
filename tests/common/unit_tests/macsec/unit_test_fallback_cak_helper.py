@@ -860,6 +860,24 @@ def test_ceos_restore_primary_handles_each_partial_mutation():
     ]
 
 
+@pytest.mark.parametrize("role", ["primary", "fallback"])
+def test_ceos_restore_rejects_unexpected_key_without_config_write(role):
+    """The shared restore path must not remove unrelated configured keys."""
+    host = _EosFakeHost()
+    adapter = EosPeerAdapter(_environment(host), "Ethernet0")
+    adapter.snapshot = lambda profile=None: {
+        "configured_ckns": {"aabb", "ccdd", "unexpected"},
+        "participants": {},
+        "controlled_port": False,
+    }
+    with pytest.raises(
+            AssertionError,
+            match="Peer profile contains unexpected CKNs"):
+        getattr(adapter, "restore_{}".format(role))(
+            _profile(), ("invalid-cak", "EEFF"))
+    assert host.eos_config_calls == []
+
+
 def test_ceos_fallback_mutations_use_exact_supported_key_lines():
     """Delete, add, and restore fallback with full cEOS key syntax."""
     host = _EosFakeHost()

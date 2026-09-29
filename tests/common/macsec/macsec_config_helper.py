@@ -1,7 +1,5 @@
 import logging
-import re
 import secrets
-import shlex
 import time
 from passlib.hash import cisco_type7
 
@@ -36,9 +34,6 @@ __all__ = [
     'generate_per_interface_macsec_profiles',
     'update_macsec_profile_key',
     'restore_macsec_profile_key',
-    'add_runtime_macsec_key',
-    'delete_runtime_macsec_key',
-    'list_runtime_macsec_participants',
     'setup_macsec_multi_profile_configuration',
     'cleanup_macsec_multi_profile_configuration',
 ]
@@ -300,99 +295,6 @@ def update_macsec_profile_key(
                     "attempted namespaces: %s", attempted)
         raise
     return results
-
-
-def _get_macsec_container_name(host, port):
-    asic = host.get_port_asic_instance(port)
-    return asic.get_docker_name("macsec")
-
-
-def _parse_wpa_global_socket(socket_output, process_output):
-    socket = socket_output.strip()
-    if socket:
-        return socket
-    match = re.search(r"(?:^|\s)-g\s*(\S+)", process_output)
-    return match.group(1) if match else ""
-
-
-def _get_wpa_global_socket(host, port):
-    container = _get_macsec_container_name(host, port)
-    result = host.command(
-        "docker exec {} sh -c {}".format(
-            container,
-            shlex.quote(
-                "find /var/run /run -type s -name global -print -quit "
-                "2>/dev/null")),
-        verbose=False,
-    )
-    socket_output = result.get("stdout", "")
-    process_output = ""
-    if not socket_output.strip():
-        process = host.command(
-            "docker exec {} sh -c {}".format(
-                container,
-                shlex.quote(
-                    "ps -eo args | grep '[w]pa_supplicant' | head -1")),
-            verbose=False,
-        )
-        process_output = process.get("stdout", "")
-    socket = _parse_wpa_global_socket(socket_output, process_output)
-    assert socket, "Unable to discover wpa_supplicant global socket"
-    return container, socket
-
-
-def _run_wpa_macsec_command(host, port, args):
-    container, socket = _get_wpa_global_socket(host, port)
-    command = [
-        "docker", "exec", container, "wpa_cli", "-g", socket,
-        "IFNAME={}".format(port),
-    ] + list(args)
-    result = host.command(
-        " ".join(shlex.quote(part) for part in command),
-        module_ignore_errors=True,
-        verbose=False,
-    )
-    output = result.get("stdout", "").strip()
-    assert not result.get("failed") and output.splitlines()[-1:] != ["FAIL"], \
-        "wpa_supplicant MACsec control command failed"
-    return output
-
-
-def delete_runtime_macsec_key(
-        host, port, profile_name, cak, ckn, is_fallback=False):
-    """Remove one running MKA participant without detaching the port."""
-    if isinstance(host, EosHost):
-        return host.eos_config(
-            lines=[_eos_macsec_key_line(
-                ckn, cak, is_fallback=is_fallback, remove=True)],
-            parents=['mac security', 'profile {}'.format(profile_name)])
-    return _run_wpa_macsec_command(
-        host, port, ["macsec_del_mka", "ckn={}".format(ckn)])
-
-
-def add_runtime_macsec_key(
-        host, port, profile_name, cak, ckn, is_fallback=False):
-    """Add one running MKA participant without detaching the port."""
-    if isinstance(host, EosHost):
-        return host.eos_config(
-            lines=[_eos_macsec_key_line(
-                ckn, cak, is_fallback=is_fallback)],
-            parents=['mac security', 'profile {}'.format(profile_name)])
-    args = [
-        "macsec_add_mka",
-        "ckn={}".format(ckn),
-        "cak={}".format(cisco_type7.decode(cak)),
-    ]
-    if is_fallback:
-        args.append("fallback=1")
-    return _run_wpa_macsec_command(host, port, args)
-
-
-def list_runtime_macsec_participants(host, port):
-    """Return raw participant-list output from a running SONiC supplicant."""
-    if isinstance(host, EosHost):
-        raise ValueError("Use EOS participant show commands for EosHost")
-    return _run_wpa_macsec_command(host, port, ["macsec_mka_list"])
 
 
 def is_macsec_configured(host, mac_profile, ctrl_links):
