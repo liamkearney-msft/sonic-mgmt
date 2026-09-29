@@ -27,7 +27,6 @@ __all__ = [
     'get_macsec_profile',
     'wait_for_macsec_cleanup',
     'macsec_profile_has_fallback',
-    'ensure_macsec_profile_fallback',
     'generate_macsec_key_pair',
     'generate_macsec_profile',
     'generate_per_interface_macsec_profile',
@@ -61,20 +60,6 @@ def macsec_profile_has_fallback(profile):
         raise ValueError(
             "fallback_cak and fallback_ckn must be supplied together")
     return has_cak
-
-
-def ensure_macsec_profile_fallback(profile):
-    """Return a profile with a fallback pair, preserving one already present."""
-    profile = dict(profile)
-    if macsec_profile_has_fallback(profile):
-        return profile, False
-    fallback_cak, fallback_ckn = generate_macsec_key_pair(
-        profile["cipher_suite"])
-    profile.update({
-        "fallback_cak": fallback_cak,
-        "fallback_ckn": fallback_ckn,
-    })
-    return profile, True
 
 
 def _build_macsec_profile_options(priority, cipher_suite, primary_cak,

@@ -5,6 +5,7 @@ import re
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -137,6 +138,91 @@ EosPeerAdapter = HELPERS["EosPeerAdapter"]
 peer_adapter = HELPERS["peer_adapter"]
 read_link_snapshot = HELPERS["read_link_snapshot"]
 EosHost = HELPERS["EosHost"]
+
+
+def test_fallback_profile_skip_is_marked_at_collection():
+    """Skip primary-only profiles before autouse MACsec setup can run."""
+    conftest_path = FALLBACK_TEST_PATH.with_name("conftest.py")
+    config_path = HELPER_PATH.with_name("macsec_config_helper.py")
+    hook = next(
+        node for node in ast.parse(conftest_path.read_text()).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "pytest_collection_modifyitems")
+    has_fallback = next(
+        node for node in ast.parse(config_path.read_text()).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "macsec_profile_has_fallback")
+    namespace = {"pytest": pytest}
+    exec(compile(ast.Module(body=[has_fallback, hook], type_ignores=[]),
+                 str(conftest_path), "exec"), namespace)
+    config = SimpleNamespace(getoption=lambda option: True)
+
+    def item(name, profile):
+        result = SimpleNamespace(
+            path=Path(name),
+            callspec=SimpleNamespace(params={"macsec_profile": profile}),
+            keywords={},
+            markers=[],
+        )
+        result.add_marker = result.markers.append
+        return result
+
+    primary = item("test_fallback_cak.py", {"name": "128"})
+    dual = item("test_fallback_cak.py", {
+        "name": "MACSEC_PROFILE_FALLBACK",
+        "fallback_cak": "cak", "fallback_ckn": "ckn"})
+    legacy = item("test_deployment.py", {"name": "128"})
+    namespace["pytest_collection_modifyitems"](
+        config, [primary, dual, legacy])
+    assert len(primary.markers) == 1
+    assert primary.markers[0].name == "skip"
+    assert "no fallback CAK/CKN" in primary.markers[0].kwargs["reason"]
+    assert not dual.markers
+    assert not legacy.markers
+
+    disabled = SimpleNamespace(getoption=lambda option: False)
+    unparametrized = SimpleNamespace(
+        path=Path("test_fallback_cak.py"), keywords={"macsec_required": True},
+        markers=[])
+    unparametrized.add_marker = unparametrized.markers.append
+    namespace["pytest_collection_modifyitems"](disabled, [unparametrized])
+    assert [marker.name for marker in unparametrized.markers] == ["skip"]
+
+    incomplete = item("test_fallback_cak.py", {
+        "name": "incomplete", "fallback_cak": "cak"})
+    with pytest.raises(
+            pytest.UsageError, match="incomplete.*supplied together"):
+        namespace["pytest_collection_modifyitems"](config, [incomplete])
+    assert not incomplete.markers
+
+
+def test_fallback_environment_reuses_selected_dual_ca_profile():
+    """Do not rewrite the configured profile or port bindings at setup."""
+    namespace = {
+        "pytest": pytest,
+        "mka_state_cli_supported": lambda host: True,
+        "wait_until": lambda timeout, interval, delay, condition, *args: (
+            condition(*args)),
+        "MKA_CONVERGE_TIMEOUT": 180,
+        "_environment_is_healthy": lambda environment: True,
+    }
+    fixture = _load_scenario("fallback_macsec_environment", namespace)
+    profile = {
+        "name": "MACSEC_PROFILE_FALLBACK",
+        "priority": 64,
+        "fallback_cak": "cak",
+        "fallback_ckn": "ckn",
+    }
+    host = SimpleNamespace(iface_macsec_ok=lambda port: True)
+    links = {"Ethernet0": {"host": host, "port": "Ethernet1"}}
+    environment = fixture(
+        host, links, profile, None,
+        lambda port: "MACSEC_PROFILE_FALLBACK")
+    assert environment["profile"] == profile
+    assert environment["neighbor_profiles"] == {
+        "Ethernet0": "MACSEC_PROFILE_FALLBACK"}
+    assert environment["neighbor_priorities"] == {"Ethernet0": 63}
+    assert environment["peer_profiles"]["Ethernet0"] == profile
 
 
 def _load_traffic_window():

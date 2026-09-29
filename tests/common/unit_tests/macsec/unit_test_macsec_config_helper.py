@@ -4,6 +4,7 @@ import json
 import logging
 import secrets
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from passlib.hash import cisco_type7
@@ -42,7 +43,6 @@ def _load_profile_helpers():
         "enable_macsec_feature",
         "enable_macsec_port",
         "macsec_profile_has_fallback",
-        "ensure_macsec_profile_fallback",
         "generate_macsec_key_pair",
         "generate_macsec_profile",
         "generate_per_interface_macsec_profile",
@@ -230,8 +230,6 @@ enable_macsec_feature = PROFILE_HELPERS["enable_macsec_feature"]
 enable_macsec_port = PROFILE_HELPERS["enable_macsec_port"]
 macsec_profile_has_fallback = PROFILE_HELPERS[
     "macsec_profile_has_fallback"]
-ensure_macsec_profile_fallback = PROFILE_HELPERS[
-    "ensure_macsec_profile_fallback"]
 generate_macsec_profile = PROFILE_HELPERS["generate_macsec_profile"]
 generate_per_interface_macsec_profile = PROFILE_HELPERS[
     "generate_per_interface_macsec_profile"]
@@ -664,34 +662,6 @@ def test_per_interface_profile_rejects_partial_base_fallback(base_profile):
         generate_per_interface_macsec_profile("Ethernet0", base_profile)
 
 
-def test_ensure_fallback_profile_reuses_existing_pair():
-    """Preserve an existing fallback pair without generating a replacement."""
-    profile = {
-        "cipher_suite": "GCM-AES-128",
-        "fallback_cak": "existing-cak",
-        "fallback_ckn": "existing-ckn",
-    }
-    ensured, generated = ensure_macsec_profile_fallback(profile)
-    assert not generated
-    assert ensured == profile
-    assert ensured is not profile
-
-
-def test_ensure_fallback_profile_adds_only_missing_pair():
-    """Add a fallback pair while preserving all existing profile fields."""
-    profile = {
-        "name": "profile",
-        "cipher_suite": "GCM-AES-128",
-        "primary_cak": "primary-cak",
-        "primary_ckn": "primary-ckn",
-    }
-    ensured, generated = ensure_macsec_profile_fallback(profile)
-    assert generated
-    assert ensured["primary_cak"] == profile["primary_cak"]
-    assert ensured["primary_ckn"] == profile["primary_ckn"]
-    assert macsec_profile_has_fallback(ensured)
-
-
 def test_eos_fallback_key_rotation_lines_are_exact():
     """Build EOS add-first and full-form key deletion commands."""
     assert _eos_macsec_key_line(
@@ -718,12 +688,42 @@ def test_build_eos_profile_lines_with_fallback():
     ]
 
 
-def test_static_fallback_profile_runs_in_normal_profile_sweep():
-    """Keep an explicit dual-CA profile in the ordinary profile catalog."""
+def test_static_fallback_profiles_are_explicit_opt_in():
+    """Legacy all omits dual-CA profiles; explicit names still select them."""
     profiles = json.loads(PROFILE_PATH.read_text())
-    profile = profiles["MACSEC_PROFILE_FALLBACK"]
-    assert macsec_profile_has_fallback(profile)
-    assert profile["primary_ckn"].lower() != profile["fallback_ckn"].lower()
-    integrity_profile = profiles["MACSEC_PROFILE_FALLBACK_INTEGRITY"]
-    assert integrity_profile["policy"] == "integrity"
-    assert macsec_profile_has_fallback(integrity_profile)
+    tree = ast.parse(MACSEC_PLUGIN_PATH.read_text())
+    plugin = next(
+        node for node in tree.body
+        if isinstance(node, ast.ClassDef) and node.name == "MacsecPlugin")
+    select = next(
+        node for node in plugin.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_generate_macsec_profile")
+    only_profiles = next(
+        node for node in tree.body
+        if isinstance(node, ast.Assign) and any(
+            isinstance(target, ast.Name)
+            and target.id == "FALLBACK_ONLY_PROFILES"
+            for target in node.targets))
+    namespace = {"natsort": SimpleNamespace(natsorted=sorted)}
+    exec(compile(ast.Module(body=[only_profiles, select], type_ignores=[]),
+                 str(MACSEC_PLUGIN_PATH), "exec"), namespace)
+    fallback_names = namespace["FALLBACK_ONLY_PROFILES"]
+    assert fallback_names == {
+        "MACSEC_PROFILE_FALLBACK",
+        "MACSEC_PROFILE_FALLBACK_INTEGRITY",
+    }
+    for name in fallback_names:
+        assert macsec_profile_has_fallback(profiles[name])
+        assert profiles[name]["primary_ckn"].lower() != (
+            profiles[name]["fallback_ckn"].lower())
+    assert profiles["MACSEC_PROFILE_FALLBACK_INTEGRITY"]["policy"] == (
+        "integrity")
+    config = SimpleNamespace(getoption=lambda name: "all")
+    plugin_instance = SimpleNamespace(macsec_profiles=profiles)
+    select = namespace["_generate_macsec_profile"]
+    assert set(select(plugin_instance, SimpleNamespace(config=config))) == (
+        set(profiles) - fallback_names)
+    config.getoption = lambda name: ",".join(sorted(fallback_names))
+    assert select(plugin_instance, SimpleNamespace(config=config)) == (
+        sorted(fallback_names))

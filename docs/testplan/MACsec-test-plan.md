@@ -118,6 +118,13 @@ About the detail to set the testbed, please refer the doc: https://github.com/so
 ./run_tests.sh -u -n vms-kvm-t0 -d vlab-01 -c macsec/test_macsec.py -f vtestbed.csv -i veos_vtb -e "--neighbor_type=sonic"
 ```
 
+Fallback CAK/rollover tests require an explicitly selected dual-CA profile, for
+example `--macsec_profile MACSEC_PROFILE_FALLBACK` (or
+`MACSEC_PROFILE_FALLBACK_INTEGRITY`). These profiles are not included in the
+legacy `--macsec_profile all` sweep. Selecting a primary-only profile skips
+`macsec/test_fallback_cak.py` before MACsec setup; an incomplete fallback CAK/CKN
+pair is a configuration error, not a skip.
+
 ## Common Configuration
 
 ### Dynamic Key(MKA)

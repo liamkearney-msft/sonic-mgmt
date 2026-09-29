@@ -19,9 +19,7 @@ from tests.common.macsec.macsec_config_helper import (
     delete_macsec_profile,
     disable_macsec_port,
     enable_macsec_port,
-    ensure_macsec_profile_fallback,
     generate_macsec_key_pair,
-    macsec_profile_has_fallback,
     set_macsec_profile,
     update_macsec_profile_key as _profile_update,
     restore_macsec_profile_key,
@@ -1016,7 +1014,7 @@ class _TrafficWindow(AbstractContextManager):
 def fallback_macsec_environment(
         macsec_duthost, ctrl_links, macsec_profile, port_profiles,
         get_port_profile_name):
-    """Reuse an existing fallback profile or add only a missing fallback."""
+    """Verify the selected dual-CA profile without changing port bindings."""
     if port_profiles:
         pytest.skip(
             "Targeted rollover cases use one shared profile; the normal "
@@ -1027,114 +1025,40 @@ def fallback_macsec_environment(
     if not mka_state_cli_supported(macsec_duthost):
         pytest.skip("SONiC image does not expose fallback CAK/MKA state CLI")
 
-    original_profiles = {
+    neighbor_profiles = {
         port: get_port_profile_name(port)
         for port in links
     }
     profile = dict(macsec_profile)
-    runtime_profile = get_macsec_profile_config(
-        macsec_duthost, next(iter(links)), profile["name"])
-    if (not macsec_profile_has_fallback(profile)
-            and runtime_profile.get("fallback_cak")
-            and runtime_profile.get("fallback_ckn")):
-        profile.update({
-            "fallback_cak": runtime_profile["fallback_cak"],
-            "fallback_ckn": runtime_profile["fallback_ckn"],
-        })
-
-    profile, added_fallback = ensure_macsec_profile_fallback(profile)
-    reuse_profile = not added_fallback
-    if reuse_profile:
-        neighbor_profiles = {
-            port: original_profiles[port]
-            for port in links
-        }
-    else:
-        profile["name"] = FALLBACK_PROFILE
-        neighbor_profiles = {
-            port: "{}_{}".format(FALLBACK_PROFILE, port)
-            for port in links
-        }
-    neighbor_priorities = {}
-
-    try:
-        for index, (port, neighbor) in enumerate(links.items()):
-            neighbor_priorities[port] = (
-                profile["priority"] + (1 if index % 2 else -1)
-            )
-
-        if not reuse_profile:
-            for port, neighbor in links.items():
-                disable_macsec_port(macsec_duthost, port)
-                disable_macsec_port(neighbor["host"], neighbor["port"])
-
-            delete_macsec_profile(macsec_duthost, FALLBACK_PROFILE)
-            for port, neighbor in links.items():
-                delete_macsec_profile(
-                    neighbor["host"], neighbor_profiles[port])
-
-            _set_profile(macsec_duthost, FALLBACK_PROFILE, profile)
-            for port, neighbor in links.items():
-                _set_profile(
-                    neighbor["host"], neighbor_profiles[port], profile,
-                    neighbor_priorities[port])
-
-            for port, neighbor in links.items():
-                enable_macsec_port(
-                    macsec_duthost, port, FALLBACK_PROFILE)
-                enable_macsec_port(
-                    neighbor["host"], neighbor["port"],
-                    neighbor_profiles[port])
-
-        for port, neighbor in links.items():
-            assert wait_until(
-                MKA_CONVERGE_TIMEOUT, 3, 0,
-                lambda p=port, n=neighbor: (
-                    macsec_duthost.iface_macsec_ok(p)
-                    and n["host"].iface_macsec_ok(n["port"])
-                ),
-            ), "Dual-CA MKA did not converge on {}".format(port)
-
-        environment = {
-            "duthost": macsec_duthost,
-            "links": links,
-            "profile": profile,
-            "neighbor_profiles": neighbor_profiles,
-            "neighbor_priorities": neighbor_priorities,
-            "peer_profiles": {
-                port: dict(profile)
-                for port in links
-            },
-            "reused_profile": reuse_profile,
-        }
+    neighbor_priorities = {
+        port: profile["priority"] + (1 if index % 2 else -1)
+        for index, port in enumerate(links)
+    }
+    for port, neighbor in links.items():
         assert wait_until(
-            MKA_CONVERGE_TIMEOUT, 5, 0,
-            _environment_is_healthy, environment,
-        ), "Dual-CA MKA operational state did not become healthy"
-        yield environment
-    finally:
-        if not reuse_profile:
-            for port, neighbor in links.items():
-                disable_macsec_port(macsec_duthost, port)
-                disable_macsec_port(neighbor["host"], neighbor["port"])
-            delete_macsec_profile(macsec_duthost, FALLBACK_PROFILE)
-            for port, neighbor in links.items():
-                delete_macsec_profile(
-                    neighbor["host"], neighbor_profiles[port])
-                enable_macsec_port(
-                    macsec_duthost, port, original_profiles[port])
-                enable_macsec_port(
-                    neighbor["host"], neighbor["port"],
-                    original_profiles[port])
+            MKA_CONVERGE_TIMEOUT, 3, 0,
+            lambda p=port, n=neighbor: (
+                macsec_duthost.iface_macsec_ok(p)
+                and n["host"].iface_macsec_ok(n["port"])
+            ),
+        ), "Dual-CA MKA did not converge on {}".format(port)
 
-            for port, neighbor in links.items():
-                assert wait_until(
-                    MKA_CONVERGE_TIMEOUT, 3, 0,
-                    lambda p=port, n=neighbor: (
-                        macsec_duthost.iface_macsec_ok(p)
-                        and n["host"].iface_macsec_ok(n["port"])
-                    ),
-                ), "Original MACsec profile did not recover on {}".format(port)
+    environment = {
+        "duthost": macsec_duthost,
+        "links": links,
+        "profile": profile,
+        "neighbor_profiles": neighbor_profiles,
+        "neighbor_priorities": neighbor_priorities,
+        "peer_profiles": {
+            port: dict(profile)
+            for port in links
+        },
+    }
+    assert wait_until(
+        MKA_CONVERGE_TIMEOUT, 5, 0,
+        _environment_is_healthy, environment,
+    ), "Dual-CA MKA operational state did not become healthy"
+    return environment
 
 
 def test_fallback_operational_state_and_show(
