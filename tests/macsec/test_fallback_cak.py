@@ -23,7 +23,7 @@ from tests.common.macsec.macsec_config_helper import (
     generate_macsec_key_pair,
     macsec_profile_has_fallback,
     set_macsec_profile,
-    update_macsec_profile_key,
+    update_macsec_profile_key as _profile_update,
     restore_macsec_profile_key,
 )
 from tests.common.macsec.failure_safe_cleanup import FailureSafeCleanup
@@ -53,7 +53,7 @@ from tests.common.macsec.mka_state_helper import (
     validate_point_to_point_ingress_sc,
     validate_mka_snapshot,
 )
-from tests.common.utilities import wait_until
+from tests.common.utilities import ping_ip, wait_until
 
 
 logger = logging.getLogger(__name__)
@@ -108,15 +108,6 @@ def _assert_profile_unchanged(before, after, description):
 def _set_profile(host, name, profile, priority=None):
     set_macsec_profile(
         host, name, **_profile_kwargs(profile, priority=priority))
-
-
-def _profile_update(
-        host, profile_name, old_cak, old_ckn, new_cak, new_ckn,
-        is_fallback=False, namespace_option=None, expect_success=True):
-    return update_macsec_profile_key(
-        host, profile_name, old_cak, old_ckn, new_cak, new_ckn,
-        is_fallback=is_fallback, namespace_option=namespace_option,
-        expect_success=expect_success)
 
 
 def _get_eos_participant_output(host, port):
@@ -434,6 +425,31 @@ def _safe_diagnostics(environment, port):
         return {"collection_error": type(error).__name__}
 
 
+def _restore_mismatch(
+        environment, port, adapter, original_profile, invalid_pair, role):
+    profile = environment["profile"]
+    principal = profile["{}_ckn".format(role)]
+    require_all_live = role == "primary"
+    try:
+        if require_all_live:
+            adapter.restore_primary(original_profile, invalid_pair)
+        else:
+            adapter.restore_fallback(original_profile, invalid_pair)
+        _wait_link_protected(
+            environment, port, principal,
+            require_all_live=require_all_live)
+        _wait_peer_protected(
+            adapter, original_profile, principal,
+            require_all_live=require_all_live)
+    except BaseException as error:
+        logger.error(
+            "%s mismatch cleanup failed: %r; diagnostics=%s",
+            role, error, _safe_diagnostics(environment, port))
+        raise
+    finally:
+        adapter.commit_profile(original_profile)
+
+
 @contextmanager
 def _primary_mismatch(environment, port, invalid_pair):
     profile = environment["profile"]
@@ -445,10 +461,11 @@ def _primary_mismatch(environment, port, invalid_pair):
     )
     mismatched_profile = adapter.profile_with_pair(
         original_profile, "primary", invalid_pair)
-    body_error = None
-    body_traceback = None
 
-    try:
+    with FailureSafeCleanup("primary mismatch") as cleanup:
+        cleanup.callback(
+            _restore_mismatch, environment, port, adapter,
+            original_profile, invalid_pair, "primary")
         if adapter.supports_primary_delete:
             adapter.delete_primary_if_supported(original_pair)
             _wait_link_protected(
@@ -476,36 +493,6 @@ def _primary_mismatch(environment, port, invalid_pair):
         )
         adapter.commit_profile(mismatched_profile)
         yield adapter
-    except BaseException as error:
-        body_error = error
-        body_traceback = error.__traceback__
-
-    cleanup_error = None
-    try:
-        adapter.restore_primary(original_profile, invalid_pair)
-        _wait_link_protected(
-            environment, port, profile["primary_ckn"])
-        _wait_peer_protected(
-            adapter,
-            original_profile,
-            profile["primary_ckn"],
-        )
-    except BaseException as error:
-        cleanup_error = error
-    finally:
-        adapter.commit_profile(original_profile)
-
-    if body_error is not None:
-        if cleanup_error is not None:
-            logger.error(
-                "Primary mismatch cleanup failed after scenario error: %r; "
-                "diagnostics=%s",
-                cleanup_error,
-                _safe_diagnostics(environment, port),
-            )
-        raise body_error.with_traceback(body_traceback)
-    if cleanup_error is not None:
-        raise cleanup_error
 
 
 @contextmanager
@@ -521,10 +508,11 @@ def _ceos_fallback_mismatch(
         original_profile, "fallback", invalid_pair)
     previous_last_updated = _snapshot(
         environment, port).session.get("last_updated")
-    body_error = None
-    body_traceback = None
 
-    try:
+    with FailureSafeCleanup("fallback mismatch") as cleanup:
+        cleanup.callback(
+            _restore_mismatch, environment, port, adapter,
+            original_profile, invalid_pair, "fallback")
         adapter.delete_fallback(original_pair)
         _wait_link_blocked(
             environment, port,
@@ -543,38 +531,6 @@ def _ceos_fallback_mismatch(
         )
         adapter.commit_profile(mismatched_profile)
         yield adapter
-    except BaseException as error:
-        body_error = error
-        body_traceback = error.__traceback__
-
-    cleanup_error = None
-    try:
-        adapter.restore_fallback(original_profile, invalid_pair)
-        _wait_link_protected(
-            environment, port, profile["fallback_ckn"],
-            require_all_live=False)
-        _wait_peer_protected(
-            adapter,
-            original_profile,
-            profile["fallback_ckn"],
-            require_all_live=False,
-        )
-    except BaseException as error:
-        cleanup_error = error
-    finally:
-        adapter.commit_profile(original_profile)
-
-    if body_error is not None:
-        if cleanup_error is not None:
-            logger.error(
-                "Fallback mismatch cleanup failed after scenario error: %r; "
-                "diagnostics=%s",
-                cleanup_error,
-                _safe_diagnostics(environment, port),
-            )
-        raise body_error.with_traceback(body_traceback)
-    if cleanup_error is not None:
-        raise cleanup_error
 
 
 def _select_routed_link(environment, upstream_links):
@@ -600,12 +556,6 @@ def _set_rekey_period(host, port, profile_name, rekey_period):
             profile_name,
             rekey_period,
         ))
-
-
-def _restart_sonic_macsec(host):
-    restart_service_with_startlimit_guard(
-        host, "macsec", is_namespaced=host.is_multi_asic,
-        backoff_seconds=35, verify_timeout=180)
 
 
 def _port_profile_attachment(host, port):
@@ -643,7 +593,9 @@ def _configure_environment_rekey_period(environment, rekey_period):
             restarted_hosts[neighbor["host"].hostname] = neighbor["host"]
 
     for host in restarted_hosts.values():
-        _restart_sonic_macsec(host)
+        restart_service_with_startlimit_guard(
+            host, "macsec", is_namespaced=host.is_multi_asic,
+            backoff_seconds=35, verify_timeout=180)
 
 
 def _restore_rekey_period(environment, original_period):
@@ -821,7 +773,7 @@ def _drain_ping_observation(ping):
     }
 
 
-def _stop_ping(ping, assert_loss=True, phase_diagnostics=None):
+def _stop_ping(ping, assert_loss=True):
     was_running = _ping_process_running(ping)
     drain = _drain_ping_observation(ping)
     pre_stop_output = drain["output"]
@@ -870,13 +822,12 @@ def _stop_ping(ping, assert_loss=True, phase_diagnostics=None):
         assert not observation["errors"], (
             "Traffic loss detected during MACsec transition:\n{}\n"
             "Observation boundary: {}\nMissing ICMP sequences: {}\n"
-            "Final ping summary: {}\nPhase diagnostics: {}"
+            "Final ping summary: {}"
         ).format(
             output,
             observation["boundary"],
             observation["missing_sequences"][:200],
             summary,
-            phase_diagnostics or [],
         )
     boundary = observation["boundary"]
     return {
@@ -892,14 +843,6 @@ def _stop_ping(ping, assert_loss=True, phase_diagnostics=None):
         "summary_loss_percent": summary["loss_percent"],
         "observation_boundary": boundary,
     }
-
-
-def _cleanup_traffic(traffic, assert_loss, phase_diagnostics=None):
-    cleanup_all(
-        traffic,
-        lambda ping: _stop_ping(
-            ping, assert_loss=assert_loss,
-            phase_diagnostics=phase_diagnostics))
 
 
 def _abort_partial_ping(ping):
@@ -929,19 +872,15 @@ def _start_bidirectional_traffic(environment, upstream_links):
     duthost = environment["duthost"]
     port, neighbor = _select_routed_link(environment, upstream_links)
     link = upstream_links[port]
-    assert not duthost.command(
-        "{} ping -c 3 {}".format(
-            get_ipnetns_prefix(duthost, port),
-            link["local_ipv4_addr"]),
-        module_ignore_errors=True,
-    )["failed"], "Unable to warm the DUT-to-neighbor traffic path"
-    assert not neighbor["host"].shell(
-        "{} ping -c 3 {}".format(
-            _ping_namespace_prefix(
-                neighbor["host"], neighbor["port"]),
-            link["peer_ipv4_addr"]),
-        module_ignore_errors=True,
-    )["failed"], "Unable to warm the neighbor-to-DUT traffic path"
+    assert ping_ip(
+        duthost, link["local_ipv4_addr"], count=3,
+        cmd_prefix=_ping_namespace_prefix(duthost, port),
+    ), "Unable to warm the DUT-to-neighbor traffic path"
+    assert ping_ip(
+        neighbor["host"], link["peer_ipv4_addr"], count=3,
+        cmd_prefix=_ping_namespace_prefix(
+            neighbor["host"], neighbor["port"]),
+    ), "Unable to warm the neighbor-to-DUT traffic path"
     traffic = []
     try:
         traffic.append(_start_ping(
@@ -962,22 +901,14 @@ def _selected_link_ping_results(environment, upstream_links, port):
     duthost = environment["duthost"]
     neighbor = environment["links"][port]
     link = upstream_links[port]
-    dut_result = duthost.command(
-        "{} ping -c 3 {}".format(
-            get_ipnetns_prefix(duthost, port),
-            link["local_ipv4_addr"]),
-        module_ignore_errors=True,
-    )
-    peer_result = neighbor["host"].shell(
-        "{} ping -c 3 {}".format(
-            _ping_namespace_prefix(
-                neighbor["host"], neighbor["port"]),
-            link["peer_ipv4_addr"]),
-        module_ignore_errors=True,
-    )
     return (
-        not dut_result.get("failed"),
-        not peer_result.get("failed"),
+        ping_ip(
+            duthost, link["local_ipv4_addr"], count=3,
+            cmd_prefix=_ping_namespace_prefix(duthost, port)),
+        ping_ip(
+            neighbor["host"], link["peer_ipv4_addr"], count=3,
+            cmd_prefix=_ping_namespace_prefix(
+                neighbor["host"], neighbor["port"])),
     )
 
 
@@ -1970,7 +1901,8 @@ def test_disable_and_macsecmgrd_restart_lifecycle(
 
     cleanup_errors = []
     try:
-        _cleanup_traffic(traffic, assert_loss=False)
+        cleanup_all(
+            traffic, lambda ping: _stop_ping(ping, assert_loss=False))
     except Exception as error:
         cleanup_errors.append(
             "traffic collection failed: {!r}".format(error))

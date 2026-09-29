@@ -213,11 +213,11 @@ def _load_primary_mismatch(
         adapter, wait_link, wait_peer, wait_removed):
     source = FALLBACK_TEST_PATH.read_text()
     tree = ast.parse(source)
-    mismatch = next(
+    functions = [
         node for node in tree.body
         if isinstance(node, ast.FunctionDef)
-        and node.name == "_primary_mismatch"
-    )
+        and node.name in ("_restore_mismatch", "_primary_mismatch")
+    ]
 
     class _Logger:
         def __init__(self):
@@ -229,6 +229,7 @@ def _load_primary_mismatch(
     logger = _Logger()
     namespace = {
         "contextmanager": contextmanager,
+        "FailureSafeCleanup": FAILURE_SAFE_MODULE.FailureSafeCleanup,
         "peer_adapter": lambda environment, port: adapter,
         "_wait_link_protected": wait_link,
         "_wait_peer_protected": wait_peer,
@@ -237,7 +238,7 @@ def _load_primary_mismatch(
         "logger": logger,
     }
     exec(
-        compile(ast.Module(body=[mismatch], type_ignores=[]),
+        compile(ast.Module(body=functions, type_ignores=[]),
                 str(FALLBACK_TEST_PATH), "exec"),
         namespace,
     )
@@ -248,11 +249,11 @@ def _load_fallback_mismatch(
         adapter, wait_link, wait_peer, wait_blocked):
     source = FALLBACK_TEST_PATH.read_text()
     tree = ast.parse(source)
-    mismatch = next(
+    functions = [
         node for node in tree.body
         if isinstance(node, ast.FunctionDef)
-        and node.name == "_ceos_fallback_mismatch"
-    )
+        and node.name in ("_restore_mismatch", "_ceos_fallback_mismatch")
+    ]
 
     class _Logger:
         def __init__(self):
@@ -264,6 +265,7 @@ def _load_fallback_mismatch(
     logger = _Logger()
     namespace = {
         "contextmanager": contextmanager,
+        "FailureSafeCleanup": FAILURE_SAFE_MODULE.FailureSafeCleanup,
         "_snapshot": lambda environment, port: type(
             "Snapshot", (), {"session": {"last_updated": "old"}})(),
         "_wait_link_blocked": wait_blocked,
@@ -274,7 +276,7 @@ def _load_fallback_mismatch(
         "logger": logger,
     }
     exec(
-        compile(ast.Module(body=[mismatch], type_ignores=[]),
+        compile(ast.Module(body=functions, type_ignores=[]),
                 str(FALLBACK_TEST_PATH), "exec"),
         namespace,
     )
@@ -1040,6 +1042,28 @@ def test_fallback_mismatch_context_restores_after_setup_failure():
     assert adapter.committed_profiles[-1]["fallback_ckn"] == "CCDD"
 
 
+def test_fallback_mismatch_preserves_body_error_on_cleanup_failure():
+    """Preserve the scenario verdict when fallback restoration also fails."""
+    adapter = _MismatchAdapter(
+        restore_error=RuntimeError("fallback restore failed"))
+    mismatch, logger = _load_fallback_mismatch(
+        adapter,
+        lambda *args, **kwargs: None,
+        lambda *args, **kwargs: None,
+        lambda *args, **kwargs: None,
+    )
+    environment = _environment(_Host())
+    with pytest.raises(ValueError, match="scenario failed"):
+        with mismatch(
+                environment, "Ethernet0", adapter,
+                ("invalid-cak", "EEFF")):
+            raise ValueError("scenario failed")
+    assert [call[0] for call in adapter.calls] == [
+        "delete-fallback", "add-fallback", "restore-fallback"]
+    assert logger.errors
+    assert adapter.committed_profiles[-1]["fallback_ckn"] == "CCDD"
+
+
 def test_rejected_rotation_setup_is_owned_by_mismatch_context():
     """Keep setup, verdict, and restoration in one failure-safe scope."""
     tree = ast.parse(FALLBACK_TEST_PATH.read_text())
@@ -1085,8 +1109,7 @@ def test_bidirectional_traffic_cleans_first_stream_on_second_start_failure():
             return {"failed": False}
 
     class Peer:
-        def shell(self, *args, **kwargs):
-            return {"failed": False}
+        pass
 
     neighbor["host"] = Peer()
 
@@ -1101,6 +1124,7 @@ def test_bidirectional_traffic_cleans_first_stream_on_second_start_failure():
             "Ethernet0", neighbor),
         "get_ipnetns_prefix": lambda host, port: "",
         "_ping_namespace_prefix": lambda host, port: "",
+        "ping_ip": lambda host, destination, count, cmd_prefix: True,
         "_start_ping": start,
         "cleanup_all": lambda traffic, cleanup: [
             cleanup(ping) for ping in traffic],
@@ -1173,7 +1197,7 @@ def test_eos_ping_namespace_prefix_for_raw_shell():
 
 
 def test_eos_continuous_and_one_shot_pings_use_vrf_namespace():
-    """Both raw-shell probes target the converged EOS route namespace."""
+    """Use suite ping_ip for one-shot and raw shell for continuous probes."""
     tree = ast.parse(FALLBACK_TEST_PATH.read_text())
     names = {
         "_ping_namespace_prefix", "_start_ping",
@@ -1183,6 +1207,10 @@ def test_eos_continuous_and_one_shot_pings_use_vrf_namespace():
         node for node in tree.body
         if isinstance(node, ast.FunctionDef) and node.name in names
     ]
+    utilities_path = FALLBACK_TEST_PATH.parents[1] / "common" / "utilities.py"
+    utility = next(
+        node for node in ast.parse(utilities_path.read_text()).body
+        if isinstance(node, ast.FunctionDef) and node.name == "ping_ip")
 
     class EosHost:
         bgp_vrf = "red"
@@ -1196,6 +1224,10 @@ def test_eos_continuous_and_one_shot_pings_use_vrf_namespace():
                 return {"stdout_lines": ["42"]}
             return {"failed": False}
 
+        def command(self, command, **kwargs):
+            self.commands.append(command)
+            return {"failed": False}
+
     class Dut:
         def command(self, command, **kwargs):
             return {"failed": False}
@@ -1203,8 +1235,9 @@ def test_eos_continuous_and_one_shot_pings_use_vrf_namespace():
     namespace = {
         "EosHost": EosHost,
         "get_ipnetns_prefix": lambda host, port: "",
+        "logger": type("Logger", (), {"info": lambda *args: None})(),
     }
-    exec(compile(ast.Module(body=functions, type_ignores=[]),
+    exec(compile(ast.Module(body=[utility] + functions, type_ignores=[]),
                  str(FALLBACK_TEST_PATH), "exec"), namespace)
     peer = EosHost()
     ping = namespace["_start_ping"](
@@ -1226,6 +1259,40 @@ def test_eos_continuous_and_one_shot_pings_use_vrf_namespace():
             }}, "Ethernet0") == (True, True)
     assert "sudo ip netns exec ns-red ping -c 3 192.0.2.2" in (
         peer.commands)
+
+
+def test_warm_ping_failure_does_not_start_continuous_traffic():
+    """Keep one-shot preflight failure before either background stream."""
+    tree = ast.parse(FALLBACK_TEST_PATH.read_text())
+    function = next(node for node in tree.body
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name == "_start_bidirectional_traffic")
+    destinations = []
+
+    def probe(host, destination, count, cmd_prefix):
+        destinations.append(destination)
+        return len(destinations) == 1
+
+    namespace = {
+        "_select_routed_link": lambda *args: (
+            "Ethernet0", {"host": object(), "port": "Ethernet1"}),
+        "_ping_namespace_prefix": lambda *args: "",
+        "ping_ip": probe,
+        "_start_ping": lambda *args: pytest.fail(
+            "continuous traffic started despite failed warm ping"),
+    }
+    exec(compile(ast.Module(body=[function], type_ignores=[]),
+                 str(FALLBACK_TEST_PATH), "exec"), namespace)
+    with pytest.raises(
+            AssertionError,
+            match="Unable to warm the neighbor-to-DUT traffic path"):
+        namespace["_start_bidirectional_traffic"](
+            {"duthost": object()}, {
+                "Ethernet0": {
+                    "local_ipv4_addr": "192.0.2.1",
+                    "peer_ipv4_addr": "192.0.2.2",
+                }})
+    assert destinations == ["192.0.2.1", "192.0.2.2"]
 
 
 @pytest.mark.parametrize("failed_step", ["delete", "fallback_wait"])
