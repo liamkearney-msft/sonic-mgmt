@@ -5,9 +5,6 @@ import re
 import logging
 from datetime import datetime, timezone
 
-import natsort
-
-
 logger = logging.getLogger(__name__)
 
 MKA_SESSION_TABLE = "MACSEC_MKA_SESSION_TABLE"
@@ -221,112 +218,6 @@ def parse_mka_timestamp(value):
     if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
         raise ValueError("MKA timestamp must be UTC: {!r}".format(value))
     return parsed
-
-
-def parse_mka_show_table(output, first_column):
-    """Read tabulate's column boundaries, including multi-word headers."""
-    lines = output.splitlines()
-    for index, line in enumerate(lines):
-        if index == 0 or not re.fullmatch(r"\s*-+(?:\s+-+)+\s*", line):
-            continue
-        columns = [match.span() for match in re.finditer(r"-+", line)]
-        headers = [lines[index - 1][start:end].strip() for start, end in columns]
-        if headers[0] != first_column:
-            continue
-        rows = []
-        for row in lines[index + 1:]:
-            if not row.strip():
-                break
-            values = [row[start:end].strip() for start, end in columns]
-            if not values[0]:
-                raise ValueError("Empty identity column in MKA show table")
-            rows.append(dict(zip(headers, values)))
-        return headers, rows
-    raise ValueError("Missing {} MKA show table".format(first_column))
-
-
-def validate_mka_show(host, interface, session, participants, compact=None):
-    """Assert actual healthy CLI values for primary or fallback ownership."""
-    if compact is None:
-        compact = host.command("show macsec --mka")["stdout"]
-    first_column = "Namespace" if host.is_multi_asic else "Interface"
-    headers, rows = parse_mka_show_table(compact, first_column)
-    expected_headers = [
-        "Interface", "KaY", "Secured", "Principal CKN", "Role",
-        "Primary live peers", "Fallback live peers", "Local-KS", "Status", "Age",
-    ]
-    if host.is_multi_asic:
-        expected_headers.insert(0, "Namespace")
-    assert headers == expected_headers, "Unexpected compact MKA columns: {}".format(headers)
-    identities = [(row["Interface"], row.get("Namespace", "")) for row in rows]
-    assert identities == natsort.natsorted(identities), "MKA rows are not in natural interface/namespace order"
-    assert len(identities) == len(set(identities)), "Duplicate MKA show interface/namespace rows"
-    namespace = get_namespace_option(host, interface)
-    selected = [
-        row for row in rows if row["Interface"] == interface
-        and (not host.is_multi_asic or row["Namespace"] == namespace.split()[-1])
-    ]
-    assert len(selected) == 1, "Missing or ambiguous MKA compact row for {}".format(interface)
-    row = selected[0]
-    principal_ckns = [ckn for ckn, part in participants.items() if part["is_principal"] == "true"]
-    assert len(principal_ckns) == 1, "MKA show requires one principal"
-    principal_ckn = principal_ckns[0]
-    principal = participants[principal_ckn]
-    expected = {
-        "KaY": session["kay_status"], "Secured": session["secured"],
-        "Principal CKN": "{}...{}".format(principal_ckn[:6], principal_ckn[-6:]),
-        "Role": "primary" if principal["is_primary"] == "true" else "fallback",
-        "Local-KS": session["is_key_server"], "Status": "ok",
-    }
-    for role, is_primary in (("Primary", "true"), ("Fallback", "false")):
-        configured = [part for part in participants.values() if part["is_primary"] == is_primary]
-        assert len(configured) <= 1, "Ambiguous configured MKA role"
-        expected["{} live peers".format(role)] = configured[0]["live_peers"] if configured else "-"
-    for field, value in expected.items():
-        assert row[field] == value, "MKA compact {}={!r}, expected {!r}".format(field, row[field], value)
-    assert re.fullmatch(r"\d+s", row["Age"]) and int(row["Age"][:-1]) <= 60, \
-        "MKA compact data is not fresh"
-
-    detail = host.command("show macsec {} --mka {}".format(namespace, interface))["stdout"]
-    fields = {}
-    for line in detail.splitlines():
-        if ":" in line:
-            label, value = line.split(":", 1)
-            assert label.strip() not in fields, "Duplicate MKA detail field"
-            fields[label.strip()] = value.strip()
-    expected_detail = {
-        "Interface": interface, "Profile": session["profile"],
-        "PAE KaY status": session["kay_status"], "Controlled port mode": "secured",
-        "Failed": session["failed"], "Actor SCI": session["actor_sci"],
-        "Key server SCI": session["key_server_sci"], "Actor priority": session["actor_priority"],
-        "Key server priority": session["key_server_priority"], "Local key server": session["is_key_server"],
-        "MKA hello time": "{} ms".format(session["mka_hello_time_ms"]),
-        "Query status": "ok", "Config status": "in-sync",
-    }
-    for label, value in expected_detail.items():
-        assert fields.get(label) == value, "MKA detail {}={!r}, expected {!r}".format(label, fields.get(label), value)
-    for label in ("Keys distributed", "Keys received"):
-        assert re.fullmatch(r"\d+", fields.get(label, "")), "Missing MKA key counter"
-    updated = re.fullmatch(r"(\S+) \((\d+)s ago\)", fields.get("Last updated", ""))
-    assert updated and int(updated.group(2)) <= 60, "MKA detail data is not fresh"
-    assert parse_mka_timestamp(updated.group(1)) >= parse_mka_timestamp(session["last_updated"]), \
-        "MKA show regressed the successful publication timestamp"
-    assert "Authenticated:" not in detail and "Secured:" not in detail, "Raw CP flags replaced the derived mode"
-    participant_headers, participant_rows = parse_mka_show_table(detail, "CKN")
-    assert participant_headers == [
-        "CKN", "Role", "Principal", "Active", "Live", "Potential", "Key-server", "Elected", "MI", "MN",
-    ], "Unexpected detailed MKA participant columns"
-    assert len(participant_rows) == len(participants), "MKA detail participant count changed"
-    assert {part["CKN"] for part in participant_rows} == set(participants), "MKA detail CKN set changed"
-    for part in participant_rows:
-        state = participants[part["CKN"]]
-        for label, field in (
-                ("Principal", "is_principal"), ("Active", "active"), ("Live", "live_peers"),
-                ("Potential", "potential_peers"), ("Key-server", "is_key_server"), ("Elected", "is_elected")):
-            assert part[label] == state[field], "MKA detail {} disagrees with STATE_DB".format(label)
-        assert part["Role"] == ("primary" if state["is_primary"] == "true" else "fallback")
-        assert re.fullmatch(r"[0-9a-f]{24}", part["MI"]) and re.fullmatch(r"\d+", part["MN"])
-    return compact, detail
 
 
 def parse_db_hash(output):

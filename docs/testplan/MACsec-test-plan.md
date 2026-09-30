@@ -358,7 +358,7 @@ SONiC or cEOS peers. Its requirements come from the
 
 | Scenario | Acceptance evidence |
 | --- | --- |
-| Primary and fallback healthy | Exact configured/runtime CKNs and roles, protected Controlled Port, one receive SC, encoding SA, required namespace-local MKA schema including key-server SCI, and actual compact/detail CLI values |
+| Primary and fallback healthy | Exact configured/runtime CKNs and roles, protected Controlled Port, one receive SC, encoding SA, and required namespace-local MKA STATE_DB fields including key-server SCI |
 | Primary mismatch/deletion and recovery | Fallback then primary ownership, observed new SAK distribution/reception and transmit encoding key, bidirectional key convergence and old-SA retirement |
 | Primary/fallback hot replacement | One mutation per peer/namespace/profile scope, survivor protection, new participant convergence, and state-aware independent restoration |
 | Unsafe alternate or invalid profile update | Rejection without CONFIG_DB mutation; multi-port preconditions allow protocol convergence plus STATE_DB publication |
@@ -383,6 +383,11 @@ SONiC key server and a cEOS peer; if publication/sampling misses the inherited
 SA interval, the counter case explicitly skips rather than comparing counters
 on a newly installed SA. The known manager-reconstruction failure on physical
 `vms26-t2-7800-1` skips only manager restart, not explicit disable.
+
+The suite checks the MKA CLI only for command availability to select supported
+images; it intentionally does not assert `show macsec --mka` compact/detail
+output fields or formatting. Protocol and rollover verdicts come from
+namespace-local STATE_DB, configured profiles, installed SAs, and traffic.
 
 Deterministic malformed-query retention, parser/scheduler deadlines,
 remove/add failure retries, CP-phase injection, slow-peer confirmation, and

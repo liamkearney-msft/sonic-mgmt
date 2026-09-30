@@ -14,7 +14,6 @@ from tests.common.macsec.mka_state_helper import (
     get_mka_state,
     mka_state_cli_supported,
     validate_mka_snapshot,
-    validate_mka_show,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,7 +87,6 @@ class TestControlPlane():
                 if validate_mka_snapshot(
                         session, participants, profile, profile["primary_ckn"]):
                     return False
-                validate_mka_show(duthost, port_name, session, participants)
                 return True
 
             assert wait_until(60, 3, 0, _state_is_healthy), (

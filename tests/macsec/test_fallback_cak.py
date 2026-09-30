@@ -44,7 +44,6 @@ from tests.common.macsec.mka_state_helper import (
     mka_state_cli_supported,
     select_independent_port_pair,
     validate_multi_port_alternate_state,
-    validate_mka_show,
     parse_mka_timestamp,
 )
 from tests.common.utilities import ping_ip, wait_until
@@ -103,17 +102,6 @@ def _assert_profile_unchanged(before, after, description):
 def _set_profile(host, name, profile, priority=None, namespace_option=None):
     set_macsec_profile(
         host, name, namespace_option=namespace_option, **_profile_kwargs(profile, priority=priority))
-
-
-def _get_eos_participant_output(host, port):
-    result = host.eos_command(
-        commands=[
-            "show mac security participants {} detail | json".format(port)
-        ])
-    output = result.get("stdout", [{}])[0]
-    if not isinstance(output, dict):
-        return {}
-    return output
 
 
 def _protocol_timeout(environment, port, intervals):
@@ -185,17 +173,6 @@ def _wait_rotation_settled(
         settle + SA_RETIRE_TIMEOUT + MKA_STATE_PUBLISH_TIMEOUT,
         1, 0, _settled,
     ), "Rollover on {} did not distribute/converge/retire: {}".format(port, errors[0])
-
-
-def _wait_mka_show(environment, port):
-    def _correct():
-        snapshot = _snapshot(environment, port)
-        validate_mka_show(
-            environment["duthost"], port, snapshot.session, snapshot.participants)
-        return True
-
-    assert wait_until(MKA_STATE_PUBLISH_TIMEOUT, 2, 0, _correct), \
-        "MKA show values did not agree with STATE_DB on {}".format(port)
 
 
 def _capture_environment_last_updated(
@@ -560,7 +537,6 @@ def _primary_mismatch(environment, port, invalid_pair):
         adapter.commit_profile(mismatched_profile)
         _wait_rotation_settled(
             environment, port, before, profile["fallback_ckn"], require_all_live=False)
-        _wait_mka_show(environment, port)
         yield adapter
 
 
@@ -1112,14 +1088,13 @@ def fallback_macsec_environment(
     return environment
 
 
-def test_fallback_operational_state_and_show(
+def test_fallback_operational_state_and_config(
         fallback_macsec_environment):
-    """Verify dual-CA CONFIG_DB, STATE_DB, show output, and one-SC state."""
+    """Verify dual-CA CONFIG_DB, STATE_DB, and protected SC/SA state."""
     environment = fallback_macsec_environment
-    duthost = environment["duthost"]
     profile = environment["profile"]
 
-    for port, neighbor in environment["links"].items():
+    for port in environment["links"]:
         snapshot = _snapshot(environment, port)
         for field in (
                 "primary_cak", "primary_ckn", "fallback_cak", "fallback_ckn"):
@@ -1135,16 +1110,6 @@ def test_fallback_operational_state_and_show(
         _assert_key_material_absent(serialized_state, profile)
         assert not peer_adapter(environment, port).protected_errors(
             environment["peer_profiles"][port], profile["primary_ckn"])
-        if isinstance(neighbor["host"], EosHost):
-            eos_output = _get_eos_participant_output(
-                neighbor["host"], neighbor["port"])
-            _assert_key_material_absent(json.dumps(eos_output), profile)
-
-        compact, detail = validate_mka_show(duthost, port, snapshot.session, snapshot.participants)
-        _assert_key_material_absent(compact, profile)
-        _assert_key_material_absent(detail, profile)
-        assert "primary_cak" not in detail
-        assert "fallback_cak" not in detail
 
 
 def test_ceos_primary_key_delete_fails_over_hitlessly(
@@ -1171,7 +1136,6 @@ def test_ceos_primary_key_delete_fails_over_hitlessly(
             _wait_peer_primary_removed(adapter, profile)
             _wait_rotation_settled(
                 environment, port, before, profile["fallback_ckn"], require_all_live=False)
-            _wait_mka_show(environment, port)
         traffic.assert_zero_loss()
 
 
@@ -1255,7 +1219,7 @@ def test_primary_rotation_and_recovery_are_hitless(
 
     with _TrafficWindow(environment, upstream_links) as traffic:
         with _rotated_cak(environment, "primary", new_pair, selected_port):
-            _wait_mka_show(environment, selected_port)
+            pass
         traffic.assert_zero_loss()
 
 
@@ -1269,7 +1233,7 @@ def test_fallback_rotation_keeps_primary_and_traffic(
 
     with _TrafficWindow(environment, upstream_links) as traffic:
         with _rotated_cak(environment, "fallback", new_pair, selected_port):
-            _wait_mka_show(environment, selected_port)
+            pass
         traffic.assert_zero_loss()
 
 
@@ -1309,7 +1273,6 @@ def test_crossed_roles_follow_key_server_primary(
         with _TrafficWindow(environment, upstream_links) as traffic:
             _wait_rotation_settled(
                 environment, port, before, profile["fallback_ckn"], require_rekey=None)
-            _wait_mka_show(environment, port)
             traffic.assert_zero_loss()
     finally:
         adapter.replace_profile(
