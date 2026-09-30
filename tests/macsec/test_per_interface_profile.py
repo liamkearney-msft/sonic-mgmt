@@ -35,40 +35,16 @@ class TestPerInterfaceProfile():
         '''
         if not port_profiles:
             pytest.skip("Requires --per_interface_macsec")
-        profile_list = list(port_profiles.values())
         all_caks = []
         all_ckns = []
-        for i in range(len(profile_list)):
-            assert profile_list[i].get("fallback_cak"), \
-                "Missing fallback CAK in {}".format(profile_list[i]["name"])
-            assert profile_list[i].get("fallback_ckn"), \
-                "Missing fallback CKN in {}".format(profile_list[i]["name"])
-            all_caks.extend([
-                profile_list[i]["primary_cak"],
-                profile_list[i]["fallback_cak"],
-            ])
-            all_ckns.extend([
-                profile_list[i]["primary_ckn"],
-                profile_list[i]["fallback_ckn"],
-            ])
-            for j in range(i + 1, len(profile_list)):
-                assert profile_list[i]["primary_cak"] != profile_list[j]["primary_cak"], \
-                    "CAK collision between {} and {}".format(
-                        profile_list[i]["name"], profile_list[j]["name"])
-                assert profile_list[i]["primary_ckn"] != profile_list[j]["primary_ckn"], \
-                    "CKN collision between {} and {}".format(
-                        profile_list[i]["name"], profile_list[j]["name"])
-                if profile_list[i].get("fallback_cak"):
-                    assert profile_list[i]["fallback_cak"] != profile_list[j]["fallback_cak"], \
-                        "Fallback CAK collision between {} and {}".format(
-                            profile_list[i]["name"], profile_list[j]["name"])
-                    assert profile_list[i]["fallback_ckn"] != profile_list[j]["fallback_ckn"], \
-                        "Fallback CKN collision between {} and {}".format(
-                            profile_list[i]["name"], profile_list[j]["name"])
-            if profile_list[i].get("fallback_ckn"):
-                assert profile_list[i]["primary_ckn"] != profile_list[i]["fallback_ckn"], \
-                    "Primary/fallback CKN collision in {}".format(
-                        profile_list[i]["name"])
+        for profile in port_profiles.values():
+            for role in ("primary", "fallback"):
+                assert profile.get("{}_cak".format(role)), \
+                    "Missing {} CAK in {}".format(role, profile["name"])
+                assert profile.get("{}_ckn".format(role)), \
+                    "Missing {} CKN in {}".format(role, profile["name"])
+                all_caks.append(profile["{}_cak".format(role)])
+                all_ckns.append(profile["{}_ckn".format(role)])
         assert len(all_caks) == len(set(all_caks)), \
             "CAK collision across per-interface primary/fallback pairs"
         assert len(all_ckns) == len(set(all_ckns)), \

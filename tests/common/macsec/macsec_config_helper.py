@@ -33,6 +33,7 @@ __all__ = [
     'generate_per_interface_macsec_profiles',
     'update_macsec_profile_key',
     'restore_macsec_profile_key',
+    'eos_macsec_key_line',
     'setup_macsec_multi_profile_configuration',
     'cleanup_macsec_multi_profile_configuration',
 ]
@@ -111,12 +112,11 @@ def _build_eos_macsec_profile_lines(
     }
     lines = [
         'cipher {}'.format(eos_cipher_suite[cipher_suite]),
-        'key {} 7 {}'.format(primary_ckn, primary_cak),
+        eos_macsec_key_line(primary_ckn, primary_cak),
     ]
     if fallback_cak:
-        lines.append(
-            'key {} 7 {} fallback'.format(
-                fallback_ckn, fallback_cak))
+        lines.append(eos_macsec_key_line(
+            fallback_ckn, fallback_cak, is_fallback=True))
     lines.append('mka key-server priority {}'.format(priority))
     if rekey_period:
         lines.append('mka session rekey-period {}'.format(rekey_period))
@@ -127,7 +127,8 @@ def _build_eos_macsec_profile_lines(
 
 def set_macsec_profile(host, profile_name, priority, cipher_suite,
                        primary_cak, primary_ckn, policy, send_sci,
-                       rekey_period=0, fallback_cak=None, fallback_ckn=None):
+                       rekey_period=0, fallback_cak=None, fallback_ckn=None,
+                       namespace_option=None):
     if isinstance(host, EosHost):
         lines = _build_eos_macsec_profile_lines(
             priority, cipher_suite, primary_cak, primary_ckn, send_sci,
@@ -141,12 +142,8 @@ def set_macsec_profile(host, profile_name, priority, cipher_suite,
         priority, cipher_suite, primary_cak, primary_ckn, policy, send_sci,
         rekey_period, fallback_cak, fallback_ckn)
 
-    if host.is_multi_asic:
-        for ns in host.get_asic_namespace_list():
-            cmd = "config macsec -n {} profile add {} {}".format(ns, profile_name, opts)
-            host.command(cmd, verbose=False)
-    else:
-        cmd = "config macsec profile add {} {}".format(profile_name, opts)
+    for option in _profile_namespace_options(host, namespace_option):
+        cmd = "config macsec {} profile add {} {}".format(option, profile_name, opts)
         host.command(cmd, verbose=False)
 
     if send_sci == "false":
@@ -160,7 +157,7 @@ def set_macsec_profile(host, profile_name, priority, cipher_suite,
         host.command("lldpcli configure system bond-slave-src-mac-type real")
 
 
-def _eos_macsec_key_line(ckn, cak, is_fallback=False, remove=False):
+def eos_macsec_key_line(ckn, cak, is_fallback=False, remove=False):
     line = "key {} 7 {}".format(ckn, cak)
     if is_fallback:
         line += " fallback"
@@ -236,9 +233,9 @@ def update_macsec_profile_key(
     if isinstance(host, EosHost):
         result = host.eos_config(
             lines=[
-                _eos_macsec_key_line(
+                eos_macsec_key_line(
                     new_ckn, new_cak, is_fallback=is_fallback),
-                _eos_macsec_key_line(
+                eos_macsec_key_line(
                     old_ckn, old_cak, is_fallback=is_fallback, remove=True),
             ],
             parents=['mac security', 'profile {}'.format(profile_name)])
@@ -339,20 +336,15 @@ def is_macsec_configured(host, mac_profile, ctrl_links):
     return is_profile_present and is_port_profile_present
 
 
-def delete_macsec_profile(host, profile_name):
+def delete_macsec_profile(host, profile_name, namespace_option=None):
     if isinstance(host, EosHost):
         host.eos_config(
             lines=['no profile {}'.format(profile_name)],
             parents=['mac security'])
         return
 
-    if host.is_multi_asic:
-        for ns in host.get_asic_namespace_list():
-            CMD_PREFIX = "-n {}".format(ns) if ns is not None else " "
-            cmd = "config macsec {} profile del {}".format(CMD_PREFIX, profile_name)
-            host.command(cmd, module_ignore_errors=True)
-    else:
-        cmd = ("config macsec profile del {}".format(profile_name))
+    for option in _profile_namespace_options(host, namespace_option):
+        cmd = "config macsec {} profile del {}".format(option, profile_name)
         host.command(cmd, module_ignore_errors=True)
 
 
@@ -845,7 +837,7 @@ def cleanup_macsec_multi_profile_configuration(duthost, ctrl_links, port_profile
         ctrl_links: dict ``{dut_port: {name, host, port, ...}}``.
         port_profiles: dict ``{dut_port: profile_dict}``.
     """
-    devices = set()
+    devices = set([nbr["host"] for nbr in ctrl_links.values()])
     if duthost.facts["asic_type"] == "vs":
         devices.add(duthost)
 
@@ -854,19 +846,16 @@ def cleanup_macsec_multi_profile_configuration(duthost, ctrl_links, port_profile
         time.sleep(3)
         disable_macsec_port(duthost, dut_port)
         disable_macsec_port(nbr["host"], nbr["port"])
-        devices.add(nbr["host"])
 
     logger.info("Multi-profile cleanup step 2: delete per-port profiles")
-    deleted_profiles = set()
+    deleted = set()
     for dut_port, nbr in list(ctrl_links.items()):
         profile_name = port_profiles[dut_port]["name"]
-        if profile_name not in deleted_profiles:
-            delete_macsec_profile(duthost, profile_name)
-            deleted_profiles.add(profile_name)
-
-    for d in devices:
-        for profile_name in deleted_profiles:
-            delete_macsec_profile(d, profile_name)
+        for host in (duthost, nbr["host"]):
+            scope = (host.hostname, profile_name)
+            if scope not in deleted:
+                delete_macsec_profile(host, profile_name)
+                deleted.add(scope)
 
     logger.info("Multi-profile cleanup step 3: wait for automatic cleanup")
 

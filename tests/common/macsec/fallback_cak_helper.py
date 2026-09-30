@@ -6,6 +6,8 @@ from tests.common.macsec.macsec_config_helper import (
     delete_macsec_profile,
     disable_macsec_port,
     enable_macsec_port,
+    eos_macsec_key_line,
+    restore_macsec_profile_key,
     set_macsec_profile,
     update_macsec_profile_key,
 )
@@ -14,20 +16,13 @@ from tests.common.macsec.mka_state_helper import (
     get_macsec_ingress_sc_state,
     get_macsec_profile_config,
     get_mka_state,
+    get_namespace_option,
     parse_eos_mka_participants,
     parse_eos_profile_ckns,
     validate_mka_snapshot,
+    validate_eos_mka_participants,
     validate_point_to_point_ingress_sc,
 )
-
-
-@dataclass(frozen=True)
-class MutationResult:
-    provider: str
-    operation: str
-    supported: bool = True
-    diagnostics: str = ""
-    profile: dict = None
 
 
 @dataclass
@@ -43,11 +38,6 @@ class LinkSnapshot:
     ingress_scs: list
     controlled_port: bool
     controlled_port_authoritative: bool
-
-    @property
-    def optional_key_server_sci(self):
-        """Return optional STATE_DB diagnostics outside the core contract."""
-        return self.session.get("key_server_sci")
 
     def principal_ckns(self):
         return sorted(
@@ -155,6 +145,36 @@ class LinkSnapshot:
             tuple(ingress),
         )
 
+    def rollover_errors(self, before, require_rekey=True):
+        """Require a converged shared SAK with the old SAs actually retired."""
+        errors = []
+        current_key = self.active_key_identity()[1]
+        previous_key = before.active_key_identity()[1]
+        if not current_key:
+            errors.append("active transmit SAK is missing")
+        if require_rekey is True:
+            if current_key == previous_key:
+                errors.append("no new transmit SAK was observed")
+            if sum(int(self.session[field]) for field in ("keys_distributed", "keys_received")) <= sum(
+                    int(before.session[field]) for field in ("keys_distributed", "keys_received")):
+                errors.append("new SAK distribution/reception has not been published")
+        elif require_rekey is False and current_key != previous_key:
+            errors.append("standby rotation changed the active SAK")
+        if len(self.egress_sas) != 1:
+            errors.append("old transmit SAs have not retired")
+        if len(self.ingress_scs) != 1:
+            errors.append("expected one receive SC after rollover")
+        else:
+            sas = self.ingress_scs[0]["sas"]
+            if len(sas) != 1:
+                errors.append("old receive SAs have not retired")
+            elif self.egress_sas:
+                transmit = next(iter(self.egress_sas.values()))
+                receive = next(iter(sas.values()))
+                if receive.get("active") != "true" or receive.get("sak") != transmit.get("sak"):
+                    errors.append("bidirectional SAK state has not converged")
+        return errors
+
     def redacted(self):
         return {
             "port": self.port,
@@ -176,40 +196,12 @@ class LinkSnapshot:
             "controlled_port": self.controlled_port,
             "controlled_port_authoritative":
                 self.controlled_port_authoritative,
-            "key_server_sci": self.optional_key_server_sci,
+            "key_server_sci": self.session.get("key_server_sci"),
         }
 
 
-class MkaStateReader:
-    """Normalized MKA reader seam.
-
-    The normalized session contract includes profile, protected state,
-    query/config status, actor/key-server priorities, key-server role,
-    counters, hello time and last_updated. Participant state includes CKN,
-    active/primary/principal/live/elected/key-server roles.
-
-    TODO: add a ``show macsec --mka`` reader when its primary/fallback
-    ``live_peers`` view is finalized. Callers must not depend on that external
-    JSON or text layout. ``key_server_sci`` is optional diagnostic metadata
-    when STATE_DB still publishes it.
-    """
-
-    def read(self, host, port):
-        raise NotImplementedError
-
-
-class StateDbMkaReader(MkaStateReader):
-    def read(self, host, port):
-        return get_mka_state(host, port)
-
-
-STATE_DB_READER = StateDbMkaReader()
-
-
-def read_link_snapshot(
-        duthost, port, neighbor, profile_name,
-        reader=STATE_DB_READER):
-    session, participants = reader.read(duthost, port)
+def read_link_snapshot(duthost, port, neighbor, profile_name):
+    session, participants = get_mka_state(duthost, port)
     appl_port, egress_sc, _, egress_sas, _ = get_appl_db(
         duthost, port, neighbor["host"], neighbor["port"])
     return LinkSnapshot(
@@ -251,6 +243,21 @@ class PeerAdapter:
     def peer_port(self):
         return self.neighbor["port"]
 
+    @property
+    def namespace_option(self):
+        return get_namespace_option(self.host, self.peer_port)
+
+    @property
+    def scope(self):
+        return self.host.hostname, self.namespace_option, self.profile_name
+
+    @property
+    def scope_ports(self):
+        return [
+            port for port in self.environment["links"]
+            if peer_adapter(self.environment, port).scope == self.scope
+        ]
+
     @staticmethod
     def profile_with_pair(profile, role, pair):
         updated = dict(profile)
@@ -259,7 +266,8 @@ class PeerAdapter:
         return updated
 
     def commit_profile(self, profile):
-        self.environment["peer_profiles"][self.port] = dict(profile)
+        for port in self.scope_ports:
+            self.environment["peer_profiles"][port] = dict(profile)
 
     def rotate(
             self, role, old_pair, new_pair, commit=True,
@@ -272,6 +280,7 @@ class PeerAdapter:
             new_pair[0],
             new_pair[1],
             is_fallback=role == "fallback",
+            namespace_option=self.namespace_option,
         )
         updated = self.profile_with_pair(
             base_profile or self.environment["peer_profiles"][self.port],
@@ -280,50 +289,21 @@ class PeerAdapter:
         )
         if commit:
             self.commit_profile(updated)
-        return MutationResult(
-            self.provider,
-            "rotate_{}".format(role),
-            profile=updated,
-        )
 
-    def restore_primary(self, original_profile, mismatched_pair):
-        configured = get_macsec_profile_config(
-            self.host, self.peer_port, self.profile_name)
-        configured_ckn = configured.get("primary_ckn", "").lower()
+    def restore_key(self, role, original_profile, replacement_pair):
         original_pair = (
-            original_profile["primary_cak"],
-            original_profile["primary_ckn"],
+            original_profile["{}_cak".format(role)],
+            original_profile["{}_ckn".format(role)],
         )
-        if configured_ckn == original_pair[1].lower():
-            return MutationResult(
-                self.provider,
-                "restore_primary",
-                profile=dict(original_profile),
-            )
-        if configured_ckn != mismatched_pair[1].lower():
-            raise AssertionError(
-                "Peer primary changed to an unexpected CKN during cleanup")
-        self.rotate(
-            "primary",
-            mismatched_pair,
-            original_pair,
-            commit=False,
-            base_profile=self.profile_with_pair(
-                original_profile, "primary", mismatched_pair),
-        )
-        return MutationResult(
-            self.provider,
-            "restore_primary",
-            profile=dict(original_profile),
-        )
+        restore_macsec_profile_key(
+            self.host, self.profile_name,
+            original_pair[0], original_pair[1],
+            replacement_pair[0], replacement_pair[1],
+            is_fallback=role == "fallback",
+            namespace_options=[self.namespace_option])
 
     def delete_primary_if_supported(self, primary_pair):
-        return MutationResult(
-            self.provider,
-            "delete_primary",
-            supported=False,
-            diagnostics=self.primary_delete_unsupported_reason,
-        )
+        raise NotImplementedError(self.primary_delete_unsupported_reason)
 
     def create_profile(self, profile_name, profile, priority=None):
         set_macsec_profile(
@@ -334,8 +314,8 @@ class PeerAdapter:
             profile["policy"], profile["send_sci"],
             profile["rekey_period"], profile.get("fallback_cak"),
             profile.get("fallback_ckn"),
+            namespace_option=self.namespace_option,
         )
-        return MutationResult(self.provider, "create_profile")
 
     def rebind(self, profile_name, profile=None):
         disable_macsec_port(self.host, self.peer_port)
@@ -344,23 +324,22 @@ class PeerAdapter:
         self.environment["neighbor_profiles"][self.port] = profile_name
         if profile is not None:
             self.environment["peer_profiles"][self.port] = dict(profile)
-        return MutationResult(self.provider, "rebind_profile")
 
     def replace_profile(self, profile_name, profile, priority=None):
-        disable_macsec_port(self.host, self.peer_port)
-        delete_macsec_profile(self.host, profile_name)
+        ports = self.scope_ports
+        for port in ports:
+            disable_macsec_port(self.host, self.environment["links"][port]["port"])
+        delete_macsec_profile(
+            self.host, profile_name, namespace_option=self.namespace_option)
         self.create_profile(profile_name, profile, priority=priority)
-        enable_macsec_port(self.host, self.peer_port, profile_name)
+        for port in ports:
+            enable_macsec_port(
+                self.host, self.environment["links"][port]["port"], profile_name)
+            self.environment["neighbor_profiles"][port] = profile_name
+            self.environment["peer_profiles"][port] = dict(profile)
         self.profile_name = profile_name
         self.priority = (
             profile["priority"] if priority is None else priority)
-        self.environment["neighbor_profiles"][self.port] = profile_name
-        self.environment["peer_profiles"][self.port] = dict(profile)
-        return MutationResult(self.provider, "replace_profile")
-
-    def restore(self, profile_name, profile):
-        self.replace_profile(profile_name, profile)
-        return MutationResult(self.provider, "restore")
 
     def protected_errors(
             self, profile, expected_principal, require_all_live=True):
@@ -416,34 +395,28 @@ class EosPeerAdapter(PeerAdapter):
     provider = "ceos"
     supports_primary_delete = True
 
-    def _key_line(self, cak, ckn, fallback=False, remove=False):
-        line = "key {} 7 {}".format(ckn, cak)
-        if fallback:
-            line += " fallback"
-        return "no " + line if remove else line
+    @property
+    def namespace_option(self):
+        return ""
 
     def _configure_key(self, pair, fallback=False, remove=False):
         self.host.eos_config(
-            lines=[self._key_line(
-                pair[0], pair[1], fallback=fallback, remove=remove)],
+            lines=[eos_macsec_key_line(
+                pair[1], pair[0], is_fallback=fallback, remove=remove)],
             parents=["mac security", "profile {}".format(self.profile_name)],
         )
 
     def delete_primary_if_supported(self, primary_pair):
         self._configure_key(primary_pair, remove=True)
-        return MutationResult(self.provider, "delete_primary")
 
     def add_primary(self, primary_pair):
         self._configure_key(primary_pair)
-        return MutationResult(self.provider, "add_primary")
 
     def delete_fallback(self, fallback_pair):
         self._configure_key(fallback_pair, fallback=True, remove=True)
-        return MutationResult(self.provider, "delete_fallback")
 
     def add_fallback(self, fallback_pair):
         self._configure_key(fallback_pair, fallback=True)
-        return MutationResult(self.provider, "add_fallback")
 
     def primary_removed_errors(self, original_profile):
         snapshot = self.snapshot(original_profile)
@@ -469,15 +442,7 @@ class EosPeerAdapter(PeerAdapter):
             errors.append("cEOS controlled port is closed")
         return errors
 
-    def restore_primary(self, original_profile, mismatched_pair):
-        return self._restore_key(
-            "primary", original_profile, mismatched_pair)
-
-    def restore_fallback(self, original_profile, mismatched_pair):
-        return self._restore_key(
-            "fallback", original_profile, mismatched_pair)
-
-    def _restore_key(self, role, original_profile, mismatched_pair):
+    def restore_key(self, role, original_profile, mismatched_pair):
         configured_ckns = self.snapshot(original_profile)["configured_ckns"]
         original_pair = (
             original_profile["{}_cak".format(role)],
@@ -496,17 +461,15 @@ class EosPeerAdapter(PeerAdapter):
         is_fallback = role == "fallback"
         lines = []
         if mismatched_ckn in configured_ckns:
-            lines.append(self._key_line(
-                mismatched_pair[0],
-                mismatched_pair[1],
-                fallback=is_fallback,
+            lines.append(eos_macsec_key_line(
+                mismatched_pair[1], mismatched_pair[0],
+                is_fallback=is_fallback,
                 remove=True,
             ))
         if original_ckn not in configured_ckns:
-            lines.append(self._key_line(
-                original_pair[0],
-                original_pair[1],
-                fallback=is_fallback,
+            lines.append(eos_macsec_key_line(
+                original_pair[1], original_pair[0],
+                is_fallback=is_fallback,
             ))
         if lines:
             self.host.eos_config(
@@ -514,11 +477,6 @@ class EosPeerAdapter(PeerAdapter):
                 parents=["mac security",
                          "profile {}".format(self.profile_name)],
             )
-        return MutationResult(
-            self.provider,
-            "restore_{}".format(role),
-            profile=dict(original_profile),
-        )
 
     def snapshot(self, profile=None):
         profile = profile or self.environment["peer_profiles"][self.port]
@@ -553,22 +511,9 @@ class EosPeerAdapter(PeerAdapter):
         errors = []
         if snapshot["configured_ckns"] != expected_ckns:
             errors.append("configured CKN set does not match")
-        if set(snapshot["participants"]) != expected_ckns:
-            errors.append("runtime participant CKN set does not match")
-        for ckn, participant in snapshot["participants"].items():
-            if not participant.get("success"):
-                if require_all_live or ckn == expected_principal.lower():
-                    errors.append("{} is not successful".format(ckn))
-            if not participant.get("active"):
-                if require_all_live or ckn == expected_principal.lower():
-                    errors.append("{} is not active".format(ckn))
-            if (
-                    participant.get("live_peers", 0) < 1
-                    and (require_all_live
-                         or ckn == expected_principal.lower())):
-                errors.append("{} has no live peer".format(ckn))
-        if not snapshot["controlled_port"]:
-            errors.append("cEOS controlled port is closed")
+        errors.extend(validate_eos_mka_participants(
+            snapshot["participants"], profile, snapshot["controlled_port"],
+            expected_principal.lower(), require_all_live))
         return errors
 
     def blocked_errors(self, expected_ckns, previous_last_updated=None):
@@ -605,3 +550,12 @@ def peer_adapter(environment, port):
     adapter = EosPeerAdapter if isinstance(
         neighbor["host"], EosHost) else PeerAdapter
     return adapter(environment, port)
+
+
+def peer_adapters(environment, ports=None):
+    """Return one adapter per peer, namespace, and shared profile."""
+    adapters = {}
+    for port in environment["links"] if ports is None else ports:
+        adapter = peer_adapter(environment, port)
+        adapters.setdefault(adapter.scope, adapter)
+    return list(adapters.values())

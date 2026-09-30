@@ -4,6 +4,7 @@ from tests.common.macsec.macsec_config_helper import (
     macsec_profile_has_fallback,
 )
 from tests.common.macsec.macsec_helper import check_appl_db
+from tests.common.macsec.mka_state_helper import mka_state_cli_supported
 from tests.common.utilities import wait_until
 
 
@@ -41,6 +42,12 @@ def pytest_collection_modifyitems(config, items):
         if not has_fallback:
             item.add_marker(pytest.mark.skip(
                 reason="Selected MACsec profile has no fallback CAK/CKN pair"))
+
+
+@pytest.fixture(scope="module")
+def mka_state_supported(duthost, wait_mka_establish):
+    """Remember image capability before any deployment transition."""
+    return mka_state_cli_supported(duthost)
 
 
 @pytest.fixture(scope="module")

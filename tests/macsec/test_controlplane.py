@@ -14,6 +14,7 @@ from tests.common.macsec.mka_state_helper import (
     get_mka_state,
     mka_state_cli_supported,
     validate_mka_snapshot,
+    validate_mka_show,
 )
 
 logger = logging.getLogger(__name__)
@@ -84,9 +85,11 @@ class TestControlPlane():
 
             def _state_is_healthy():
                 session, participants = get_mka_state(duthost, port_name)
-                return not validate_mka_snapshot(
-                    session, participants, profile,
-                    profile["primary_ckn"])
+                if validate_mka_snapshot(
+                        session, participants, profile, profile["primary_ckn"]):
+                    return False
+                validate_mka_show(duthost, port_name, session, participants)
+                return True
 
             assert wait_until(60, 3, 0, _state_is_healthy), (
                 "MKA operational state did not become healthy on {}"

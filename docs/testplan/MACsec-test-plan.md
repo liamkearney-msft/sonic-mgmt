@@ -48,7 +48,7 @@
 | Check the Data plane                                                 | Completed |                                                   |
 | Refresh SAK - timer based                                            | Completed |                                                   |
 | Refresh SAK - packet number based                                    |  Ongoing  |                                                   |
-| MACsec Key rotation, Primary/Fallback CAK                            | Not start | Feature hasn't been supported                    |
+| MACsec Key rotation, Primary/Fallback CAK                            | Implemented, validation pending | Explicit dual-CA opt-in; current revision needs lab validation |
 | MACsec Counters                                                      |  Ongoing  |                                                   |
 | COPP                                                                 |  Ongoing  |                                                   |
 | Port channel with MACsec                                             | Completed |                                                   |
@@ -124,6 +124,14 @@ example `--macsec_profile MACSEC_PROFILE_FALLBACK` (or
 legacy `--macsec_profile all` sweep. Selecting a primary-only profile skips
 `macsec/test_fallback_cak.py` before MACsec setup; an incomplete fallback CAK/CKN
 pair is a configuration error, not a skip.
+
+The targeted fallback module uses a shared profile. `--per_interface_macsec`
+is a separate, explicitly selected generation mode: it creates unique primary
+and fallback pairs for the normal per-interface/control-plane/deployment tests,
+and skips the shared-profile fallback module. Stress cases additionally require
+`--run-stress-tests`; all-link scale coverage requires `--macsec_all_links`.
+The cold-reboot and bounded rotation stress cases run only with
+`MACSEC_PROFILE_FALLBACK`, not the integrity profile.
 
 ## Common Configuration
 
@@ -343,7 +351,47 @@ SAI_MACSEC_SA_ATTR_CONFIGURED_EGRESS_XPN            │
 
 #### MACsec Key rotation, Primary/Fallback CAK
 
-   TODO
+`macsec/test_fallback_cak.py` exercises supported SONiC config commands with
+SONiC or cEOS peers. Its requirements come from the
+[fallback CAK HLD](https://github.com/sonic-net/SONiC/pull/2495) and
+[MKA state/rotation HLD](https://github.com/sonic-net/SONiC/pull/2545).
+
+| Scenario | Acceptance evidence |
+| --- | --- |
+| Primary and fallback healthy | Exact configured/runtime CKNs and roles, protected Controlled Port, one receive SC, encoding SA, required namespace-local MKA schema including key-server SCI, and actual compact/detail CLI values |
+| Primary mismatch/deletion and recovery | Fallback then primary ownership, observed new SAK distribution/reception and transmit encoding key, bidirectional key convergence and old-SA retirement |
+| Primary/fallback hot replacement | One mutation per peer/namespace/profile scope, survivor protection, new participant convergence, and state-aware independent restoration |
+| Unsafe alternate or invalid profile update | Rejection without CONFIG_DB mutation; multi-port preconditions allow protocol convergence plus STATE_DB publication |
+| Both CAs invalid | Blocked Controlled Port, no SAs, failed traffic in both directions, then recovery of a matching profile (cEOS also restores fallback before primary) |
+| Explicit disable and manager restart | Disable independently deletes both MKA tables; restart requires newer successful publication, a new manager PID, unchanged WPA processes and strict traffic continuity |
+| Bounded stress and counters | Alternating replacements/restorations and a periodic-SAK boundary; counters are compared across migration only while the same installed SAK is observable |
+
+Exact-loss checks use continuous 10-Hz ICMP streams from both endpoints.
+They require a direct or single-member protected routed link so a bundle cannot
+route around the selected interface. Traffic remains active through promotion,
+the deferred SAK distribution, encoding rollover, old-SA retirement, and key
+restoration. A protocol-derived settle window and the 20-second retirement
+failsafe are combined with publication/convergence evidence, rather than
+closing the window as soon as a principal row appears. Standby rotation with
+periodic rekey disabled must leave the active SAK unchanged. These are sampled
+endpoint traffic checks, not an independent line-rate packet-generator result.
+
+cEOS supports delete-only key injection; that scenario is not exposed by the
+supported SONiC configuration API. Crossed-role peer-key-server coverage
+requires four-SA capability. Counter preservation requires a non-periodic
+SONiC key server and a cEOS peer; if publication/sampling misses the inherited
+SA interval, the counter case explicitly skips rather than comparing counters
+on a newly installed SA. The known manager-reconstruction failure on physical
+`vms26-t2-7800-1` skips only manager restart, not explicit disable.
+
+Deterministic malformed-query retention, parser/scheduler deadlines,
+remove/add failure retries, CP-phase injection, slow-peer confirmation, and
+constrained-SA peer interoperability remain owning-component or specialized
+acceptance cases; the integration suite does not claim coverage from fake
+helpers or unit tests. Stable peer SCI and coherent per-CA key-server election
+are hitless prerequisites, not guarantees for unsupported combinations.
+The current source has no fresh physical/VS verdict; older-revision passes do
+not validate these assertions.
 
 #### MACsec Counters
 

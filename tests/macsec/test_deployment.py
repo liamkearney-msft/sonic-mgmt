@@ -28,9 +28,11 @@ pytestmark = [
 
 
 def _mka_operational_state_ok(
-        duthost, ctrl_links, macsec_profile, port_profiles):
-    if not mka_state_cli_supported(duthost):
+        duthost, ctrl_links, macsec_profile, port_profiles, mka_supported):
+    if not mka_supported:
         return True
+    assert mka_state_cli_supported(duthost), \
+        "Previously supported MKA CLI disappeared after the transition"
     for port in ctrl_links:
         profile = port_profiles[port] if port_profiles else macsec_profile
         session, participants = get_mka_state(duthost, port)
@@ -58,7 +60,7 @@ class TestDeployment():
     def test_config_reload(
             self, duthost, ctrl_links, policy, cipher_suite, send_sci,
             macsec_profile, port_profiles, upstream_links,
-            wait_mka_establish):
+            wait_mka_establish, mka_state_supported):
         """Verify MACsec participant, SC/SA, and traffic recovery after reload."""
         with preserve_config_db_files(duthost):
             duthost.shell("config save -y")
@@ -67,7 +69,7 @@ class TestDeployment():
         assert wait_until(
             300, 5, 0,
             _mka_operational_state_ok,
-            duthost, ctrl_links, macsec_profile, port_profiles,
+            duthost, ctrl_links, macsec_profile, port_profiles, mka_state_supported,
         ), "MKA participant state did not recover after config reload"
         assert wait_until(
             120, 5, 0,
@@ -79,7 +81,7 @@ class TestDeployment():
     def test_reboot_with_fallback_profile(
             self, duthost, localhost, ctrl_links, policy, cipher_suite,
             send_sci, macsec_profile, port_profiles, upstream_links,
-            wait_mka_establish):
+            wait_mka_establish, mka_state_supported):
         """Verify a persisted dual-CA profile recovers after a cold reboot."""
         if port_profiles or macsec_profile["name"] != "MACSEC_PROFILE_FALLBACK":
             pytest.skip(
@@ -98,7 +100,7 @@ class TestDeployment():
         assert wait_until(
             300, 5, 0,
             _mka_operational_state_ok,
-            duthost, ctrl_links, macsec_profile, port_profiles,
+            duthost, ctrl_links, macsec_profile, port_profiles, mka_state_supported,
         ), "Dual-CA MKA state did not recover after reboot"
         assert wait_until(
             120, 5, 0,
@@ -154,16 +156,21 @@ class TestDeployment():
     def test_all_eligible_links(
             self, request, duthost, ctrl_links, nbrhosts, upstream_links,
             macsec_profile, port_profiles, policy, cipher_suite, send_sci,
-            wait_mka_establish):
+            tbinfo, wait_mka_establish, mka_state_supported):
         """Verify fallback MKA on every opt-in eligible neighbor link."""
         if not request.config.getoption("--macsec_all_links"):
             pytest.skip("Requires --macsec_all_links")
         if not macsec_profile.get("fallback_ckn"):
             pytest.skip("Requires a fallback-enabled base profile")
 
-        assert len(ctrl_links) == len(nbrhosts), (
-            "Expected every eligible neighbor link to be controlled"
-        )
+        adjacent = duthost.get_extended_minigraph_facts(tbinfo)["minigraph_neighbors"]
+        eligible_ports = {
+            port for port, neighbor in adjacent.items()
+            if neighbor["name"] in nbrhosts
+        }
+        assert set(ctrl_links) == eligible_ports, (
+            "Controlled ports {}, expected eligible adjacent ports {}"
+        ).format(sorted(ctrl_links), sorted(eligible_ports))
         if port_profiles:
             assert set(port_profiles) == set(ctrl_links)
         assert wait_until(
@@ -173,7 +180,7 @@ class TestDeployment():
         assert wait_until(
             300, 5, 0,
             _mka_operational_state_ok,
-            duthost, ctrl_links, macsec_profile, port_profiles,
+            duthost, ctrl_links, macsec_profile, port_profiles, mka_state_supported,
         )
         for port, neighbor in ctrl_links.items():
             assert duthost.iface_macsec_ok(port)

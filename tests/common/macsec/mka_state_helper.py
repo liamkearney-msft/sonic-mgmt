@@ -2,7 +2,13 @@ import ast
 import json
 import math
 import re
+import logging
+from datetime import datetime, timezone
 
+import natsort
+
+
+logger = logging.getLogger(__name__)
 
 MKA_SESSION_TABLE = "MACSEC_MKA_SESSION_TABLE"
 MKA_PARTICIPANT_TABLE = "MACSEC_MKA_PARTICIPANT_TABLE"
@@ -17,6 +23,7 @@ REQUIRED_SESSION_FIELDS = {
     "secured",
     "failed",
     "actor_sci",
+    "key_server_sci",
     "actor_priority",
     "key_server_priority",
     "is_key_server",
@@ -140,7 +147,8 @@ def parse_eos_mka_participants(output, interface):
 
 
 def validate_eos_mka_participants(
-        participants, profile, controlled_port):
+        participants, profile, controlled_port,
+        expected_principal=None, require_all_live=True):
     """Validate operational EOS peer state without ownership flags."""
     errors = []
     primary_ckn = profile["primary_ckn"].lower()
@@ -156,14 +164,15 @@ def validate_eos_mka_participants(
 
     for ckn in expected_ckns:
         participant = participants.get(ckn, {})
-        if not participant.get("success"):
-            errors.append("{} is not successful".format(ckn))
-        if not participant.get("active"):
-            errors.append("{} is not active".format(ckn))
-        if participant.get("failed"):
-            errors.append("{} is failed".format(ckn))
-        if participant.get("live_peers", 0) < 1:
-            errors.append("{} has no live peer".format(ckn))
+        if require_all_live or ckn == expected_principal:
+            if not participant.get("success"):
+                errors.append("{} is not successful".format(ckn))
+            if not participant.get("active"):
+                errors.append("{} is not active".format(ckn))
+            if participant.get("failed"):
+                errors.append("{} is failed".format(ckn))
+            if participant.get("live_peers", 0) < 1:
+                errors.append("{} has no live peer".format(ckn))
     return errors
 
 
@@ -184,22 +193,16 @@ def parse_eos_profile_ckns(output, profile_name):
 
 
 def _mka_show_result_supported(result):
-    """Return whether canonical MKA output comes from a recognized command."""
-    if result.get("failed", False) or result.get("rc", 0) != 0:
-        return False
-
+    """Recognize absent MKA syntax without hiding operational CLI failures."""
     output = "{}\n{}".format(
         result.get("stdout", ""), result.get("stderr", "")).lower()
-    unsupported_markers = (
-        "command not found",
-        "invalid option",
-        "no such option",
-        "unrecognized option",
-        "unrecognized arguments",
-        "unknown option",
-        "unknown command",
-    )
-    return not any(marker in output for marker in unsupported_markers)
+    if re.search(
+            r"(?:no such option|unknown option|unrecognized (?:option|arguments)|"
+            r"invalid option)\s*:?\s*['\"]?--mka\b", output):
+        return False
+    if result.get("failed") or result.get("rc", 0) != 0:
+        raise RuntimeError("show macsec --mka failed: {}".format(output.strip()))
+    return True
 
 
 def mka_state_cli_supported(host):
@@ -210,6 +213,120 @@ def mka_state_cli_supported(host):
         verbose=False,
     )
     return _mka_show_result_supported(result)
+
+
+def parse_mka_timestamp(value):
+    """Require the HLD's UTC, timezone-qualified successful query timestamp."""
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(parsed):
+        raise ValueError("MKA timestamp must be UTC: {!r}".format(value))
+    return parsed
+
+
+def parse_mka_show_table(output, first_column):
+    """Read tabulate's column boundaries, including multi-word headers."""
+    lines = output.splitlines()
+    for index, line in enumerate(lines):
+        if index == 0 or not re.fullmatch(r"\s*-+(?:\s+-+)+\s*", line):
+            continue
+        columns = [match.span() for match in re.finditer(r"-+", line)]
+        headers = [lines[index - 1][start:end].strip() for start, end in columns]
+        if headers[0] != first_column:
+            continue
+        rows = []
+        for row in lines[index + 1:]:
+            if not row.strip():
+                break
+            values = [row[start:end].strip() for start, end in columns]
+            if not values[0]:
+                raise ValueError("Empty identity column in MKA show table")
+            rows.append(dict(zip(headers, values)))
+        return headers, rows
+    raise ValueError("Missing {} MKA show table".format(first_column))
+
+
+def validate_mka_show(host, interface, session, participants, compact=None):
+    """Assert actual healthy CLI values for primary or fallback ownership."""
+    if compact is None:
+        compact = host.command("show macsec --mka")["stdout"]
+    first_column = "Namespace" if host.is_multi_asic else "Interface"
+    headers, rows = parse_mka_show_table(compact, first_column)
+    expected_headers = [
+        "Interface", "KaY", "Secured", "Principal CKN", "Role",
+        "Primary live peers", "Fallback live peers", "Local-KS", "Status", "Age",
+    ]
+    if host.is_multi_asic:
+        expected_headers.insert(0, "Namespace")
+    assert headers == expected_headers, "Unexpected compact MKA columns: {}".format(headers)
+    identities = [(row["Interface"], row.get("Namespace", "")) for row in rows]
+    assert identities == natsort.natsorted(identities), "MKA rows are not in natural interface/namespace order"
+    assert len(identities) == len(set(identities)), "Duplicate MKA show interface/namespace rows"
+    namespace = get_namespace_option(host, interface)
+    selected = [
+        row for row in rows if row["Interface"] == interface
+        and (not host.is_multi_asic or row["Namespace"] == namespace.split()[-1])
+    ]
+    assert len(selected) == 1, "Missing or ambiguous MKA compact row for {}".format(interface)
+    row = selected[0]
+    principal_ckns = [ckn for ckn, part in participants.items() if part["is_principal"] == "true"]
+    assert len(principal_ckns) == 1, "MKA show requires one principal"
+    principal_ckn = principal_ckns[0]
+    principal = participants[principal_ckn]
+    expected = {
+        "KaY": session["kay_status"], "Secured": session["secured"],
+        "Principal CKN": "{}...{}".format(principal_ckn[:6], principal_ckn[-6:]),
+        "Role": "primary" if principal["is_primary"] == "true" else "fallback",
+        "Local-KS": session["is_key_server"], "Status": "ok",
+    }
+    for role, is_primary in (("Primary", "true"), ("Fallback", "false")):
+        configured = [part for part in participants.values() if part["is_primary"] == is_primary]
+        assert len(configured) <= 1, "Ambiguous configured MKA role"
+        expected["{} live peers".format(role)] = configured[0]["live_peers"] if configured else "-"
+    for field, value in expected.items():
+        assert row[field] == value, "MKA compact {}={!r}, expected {!r}".format(field, row[field], value)
+    assert re.fullmatch(r"\d+s", row["Age"]) and int(row["Age"][:-1]) <= 60, \
+        "MKA compact data is not fresh"
+
+    detail = host.command("show macsec {} --mka {}".format(namespace, interface))["stdout"]
+    fields = {}
+    for line in detail.splitlines():
+        if ":" in line:
+            label, value = line.split(":", 1)
+            assert label.strip() not in fields, "Duplicate MKA detail field"
+            fields[label.strip()] = value.strip()
+    expected_detail = {
+        "Interface": interface, "Profile": session["profile"],
+        "PAE KaY status": session["kay_status"], "Controlled port mode": "secured",
+        "Failed": session["failed"], "Actor SCI": session["actor_sci"],
+        "Key server SCI": session["key_server_sci"], "Actor priority": session["actor_priority"],
+        "Key server priority": session["key_server_priority"], "Local key server": session["is_key_server"],
+        "MKA hello time": "{} ms".format(session["mka_hello_time_ms"]),
+        "Query status": "ok", "Config status": "in-sync",
+    }
+    for label, value in expected_detail.items():
+        assert fields.get(label) == value, "MKA detail {}={!r}, expected {!r}".format(label, fields.get(label), value)
+    for label in ("Keys distributed", "Keys received"):
+        assert re.fullmatch(r"\d+", fields.get(label, "")), "Missing MKA key counter"
+    updated = re.fullmatch(r"(\S+) \((\d+)s ago\)", fields.get("Last updated", ""))
+    assert updated and int(updated.group(2)) <= 60, "MKA detail data is not fresh"
+    assert parse_mka_timestamp(updated.group(1)) >= parse_mka_timestamp(session["last_updated"]), \
+        "MKA show regressed the successful publication timestamp"
+    assert "Authenticated:" not in detail and "Secured:" not in detail, "Raw CP flags replaced the derived mode"
+    participant_headers, participant_rows = parse_mka_show_table(detail, "CKN")
+    assert participant_headers == [
+        "CKN", "Role", "Principal", "Active", "Live", "Potential", "Key-server", "Elected", "MI", "MN",
+    ], "Unexpected detailed MKA participant columns"
+    assert len(participant_rows) == len(participants), "MKA detail participant count changed"
+    assert {part["CKN"] for part in participant_rows} == set(participants), "MKA detail CKN set changed"
+    for part in participant_rows:
+        state = participants[part["CKN"]]
+        for label, field in (
+                ("Principal", "is_principal"), ("Active", "active"), ("Live", "live_peers"),
+                ("Potential", "potential_peers"), ("Key-server", "is_key_server"), ("Elected", "is_elected")):
+            assert part[label] == state[field], "MKA detail {} disagrees with STATE_DB".format(label)
+        assert part["Role"] == ("primary" if state["is_primary"] == "true" else "fallback")
+        assert re.fullmatch(r"[0-9a-f]{24}", part["MI"]) and re.fullmatch(r"\d+", part["MN"])
+    return compact, detail
 
 
 def parse_db_hash(output):
@@ -296,7 +413,10 @@ def get_macsec_ingress_sc_state(host, interface):
         module_ignore_errors=True,
         verbose=False,
     )
-    keys = result.get("stdout_lines", []) if not result.get("failed") else []
+    if result.get("failed") or result.get("rc", 0) != 0:
+        raise RuntimeError(
+            "Unable to read APPL_DB ingress SC KEYS for {}".format(interface))
+    keys = result.get("stdout_lines", [])
     prefix = "{}:{}:".format(MACSEC_INGRESS_SC_TABLE, interface)
     entries = []
     for key in sorted(key.strip() for key in keys if key.strip()):
@@ -401,15 +521,6 @@ def select_independent_port_pair(ports, scope_by_port):
     return None
 
 
-def remaining_link_items(links, selected_port):
-    """Return non-selected links without mutating selected-link identity."""
-    return [
-        (candidate_port, candidate_neighbor)
-        for candidate_port, candidate_neighbor in links.items()
-        if candidate_port != selected_port
-    ]
-
-
 def validate_multi_port_alternate_state(
         participants_by_port, alternate_ckn, unsafe_port, safe_ports,
         peer_participants_by_port=None,
@@ -468,59 +579,17 @@ def macsecmgrd_restart_ready(old_pids, new_pids, supervisor_output):
     )
 
 
-def macsecmgrd_restart_command(container):
-    """Build the deterministic supervisor restart command."""
-    return "docker exec {} supervisorctl restart macsecmgrd".format(
-        container)
-
-
-def validate_lifecycle_cleanup_state(
-        session, previous_last_updated, process_ready, controlled_port,
-        egress_sc, egress_sas, ingress_scs):
-    """Validate fresh MKA/process/SC-SA state after explicit cleanup."""
-    errors = []
-    if session.get("query_status") != "ok":
-        errors.append("query_status is not ok")
-    if session.get("config_status") != "in-sync":
-        errors.append("config_status is not in-sync")
-    last_updated = session.get("last_updated")
-    if not last_updated:
-        errors.append("last_updated is missing")
-    elif last_updated == previous_last_updated:
-        errors.append("last_updated did not refresh")
-    if not process_ready:
-        errors.append("MACsec service process is not healthy")
-    if not controlled_port:
-        errors.append("controlled port is not open")
-
-    errors.extend(validate_point_to_point_ingress_sc(ingress_scs))
-    if not egress_sc:
-        errors.append("egress SC is missing")
-        return errors
-    try:
-        encoding_an = int(egress_sc.get("encoding_an"))
-    except (TypeError, ValueError):
-        errors.append("egress encoding AN is invalid")
-        return errors
-    active_sa = egress_sas.get(encoding_an, {})
-    if not active_sa:
-        errors.append(
-            "egress SA for encoding AN {} is missing".format(encoding_an))
-    elif not active_sa.get("sak"):
-        errors.append(
-            "egress SA for encoding AN {} has no SAK".format(encoding_an))
-    return errors
-
-
 def cleanup_all(items, cleanup):
     """Run cleanup for every item and re-raise the first failure afterward."""
     first_error = None
     for item in items:
         try:
             cleanup(item)
-        except Exception as error:
+        except BaseException as error:
             if first_error is None:
                 first_error = error
+            else:
+                logger.error("Additional MACsec cleanup failure: %r", error)
     if first_error is not None:
         raise first_error
 
@@ -550,6 +619,21 @@ def validate_mka_snapshot(session, participants, profile,
             errors.append("{}={!r}, expected {!r}".format(
                 field, session.get(field), expected))
 
+    for field in ("actor_sci", "key_server_sci"):
+        if not re.fullmatch(r"[0-9a-f]{16}", session.get(field, "")):
+            errors.append("{} is not a normalized SCI".format(field))
+    try:
+        parse_mka_timestamp(session.get("last_updated", ""))
+    except (ValueError, TypeError, AttributeError):
+        errors.append("last_updated is not an ISO UTC timestamp")
+    for field in (
+            "actor_priority", "key_server_priority", "keys_distributed",
+            "keys_received", "mka_hello_time_ms"):
+        if not re.fullmatch(r"\d+", session.get(field, "")):
+            errors.append("{} is not an unsigned integer".format(field))
+    if session.get("is_key_server") not in ("true", "false"):
+        errors.append("is_key_server is not a normalized boolean")
+
     expected_roles = {
         profile["primary_ckn"].lower(): "true",
     }
@@ -573,7 +657,16 @@ def validate_mka_snapshot(session, participants, profile,
                 ckn, participant.get("is_primary"), is_primary))
         if participant.get("active") != "true":
             errors.append("{} is not active".format(ckn))
-        live_peers = int(participant.get("live_peers", "0"))
+        for field in ("participant_index", "mn", "live_peers", "potential_peers"):
+            if not re.fullmatch(r"\d+", participant.get(field, "")):
+                errors.append("{} {} is not an unsigned integer".format(ckn, field))
+        for field in ("active", "retain", "is_principal", "is_primary", "is_key_server", "is_elected"):
+            if participant.get(field) not in ("true", "false"):
+                errors.append("{} {} is not a normalized boolean".format(ckn, field))
+        if not re.fullmatch(r"[0-9a-f]{24}", participant.get("mi", "")):
+            errors.append("{} MI is not normalized".format(ckn))
+        live_peers = int(participant["live_peers"]) if re.fullmatch(
+            r"\d+", participant.get("live_peers", "")) else 0
         principal_ckn = (expected_principal_ckn or "").lower()
         if ((require_all_live or ckn == principal_ckn)
                 and live_peers < 1):
