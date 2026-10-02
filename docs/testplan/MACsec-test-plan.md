@@ -361,7 +361,8 @@ SONiC or cEOS peers. Its requirements come from the
 | Primary and fallback healthy | Exact configured/runtime CKNs and roles, protected Controlled Port, one receive SC, encoding SA, and required namespace-local MKA STATE_DB fields including key-server SCI |
 | Primary mismatch/deletion and recovery | Fallback then primary ownership, observed new SAK distribution/reception and transmit encoding key, bidirectional key convergence and old-SA retirement |
 | Primary/fallback hot replacement | One mutation per peer/namespace/profile scope, survivor protection, new participant convergence, and state-aware independent restoration |
-| Unsafe alternate or invalid profile update | Rejection without CONFIG_DB mutation; multi-port preconditions allow protocol convergence plus STATE_DB publication |
+| Unsafe alternate with safe sibling | Structurally valid update persists desired CONFIG_DB; unsafe peer-present port retains its original applied participant with `query_status=ok,config_status=degraded` while safe sibling applies the replacement; after the alternate recovers, the pending port converges without a second CLI update |
+| Invalid profile update | Unknown/duplicate/malformed CKN, malformed CAK, and primary-only profile updates are rejected without CONFIG_DB mutation, including an unattached primary-only profile |
 | Both CAs invalid | Blocked Controlled Port, no SAs, failed traffic in both directions, then recovery of a matching profile (cEOS also restores fallback before primary) |
 | Explicit disable and manager restart | Disable independently deletes both MKA tables; restart requires newer successful publication, a new manager PID, unchanged WPA processes and strict traffic continuity |
 | Bounded stress and counters | Alternating replacements/restorations and a periodic-SAK boundary; counters are compared across migration only while the same installed SAK is observable |
@@ -388,13 +389,19 @@ The suite checks the MKA CLI only for command availability to select supported
 images; it intentionally does not assert `show macsec --mka` compact/detail
 output fields or formatting. Protocol and rollover verdicts come from
 namespace-local STATE_DB, configured profiles, installed SAs, and traffic.
+Desired CONFIG_DB is not rolled back by runtime failure: a healthy old applied
+participant can remain degraded/pending until fresh safe conditions allow
+reconciliation. The multi-port case verifies this separately from normal
+healthy `in-sync` assertions; it does not use missing alternate liveness alone
+as proof of peerlessness. Peerless owned-runtime, parser/scheduler faults,
+partial add/retry, and direct primary-only desired-state injection require
+controlled component stimuli and are not simulated by this integration suite.
 
-Deterministic malformed-query retention, parser/scheduler deadlines,
-remove/add failure retries, CP-phase injection, slow-peer confirmation, and
-constrained-SA peer interoperability remain owning-component or specialized
-acceptance cases; the integration suite does not claim coverage from fake
-helpers or unit tests. Stable peer SCI and coherent per-CA key-server election
-are hitless prerequisites, not guarantees for unsupported combinations.
+CP-phase injection, slow-peer confirmation, and constrained-SA peer
+interoperability also remain owning-component or specialized acceptance cases;
+the integration suite does not claim coverage from fake helpers or unit tests.
+Stable peer SCI and coherent per-CA key-server election are hitless
+prerequisites, not guarantees for unsupported combinations.
 The current source has no fresh physical/VS verdict; older-revision passes do
 not validate these assertions.
 
