@@ -3,6 +3,7 @@ import json
 import math
 import re
 import logging
+import shlex
 from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
@@ -269,20 +270,6 @@ def get_macsec_profile_config(host, interface, profile_name):
         "MACSEC_PROFILE|{}".format(profile_name))
 
 
-def get_macsec_appl_port_state(host, interface):
-    """Read the namespace-local controlled-port APPL_DB row."""
-    return _read_hash(
-        host, get_namespace_option(host, interface), "APPL_DB",
-        "{}:{}".format(MACSEC_PORT_TABLE, interface))
-
-
-def get_macsec_controlled_port_state(host, interface):
-    """Read the namespace-local operational port status without masking DB errors."""
-    return _read_hash(
-        host, get_namespace_option(host, interface), "STATE_DB",
-        "{}|{}".format(MACSEC_PORT_TABLE, interface))
-
-
 def get_mka_state(host, interface):
     """Return the MKA session row and participant rows for *interface*."""
     namespace_option = get_namespace_option(host, interface)
@@ -362,69 +349,157 @@ def _get_macsec_sc_state(host, interface, sc_table, sa_table):
     return entries
 
 
-def get_macsec_egress_sc_state(host, interface):
-    """Enumerate actual egress SC/SAs for a namespace-local MACsec port."""
-    return _get_macsec_sc_state(
-        host, interface, MACSEC_EGRESS_SC_TABLE, MACSEC_EGRESS_SA_TABLE)
-
-
 def get_macsec_ingress_sc_state(host, interface):
     """Enumerate actual ingress SC/SAs for a namespace-local MACsec port."""
     return _get_macsec_sc_state(
         host, interface, MACSEC_INGRESS_SC_TABLE, MACSEC_INGRESS_SA_TABLE)
 
 
-def get_macsec_link_sc_state(host, interface):
-    """Read both directions' observed SC/SA keys in one namespace-local scan."""
-    namespace_option = get_namespace_option(host, interface)
-    result = host.command(
-        "sonic-db-cli {} APPL_DB KEYS 'MACSEC_*_TABLE:{}:*'".format(
-            namespace_option, interface),
-        module_ignore_errors=True, verbose=False)
-    if result.get("failed") or result.get("rc", 0) != 0:
-        raise RuntimeError(
-            "Unable to enumerate APPL_DB MACsec SC/SA keys for {}".format(
-                interface))
-    prefixes = {
-        "egress": (
-            "{}:{}:".format(MACSEC_EGRESS_SC_TABLE, interface),
-            "{}:{}:".format(MACSEC_EGRESS_SA_TABLE, interface)),
-        "ingress": (
-            "{}:{}:".format(MACSEC_INGRESS_SC_TABLE, interface),
-            "{}:{}:".format(MACSEC_INGRESS_SA_TABLE, interface)),
+_SNAPSHOT_SCRIPT = """
+import json
+import sys
+from swsscommon.swsscommon import SonicV2Connector
+
+ports, profile = json.loads(sys.argv[1])
+rows = {}
+connectors = {}
+for port, namespace in ports:
+    if namespace not in connectors:
+        connector = SonicV2Connector(
+            use_unix_socket_path=True, namespace=namespace)
+        for database in ("STATE_DB", "APPL_DB", "CONFIG_DB"):
+            connector.connect(getattr(connector, database))
+        connectors[namespace] = connector
+    connector = connectors[namespace]
+
+    def query(db, key):
+        try:
+            value = connector.get_all(getattr(connector, db), key)
+        except Exception as error:
+            raise RuntimeError(
+                "{} HGETALL failed on {} ({})".format(db, port, namespace)) from error
+        if value is not None and not isinstance(value, dict):
+            raise ValueError("{} HGETALL returned invalid data on {}".format(db, port))
+        return json.dumps(value or {})
+
+    def keys(db, pattern):
+        try:
+            value = connector.keys(getattr(connector, db), pattern)
+        except Exception as error:
+            raise RuntimeError(
+                "{} KEYS failed on {} ({})".format(db, port, namespace)) from error
+        if value is not None and not isinstance(value, (list, tuple)):
+            raise ValueError("{} KEYS returned invalid data on {}".format(db, port))
+        return value or []
+
+    participant_prefix = "MACSEC_MKA_PARTICIPANT_TABLE|{}|".format(port)
+    participants = {}
+    for key in keys("STATE_DB", participant_prefix + "*"):
+        if not key.startswith(participant_prefix) or key in participants:
+            raise ValueError("Unexpected participant key on {}".format(port))
+        participants[key] = query("STATE_DB", key)
+
+    appl = {}
+    for key in keys("APPL_DB", "MACSEC_*_TABLE:{}:*".format(port)):
+        if key in appl:
+            raise ValueError("Duplicate MACsec APPL_DB key on {}".format(port))
+        appl[key] = query("APPL_DB", key)
+
+    rows[port] = {
+        "session": query("STATE_DB",
+                         "MACSEC_MKA_SESSION_TABLE|{}".format(port)),
+        "participants": participants,
+        "profile": query("CONFIG_DB",
+                         "MACSEC_PROFILE|{}".format(profile)),
+        "appl_port": query("APPL_DB",
+                           "MACSEC_PORT_TABLE:{}".format(port)),
+        "appl": appl,
     }
-    entries = {"egress": {}, "ingress": {}}
-    for key in result.get("stdout_lines", []):
-        key = key.strip()
-        if not key:
-            continue
-        for direction, (sc_prefix, sa_prefix) in prefixes.items():
-            if key.startswith(sc_prefix):
-                sci = key[len(sc_prefix):]
-                entry = entries[direction].setdefault(
-                    sci, {"key": key, "sci": sci, "sc": {}, "sas": {}})
-                if entry["sc"]:
-                    raise ValueError("Duplicate MACsec SC for {}".format(interface))
-                entry["sc"] = _read_hash(host, namespace_option, "APPL_DB", key)
-                break
-            if key.startswith(sa_prefix):
-                sci, separator, an_text = key[len(sa_prefix):].rpartition(":")
-                if not separator:
-                    raise ValueError("Malformed MACsec SA key for {}".format(interface))
-                an = int(an_text)
-                entry = entries[direction].setdefault(
-                    sci, {"key": sc_prefix + sci, "sci": sci, "sc": {}, "sas": {}})
-                if an in entry["sas"]:
-                    raise ValueError("Duplicate MACsec SA for {}".format(interface))
-                entry["sas"][an] = _read_hash(
-                    host, namespace_option, "APPL_DB", key)
-                break
-        else:
-            raise ValueError("Unexpected MACsec APPL_DB key for {}".format(interface))
-    return (
-        list(entries["egress"].values()),
-        list(entries["ingress"].values()),
-    )
+print(json.dumps(rows))
+"""
+
+
+def get_macsec_snapshot_rows(host, ports, profile_name):
+    """Collect namespace-local MACsec rows in one serialized host invocation."""
+    ports = tuple(ports)
+    if not ports:
+        return {}
+    specifications = [
+        (port, get_namespace_option(host, port).split()[-1]
+         if host.is_multi_asic else "")
+        for port in ports
+    ]
+    command = "python3 -c {} {}".format(
+        shlex.quote(_SNAPSHOT_SCRIPT),
+        shlex.quote(json.dumps((specifications, profile_name))))
+    result = host.command(
+        command, module_ignore_errors=True, verbose=False)
+    if result.get("failed") or result.get("rc", 0) != 0:
+        detail = result.get("stderr", "").strip().splitlines()
+        raise RuntimeError(
+            "Unable to collect MACsec snapshot rows for {}: {}".format(
+                ports, detail[-1] if detail else "remote command failed"))
+    try:
+        raw = json.loads(result["stdout"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("Malformed MACsec snapshot response") from error
+    if not isinstance(raw, dict) or set(raw) != set(ports):
+        raise ValueError("MACsec snapshot response is missing ports")
+
+    parsed = {}
+    for port in ports:
+        row = raw[port]
+        participants = {}
+        participant_prefix = "{}|{}|".format(MKA_PARTICIPANT_TABLE, port)
+        for key, value in row["participants"].items():
+            if not key.startswith(participant_prefix):
+                raise ValueError("Unexpected participant key on {}".format(port))
+            ckn = key[len(participant_prefix):].lower()
+            if not ckn or ckn in participants:
+                raise ValueError("Duplicate or empty participant CKN on {}".format(port))
+            participants[ckn] = parse_db_hash(value)
+
+        entries = {"egress": {}, "ingress": {}}
+        prefixes = {
+            "egress": (
+                "{}:{}:".format(MACSEC_EGRESS_SC_TABLE, port),
+                "{}:{}:".format(MACSEC_EGRESS_SA_TABLE, port)),
+            "ingress": (
+                "{}:{}:".format(MACSEC_INGRESS_SC_TABLE, port),
+                "{}:{}:".format(MACSEC_INGRESS_SA_TABLE, port)),
+        }
+        for key, value in row["appl"].items():
+            for direction, (sc_prefix, sa_prefix) in prefixes.items():
+                if key.startswith(sc_prefix):
+                    sci = key[len(sc_prefix):]
+                    entry = entries[direction].setdefault(
+                        sci, {"key": key, "sci": sci, "sc": {}, "sas": {}})
+                    if entry["sc"]:
+                        raise ValueError("Duplicate MACsec SC on {}".format(port))
+                    entry["sc"] = parse_db_hash(value)
+                    break
+                if key.startswith(sa_prefix):
+                    sci, separator, an_text = key[len(sa_prefix):].rpartition(":")
+                    if not separator:
+                        raise ValueError("Malformed MACsec SA key on {}".format(port))
+                    an = int(an_text)
+                    entry = entries[direction].setdefault(
+                        sci, {"key": sc_prefix + sci, "sci": sci, "sc": {}, "sas": {}})
+                    if an in entry["sas"]:
+                        raise ValueError("Duplicate MACsec SA on {}".format(port))
+                    entry["sas"][an] = parse_db_hash(value)
+                    break
+            else:
+                raise ValueError("Unexpected MACsec APPL_DB key on {}".format(port))
+        parsed[port] = {
+            "session": parse_db_hash(row["session"]),
+            "participants": participants,
+            "profile": parse_db_hash(row["profile"]),
+            "appl_port": parse_db_hash(row["appl_port"]),
+            "egress": list(entries["egress"].values()),
+            "ingress": list(entries["ingress"].values()),
+        }
+    return parsed
 
 
 def validate_point_to_point_ingress_sc(entries):

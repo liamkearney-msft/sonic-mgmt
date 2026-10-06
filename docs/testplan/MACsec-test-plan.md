@@ -376,6 +376,9 @@ failsafe are combined with publication/convergence evidence, rather than
 closing the window as soon as a principal row appears. Standby rotation with
 periodic rekey disabled must leave the active SAK unchanged. These are sampled
 endpoint traffic checks, not an independent line-rate packet-generator result.
+At shutdown each ping is allowed a short post-exit log flush before its summary
+is read; only an in-flight final probe beyond the pre-stop reply boundary is
+excluded. Any missing sequence inside the measured window remains a failure.
 
 cEOS supports delete-only key injection; that scenario is not exposed by the
 supported SONiC configuration API. Crossed-role peer-key-server coverage
@@ -395,10 +398,14 @@ actual namespace-local APPL_DB keys; they do not query a routed cEOS port's MAC
 read-only participant, configured CKN, and controlled-port status; it does not
 claim cEOS-side SC/SA or packet-counter snapshots. DUT receive/transmit SAK
 agreement, old-SA retirement, and exact bidirectional endpoint traffic remain
-mandatory. A namespace-local SC/SA key scan avoids per-AN empty-row probes,
-and at most 16 bounded observation workers check distinct links under one
-protocol/publication deadline instead of resetting the timeout for each link.
-Read errors propagate; missing or extra SC/SA rows cannot count as healthy.
+mandatory. A serialized, read-only DUT command gathers namespace-local MKA
+and SC/SA rows for all affected links in one observation, rather than
+dispatching overlapping Ansible connections against a shared host. The
+protocol/publication deadline is shared across links instead of resetting
+per link. Read errors propagate; missing or extra SC/SA rows cannot count as
+healthy. SONiC's `MACSEC_PORT_TABLE.state=ok` records port creation, not
+authenticated Controlled Port status; blocked-state verdicts use MKA state,
+APPL_DB enable, actual SA teardown, and traffic instead.
 Desired CONFIG_DB is not rolled back by runtime failure: a healthy old applied
 participant can remain degraded/pending until fresh safe conditions allow
 reconciliation. The multi-port case verifies this separately from normal

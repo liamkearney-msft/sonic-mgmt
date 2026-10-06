@@ -1,5 +1,6 @@
 import hashlib
 from dataclasses import dataclass
+from typing import Optional
 
 from tests.common.devices.eos import EosHost
 from tests.common.macsec.macsec_config_helper import (
@@ -12,11 +13,7 @@ from tests.common.macsec.macsec_config_helper import (
     update_macsec_profile_key,
 )
 from tests.common.macsec.mka_state_helper import (
-    get_macsec_appl_port_state,
-    get_macsec_controlled_port_state,
-    get_macsec_link_sc_state,
-    get_macsec_profile_config,
-    get_mka_state,
+    get_macsec_snapshot_rows,
     get_namespace_option,
     parse_eos_mka_participants,
     parse_eos_profile_ckns,
@@ -37,7 +34,7 @@ class LinkSnapshot:
     egress_sc: dict
     egress_sas: dict
     ingress_scs: list
-    controlled_port: bool
+    controlled_port: Optional[bool]
     controlled_port_authoritative: bool
     egress_sc_count: int = 1
 
@@ -206,17 +203,17 @@ class LinkSnapshot:
         }
 
 
-def read_link_snapshot(duthost, port, profile_name):
-    session, participants = get_mka_state(duthost, port)
-    egress_scs, ingress_scs = get_macsec_link_sc_state(duthost, port)
+def read_link_snapshot(duthost, port, profile_name, rows=None):
+    if rows is None:
+        rows = get_macsec_snapshot_rows(duthost, (port,), profile_name)[port]
+    egress_scs, ingress_scs = rows["egress"], rows["ingress"]
     return LinkSnapshot(
         port=port,
         profile_name=profile_name,
-        profile_config=get_macsec_profile_config(
-            duthost, port, profile_name),
-        session=session,
-        participants=participants,
-        appl_port=get_macsec_appl_port_state(duthost, port),
+        profile_config=rows["profile"],
+        session=rows["session"],
+        participants=rows["participants"],
+        appl_port=rows["appl_port"],
         egress_sc=egress_scs[0]["sc"] if len(egress_scs) == 1 else {},
         egress_sas=(
             egress_scs[0]["sas"] if len(egress_scs) == 1 else {
@@ -224,9 +221,8 @@ def read_link_snapshot(duthost, port, profile_name):
                 for entry in egress_scs for an, sa in entry["sas"].items()
             }),
         ingress_scs=ingress_scs,
-        controlled_port=get_macsec_controlled_port_state(
-            duthost, port).get("state") == "ok",
-        controlled_port_authoritative=True,
+        controlled_port=None,
+        controlled_port_authoritative=False,
         egress_sc_count=len(egress_scs),
     )
 

@@ -2,7 +2,6 @@ import json
 import logging
 import re
 import time
-from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
 
 import pytest
@@ -17,6 +16,7 @@ from tests.common.macsec.fallback_cak_helper import (
     peer_adapters,
     read_link_snapshot,
 )
+from tests.common.macsec.mka_state_helper import get_macsec_snapshot_rows
 from tests.common.macsec.macsec_config_helper import (
     delete_macsec_profile,
     disable_macsec_port,
@@ -120,9 +120,14 @@ def _snapshot(environment, port):
 
 def _snapshots(environment, ports):
     ports = tuple(ports)
-    with ThreadPoolExecutor(max_workers=min(16, len(ports))) as pool:
-        return dict(zip(ports, pool.map(
-            lambda port: _snapshot(environment, port), ports)))
+    rows = get_macsec_snapshot_rows(
+        environment["duthost"], ports, environment["profile"]["name"])
+    return {
+        port: read_link_snapshot(
+            environment["duthost"], port,
+            environment["profile"]["name"], rows=rows[port])
+        for port in ports
+    }
 
 
 def _wait_link_protected(
@@ -148,19 +153,17 @@ def _wait_environment(
     deadline = time.monotonic() + timeout
     errors = {}
     ports = tuple(environment["links"])
-    with ThreadPoolExecutor(max_workers=min(16, len(ports))) as pool:
-        while time.monotonic() < deadline:
-            snapshots = pool.map(
-                lambda port: _snapshot(environment, port), ports)
-            errors = {
-                port: problems
-                for port, snapshot in zip(ports, snapshots)
-                if (problems := snapshot.protected_errors(
-                    environment["profile"], principal_ckn))
-            }
-            if not errors and time.monotonic() < deadline:
-                return
-            time.sleep(min(2, max(0, deadline - time.monotonic())))
+    while time.monotonic() < deadline:
+        snapshots = _snapshots(environment, ports)
+        errors = {
+            port: problems
+            for port, snapshot in snapshots.items()
+            if (problems := snapshot.protected_errors(
+                environment["profile"], principal_ckn))
+        }
+        if not errors and time.monotonic() < deadline:
+            return
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
     raise AssertionError("MACsec environment did not recover: {}".format(errors))
 
 
@@ -199,8 +202,7 @@ def _wait_rotations_settled(
                 problems.append("DUT MKA publication did not advance")
         return problems
 
-    def _observe(port):
-        snapshot = _snapshot(environment, port)
+    def _observe(port, snapshot):
         problems = _problems(port, snapshot)
         now = time.monotonic()
         key = snapshot.active_key_identity()
@@ -209,36 +211,56 @@ def _wait_rotations_settled(
             not problems and now - started >= settle[port]
             and previous is not None and previous[0] == key
             and now - previous[1] >= hello[port])
-        if settled and check_peers:
-            adapter = peer_adapter(environment, port)
-            problems.extend(adapter.protected_errors(
-                environment["peer_profiles"][port], principal_ckn,
-                require_all_live=require_all_live))
-            if published and port in published["peers"] and not problems:
-                if parse_mka_timestamp(adapter.publication_marker()) <= parse_mka_timestamp(
-                        published["peers"][port]):
-                    problems.append("peer MKA publication did not advance")
         return port, key, now, problems, settled
 
-    with ThreadPoolExecutor(max_workers=min(16, len(before))) as pool:
-        while time.monotonic() < deadline:
-            observations = pool.map(_observe, before)
-            errors = {}
-            ready = 0
-            for port, key, observed_at, problems, settled in observations:
-                if problems or observed_at - started < settle[port]:
-                    stable.pop(port, None)
-                    errors[port] = problems
+    while time.monotonic() < deadline:
+        snapshots = _snapshots(environment, before)
+        errors = {}
+        ready = 0
+        for port, snapshot in snapshots.items():
+            port, key, observed_at, problems, settled = _observe(port, snapshot)
+            if problems or observed_at - started < settle[port]:
+                stable.pop(port, None)
+                errors[port] = problems
+                continue
+            if port not in stable or stable[port][0] != key:
+                stable[port] = key, observed_at
+            if settled:
+                ready += 1
+            else:
+                errors[port] = ["SAK/participant settle interval pending"]
+        if ready == len(before) and time.monotonic() < deadline:
+            if check_peers:
+                for port in before:
+                    if time.monotonic() >= deadline:
+                        errors[port] = ["peer confirmation deadline elapsed"]
+                        continue
+                    adapter = peer_adapter(environment, port)
+                    problems = adapter.protected_errors(
+                        environment["peer_profiles"][port], principal_ckn,
+                        require_all_live=require_all_live)
+                    if published and port in published["peers"] and not problems:
+                        if parse_mka_timestamp(adapter.publication_marker()) <= parse_mka_timestamp(
+                                published["peers"][port]):
+                            problems.append("peer MKA publication did not advance")
+                    if problems:
+                        errors[port] = problems
+                if errors:
+                    time.sleep(min(1, max(0, deadline - time.monotonic())))
                     continue
-                if port not in stable or stable[port][0] != key:
-                    stable[port] = key, observed_at
-                if settled:
-                    ready += 1
-                else:
-                    errors[port] = ["SAK/participant settle interval pending"]
-            if ready == len(before) and time.monotonic() < deadline:
-                return
-            time.sleep(min(1, max(0, deadline - time.monotonic())))
+            if time.monotonic() < deadline:
+                final = _snapshots(environment, before)
+                errors = {}
+                for port, snapshot in final.items():
+                    problems = _problems(port, snapshot)
+                    if snapshot.active_key_identity() != stable[port][0]:
+                        problems.append("encoding SAK changed before final validation")
+                    if problems:
+                        stable.pop(port, None)
+                        errors[port] = problems
+                if not errors and time.monotonic() < deadline:
+                    return
+        time.sleep(min(1, max(0, deadline - time.monotonic())))
     assert False, "Rollover did not distribute/converge/retire on {}: {}".format(
         sorted(errors), errors)
 
@@ -252,12 +274,8 @@ def _capture_environment_last_updated(
         },
         "peers": {},
     }
-    peer_ports = tuple(peer_ports)
-    with ThreadPoolExecutor(max_workers=min(16, len(peer_ports) or 1)) as pool:
-        markers = list(pool.map(
-            lambda port: peer_adapter(environment, port).publication_marker(),
-            peer_ports))
-    for port, marker in zip(peer_ports, markers):
+    for port in peer_ports:
+        marker = peer_adapter(environment, port).publication_marker()
         if marker is not None:
             snapshots["peers"][port] = marker
     return snapshots
@@ -265,30 +283,31 @@ def _capture_environment_last_updated(
 
 def _restored_environment_published(
         environment, snapshots, principal_ckn):
-    def _ready(port):
-        dut_snapshot = _snapshot(environment, port)
+    observed = _snapshots(environment, environment["links"])
+    results = []
+    for port, dut_snapshot in observed.items():
         if (
                 port in snapshots["dut"]
                 and parse_mka_timestamp(dut_snapshot.session["last_updated"])
                 <= parse_mka_timestamp(snapshots["dut"][port])):
-            return False
+            results.append(False)
+            continue
         if dut_snapshot.protected_errors(
                 environment["profile"], principal_ckn):
-            return False
+            results.append(False)
+            continue
         adapter = peer_adapter(environment, port)
         if (
                 port in snapshots["peers"]
                 and parse_mka_timestamp(adapter.publication_marker())
                 <= parse_mka_timestamp(snapshots["peers"][port])):
-            return False
+            results.append(False)
+            continue
         if adapter.protected_errors(
                 environment["peer_profiles"][port], principal_ckn):
-            return False
-        return True
-
-    with ThreadPoolExecutor(
-            max_workers=min(16, len(environment["links"]))) as pool:
-        results = list(pool.map(_ready, environment["links"]))
+            results.append(False)
+            continue
+        results.append(True)
     return all(results)
 
 
@@ -887,17 +906,20 @@ def _stop_ping(ping, assert_loss=True):
             "sudo kill -TERM {}".format(ping["pid"]),
             module_ignore_errors=True,
         )
+    else:
+        time.sleep(0.3)
 
-    try:
+    output = _read_ping_output(ping)
+    summary = _parse_ping_output(output)["summary"]
+    for _ in range(10):
+        if summary:
+            break
+        time.sleep(0.2)
         output = _read_ping_output(ping)
-    finally:
-        ping["host"].shell(
-            "rm -f {}".format(ping["path"]),
-            module_ignore_errors=True,
-        )
-
-    parsed = _parse_ping_output(output)
-    summary = parsed["summary"]
+        summary = _parse_ping_output(output)["summary"]
+    assert summary, "Unable to parse ping summary:\n{}".format(output)
+    ping["host"].shell(
+        "rm -f {}".format(ping["path"]), module_ignore_errors=True)
     assert was_running, (
         "Continuous ping exited before the observation window closed: {}"
     ).format(ping)
@@ -914,8 +936,6 @@ def _stop_ping(ping, assert_loss=True):
     ).format(ping)
     assert exited, "Continuous ping did not exit after SIGINT: {}".format(
         ping)
-    assert summary, "Unable to parse ping summary:\n{}".format(output)
-
     observation = _ping_observation_result(pre_stop_output, output)
     if assert_loss:
         assert not observation["errors"], (
