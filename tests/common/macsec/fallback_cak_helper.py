@@ -11,9 +11,10 @@ from tests.common.macsec.macsec_config_helper import (
     set_macsec_profile,
     update_macsec_profile_key,
 )
-from tests.common.macsec.macsec_helper import get_appl_db
 from tests.common.macsec.mka_state_helper import (
-    get_macsec_ingress_sc_state,
+    get_macsec_appl_port_state,
+    get_macsec_controlled_port_state,
+    get_macsec_link_sc_state,
     get_macsec_profile_config,
     get_mka_state,
     get_namespace_option,
@@ -38,6 +39,7 @@ class LinkSnapshot:
     ingress_scs: list
     controlled_port: bool
     controlled_port_authoritative: bool
+    egress_sc_count: int = 1
 
     def principal_ckns(self):
         return sorted(
@@ -55,6 +57,9 @@ class LinkSnapshot:
         )
         if self.appl_port.get("enable") != "true":
             errors.append("APPL_DB controlled port is not enabled")
+        if self.egress_sc_count != 1:
+            errors.append("expected one egress SC, found {}".format(
+                self.egress_sc_count))
         if not self.egress_sc:
             errors.append("egress SC is missing")
         else:
@@ -183,6 +188,7 @@ class LinkSnapshot:
             "participants": self.participants,
             "appl_port": self.appl_port,
             "egress_encoding_an": self.egress_sc.get("encoding_an"),
+            "egress_sc_count": self.egress_sc_count,
             "egress_ans": sorted(self.egress_sas),
             "ingress": [
                 {
@@ -200,10 +206,9 @@ class LinkSnapshot:
         }
 
 
-def read_link_snapshot(duthost, port, neighbor, profile_name):
+def read_link_snapshot(duthost, port, profile_name):
     session, participants = get_mka_state(duthost, port)
-    appl_port, egress_sc, _, egress_sas, _ = get_appl_db(
-        duthost, port, neighbor["host"], neighbor["port"])
+    egress_scs, ingress_scs = get_macsec_link_sc_state(duthost, port)
     return LinkSnapshot(
         port=port,
         profile_name=profile_name,
@@ -211,12 +216,18 @@ def read_link_snapshot(duthost, port, neighbor, profile_name):
             duthost, port, profile_name),
         session=session,
         participants=participants,
-        appl_port=appl_port,
-        egress_sc=egress_sc,
-        egress_sas=egress_sas,
-        ingress_scs=get_macsec_ingress_sc_state(duthost, port),
-        controlled_port=duthost.iface_macsec_ok(port),
-        controlled_port_authoritative=False,
+        appl_port=get_macsec_appl_port_state(duthost, port),
+        egress_sc=egress_scs[0]["sc"] if len(egress_scs) == 1 else {},
+        egress_sas=(
+            egress_scs[0]["sas"] if len(egress_scs) == 1 else {
+                (entry["sci"], an): sa
+                for entry in egress_scs for an, sa in entry["sas"].items()
+            }),
+        ingress_scs=ingress_scs,
+        controlled_port=get_macsec_controlled_port_state(
+            duthost, port).get("state") == "ok",
+        controlled_port_authoritative=True,
+        egress_sc_count=len(egress_scs),
     )
 
 
@@ -367,14 +378,7 @@ class PeerAdapter:
     def snapshot(self, profile=None):
         profile_name = self.environment["neighbor_profiles"][self.port]
         return read_link_snapshot(
-            self.host,
-            self.peer_port,
-            {
-                "host": self.environment["duthost"],
-                "port": self.port,
-            },
-            profile_name,
-        )
+            self.host, self.peer_port, profile_name)
 
     def normalized_state(self):
         snapshot = self.snapshot()

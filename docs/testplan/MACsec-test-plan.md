@@ -389,6 +389,16 @@ The suite checks the MKA CLI only for command availability to select supported
 images; it intentionally does not assert `show macsec --mka` compact/detail
 output fields or formatting. Protocol and rollover verdicts come from
 namespace-local STATE_DB, configured profiles, installed SAs, and traffic.
+Fallback link snapshots enumerate SONiC ingress and egress SC/SA rows by their
+actual namespace-local APPL_DB keys; they do not query a routed cEOS port's MAC
+(which would toggle its interface mode). On cEOS peers the suite checks
+read-only participant, configured CKN, and controlled-port status; it does not
+claim cEOS-side SC/SA or packet-counter snapshots. DUT receive/transmit SAK
+agreement, old-SA retirement, and exact bidirectional endpoint traffic remain
+mandatory. A namespace-local SC/SA key scan avoids per-AN empty-row probes,
+and at most 16 bounded observation workers check distinct links under one
+protocol/publication deadline instead of resetting the timeout for each link.
+Read errors propagate; missing or extra SC/SA rows cannot count as healthy.
 Desired CONFIG_DB is not rolled back by runtime failure: a healthy old applied
 participant can remain degraded/pending until fresh safe conditions allow
 reconciliation. The multi-port case verifies this separately from normal

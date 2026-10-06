@@ -2,6 +2,7 @@ import json
 import logging
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AbstractContextManager, contextmanager
 
 import pytest
@@ -113,9 +114,15 @@ def _snapshot(environment, port):
     return read_link_snapshot(
         environment["duthost"],
         port,
-        environment["links"][port],
         environment["profile"]["name"],
     )
+
+
+def _snapshots(environment, ports):
+    ports = tuple(ports)
+    with ThreadPoolExecutor(max_workers=min(16, len(ports))) as pool:
+        return dict(zip(ports, pool.map(
+            lambda port: _snapshot(environment, port), ports)))
 
 
 def _wait_link_protected(
@@ -138,52 +145,119 @@ def _wait_link_protected(
 
 def _wait_environment(
         environment, principal_ckn, timeout=MKA_STATE_PUBLISH_TIMEOUT):
-    for port in environment["links"]:
-        _wait_link_protected(
-            environment, port, principal_ckn, timeout=timeout)
+    deadline = time.monotonic() + timeout
+    errors = {}
+    ports = tuple(environment["links"])
+    with ThreadPoolExecutor(max_workers=min(16, len(ports))) as pool:
+        while time.monotonic() < deadline:
+            snapshots = pool.map(
+                lambda port: _snapshot(environment, port), ports)
+            errors = {
+                port: problems
+                for port, snapshot in zip(ports, snapshots)
+                if (problems := snapshot.protected_errors(
+                    environment["profile"], principal_ckn))
+            }
+            if not errors and time.monotonic() < deadline:
+                return
+            time.sleep(min(2, max(0, deadline - time.monotonic())))
+    raise AssertionError("MACsec environment did not recover: {}".format(errors))
 
 
 def _wait_rotation_settled(
         environment, port, before, principal_ckn,
         require_rekey=True, require_all_live=True):
-    """Observe the deferred distribution, shared encoding SAK, and retirement."""
-    settle = mka_hello_timeout_seconds(before.session, 3)
-    hello = mka_hello_timeout_seconds(before.session, 1)
-    started = time.monotonic()
-    stable_since = [None]
-    stable_key = [None]
-    errors = [None]
+    _wait_rotations_settled(
+        environment, {port: before}, principal_ckn,
+        require_rekey=require_rekey, require_all_live=require_all_live)
 
-    def _settled():
-        snapshot = _snapshot(environment, port)
-        errors[0] = snapshot.protected_errors(
+
+def _wait_rotations_settled(
+        environment, before, principal_ckn, require_rekey=True,
+        require_all_live=True, check_peers=False, published=None):
+    """Check every affected link under one protocol/publication deadline."""
+    settle = {
+        port: mka_hello_timeout_seconds(snapshot.session, 3)
+        for port, snapshot in before.items()
+    }
+    hello = {
+        port: mka_hello_timeout_seconds(snapshot.session, 1)
+        for port, snapshot in before.items()
+    }
+    started = time.monotonic()
+    deadline = started + max(settle.values()) + SA_RETIRE_TIMEOUT + MKA_STATE_PUBLISH_TIMEOUT
+    stable = {}
+    errors = {}
+
+    def _problems(port, snapshot):
+        problems = snapshot.protected_errors(
             environment["profile"], principal_ckn, require_all_live)
-        errors[0].extend(snapshot.rollover_errors(before, require_rekey))
+        problems.extend(snapshot.rollover_errors(before[port], require_rekey))
+        if published and port in published["dut"]:
+            if parse_mka_timestamp(snapshot.session["last_updated"]) <= parse_mka_timestamp(
+                    published["dut"][port]):
+                problems.append("DUT MKA publication did not advance")
+        return problems
+
+    def _observe(port):
+        snapshot = _snapshot(environment, port)
+        problems = _problems(port, snapshot)
         now = time.monotonic()
         key = snapshot.active_key_identity()
-        if errors[0] or now - started < settle:
-            stable_since[0] = None
-            return False
-        if key != stable_key[0] or stable_since[0] is None:
-            stable_key[0] = key
-            stable_since[0] = now
-        return now - stable_since[0] >= hello
+        previous = stable.get(port)
+        settled = (
+            not problems and now - started >= settle[port]
+            and previous is not None and previous[0] == key
+            and now - previous[1] >= hello[port])
+        if settled and check_peers:
+            adapter = peer_adapter(environment, port)
+            problems.extend(adapter.protected_errors(
+                environment["peer_profiles"][port], principal_ckn,
+                require_all_live=require_all_live))
+            if published and port in published["peers"] and not problems:
+                if parse_mka_timestamp(adapter.publication_marker()) <= parse_mka_timestamp(
+                        published["peers"][port]):
+                    problems.append("peer MKA publication did not advance")
+        return port, key, now, problems, settled
 
-    assert wait_until(
-        settle + SA_RETIRE_TIMEOUT + MKA_STATE_PUBLISH_TIMEOUT,
-        1, 0, _settled,
-    ), "Rollover on {} did not distribute/converge/retire: {}".format(port, errors[0])
+    with ThreadPoolExecutor(max_workers=min(16, len(before))) as pool:
+        while time.monotonic() < deadline:
+            observations = pool.map(_observe, before)
+            errors = {}
+            ready = 0
+            for port, key, observed_at, problems, settled in observations:
+                if problems or observed_at - started < settle[port]:
+                    stable.pop(port, None)
+                    errors[port] = problems
+                    continue
+                if port not in stable or stable[port][0] != key:
+                    stable[port] = key, observed_at
+                if settled:
+                    ready += 1
+                else:
+                    errors[port] = ["SAK/participant settle interval pending"]
+            if ready == len(before) and time.monotonic() < deadline:
+                return
+            time.sleep(min(1, max(0, deadline - time.monotonic())))
+    assert False, "Rollover did not distribute/converge/retire on {}: {}".format(
+        sorted(errors), errors)
 
 
 def _capture_environment_last_updated(
-        environment, dut_ports=(), peer_ports=()):
-    snapshots = {"dut": {}, "peers": {}}
-    for port in dut_ports:
-        snapshots["dut"][port] = _snapshot(
-            environment, port).session.get("last_updated")
-    for port in peer_ports:
-        adapter = peer_adapter(environment, port)
-        marker = adapter.publication_marker()
+        environment, before, peer_ports=()):
+    snapshots = {
+        "dut": {
+            port: snapshot.session["last_updated"]
+            for port, snapshot in before.items()
+        },
+        "peers": {},
+    }
+    peer_ports = tuple(peer_ports)
+    with ThreadPoolExecutor(max_workers=min(16, len(peer_ports) or 1)) as pool:
+        markers = list(pool.map(
+            lambda port: peer_adapter(environment, port).publication_marker(),
+            peer_ports))
+    for port, marker in zip(peer_ports, markers):
         if marker is not None:
             snapshots["peers"][port] = marker
     return snapshots
@@ -191,7 +265,7 @@ def _capture_environment_last_updated(
 
 def _restored_environment_published(
         environment, snapshots, principal_ckn):
-    for port in environment["links"]:
+    def _ready(port):
         dut_snapshot = _snapshot(environment, port)
         if (
                 port in snapshots["dut"]
@@ -210,17 +284,24 @@ def _restored_environment_published(
         if adapter.protected_errors(
                 environment["peer_profiles"][port], principal_ckn):
             return False
-    return True
+        return True
+
+    with ThreadPoolExecutor(
+            max_workers=min(16, len(environment["links"]))) as pool:
+        results = list(pool.map(_ready, environment["links"]))
+    return all(results)
 
 
 def _wait_restored_environment_published(
         environment, snapshots, principal_ckn, description):
-    assert wait_until(
-        MKA_STATE_PUBLISH_TIMEOUT, 2, 0,
-        _restored_environment_published,
-        environment, snapshots, principal_ckn,
-    ), "{} did not republish within three status sweeps".format(
-        description)
+    deadline = time.monotonic() + MKA_STATE_PUBLISH_TIMEOUT
+    while time.monotonic() < deadline:
+        if _restored_environment_published(
+                environment, snapshots, principal_ckn):
+            return
+        time.sleep(min(2, max(0, deadline - time.monotonic())))
+    raise AssertionError("{} did not republish within three status sweeps".format(
+        description))
 
 
 def _wait_peer_protected(
@@ -298,11 +379,9 @@ def _restore_rotation(
     before = {}
     errors = []
     try:
-        before = {port: _snapshot(environment, port) for port in environment["links"]}
+        before = _snapshots(environment, environment["links"])
         snapshots = _capture_environment_last_updated(
-            environment,
-            dut_ports=tuple(environment["links"]),
-            peer_ports=tuple(attempted_ports))
+            environment, before, peer_ports=tuple(attempted_ports))
     except BaseException as error:
         errors.append(error)
 
@@ -317,14 +396,13 @@ def _restore_rotation(
     profile["{}_cak".format(role)] = old_pair[0]
     profile["{}_ckn".format(role)] = old_pair[1]
     if role == "primary" and fully_rotated[0] and not errors:
-        for port, snapshot in before.items():
-            try:
-                _wait_rotation_settled(
-                    environment, port, snapshot, profile["fallback_ckn"],
-                    require_all_live=False)
-                before[port] = _snapshot(environment, port)
-            except BaseException as error:
-                errors.append(error)
+        try:
+            _wait_rotations_settled(
+                environment, before, profile["fallback_ckn"],
+                require_all_live=False)
+            before = _snapshots(environment, environment["links"])
+        except BaseException as error:
+            errors.append(error)
 
     for port in attempted_ports:
         restored = peer_originals[port]
@@ -337,15 +415,11 @@ def _restore_rotation(
     if not errors:
         try:
             if fully_rotated[0]:
-                _wait_restored_environment_published(
-                    environment, snapshots,
-                    original_profile["primary_ckn"],
-                    "original {} cleanup".format(role))
-                for port, snapshot in before.items():
-                    _wait_rotation_settled(
-                        environment, port, snapshot, original_profile["primary_ckn"],
-                        require_rekey=True if role == "primary" else (
-                            False if profile["rekey_period"] == 0 else None))
+                _wait_rotations_settled(
+                    environment, before, original_profile["primary_ckn"],
+                    require_rekey=True if role == "primary" else (
+                        False if profile["rekey_period"] == 0 else None),
+                    check_peers=True, published=snapshots)
             else:
                 assert wait_until(
                     MKA_STATE_PUBLISH_TIMEOUT, 2, 0,
@@ -376,7 +450,7 @@ def _rotated_cak(environment, role, new_pair, selected_port):
     original_profile = dict(profile)
     old_pair = (profile["{}_cak".format(role)], profile["{}_ckn".format(role)])
     peer_originals = {port: dict(value) for port, value in environment["peer_profiles"].items()}
-    before = {port: _snapshot(environment, port) for port in environment["links"]}
+    before = _snapshots(environment, environment["links"])
     attempted = []
     completed = [False]
     with FailureSafeCleanup("{} rotation".format(role)) as cleanup:
@@ -388,24 +462,19 @@ def _rotated_cak(environment, role, new_pair, selected_port):
             new_pair[0], new_pair[1], is_fallback=role == "fallback")
         profile["{}_cak".format(role)], profile["{}_ckn".format(role)] = new_pair
         if role == "primary":
-            for port in environment["links"]:
-                _wait_rotation_settled(
-                    environment, port, before[port], profile["fallback_ckn"],
-                    require_all_live=False)
-                before[port] = _snapshot(environment, port)
+            _wait_rotations_settled(
+                environment, before, profile["fallback_ckn"],
+                require_all_live=False)
+            before = _snapshots(environment, environment["links"])
         ports = [selected_port] + [port for port in environment["links"] if port != selected_port]
         for adapter in peer_adapters(environment, ports):
             attempted.append(adapter.port)
             adapter.rotate(role, old_pair, new_pair)
-            for port in adapter.scope_ports:
-                _wait_link_protected(environment, port, profile["primary_ckn"])
-                _wait_peer_protected(
-                    peer_adapter(environment, port), environment["peer_profiles"][port],
-                    profile["primary_ckn"])
-                _wait_rotation_settled(
-                    environment, port, before[port], profile["primary_ckn"],
-                    require_rekey=True if role == "primary" else (
-                        False if profile["rekey_period"] == 0 else None))
+        _wait_rotations_settled(
+            environment, before, profile["primary_ckn"],
+            require_rekey=True if role == "primary" else (
+                False if profile["rekey_period"] == 0 else None),
+            check_peers=True)
         completed[0] = True
         yield
 

@@ -10,6 +10,8 @@ logger = logging.getLogger(__name__)
 MKA_SESSION_TABLE = "MACSEC_MKA_SESSION_TABLE"
 MKA_PARTICIPANT_TABLE = "MACSEC_MKA_PARTICIPANT_TABLE"
 MACSEC_PORT_TABLE = "MACSEC_PORT_TABLE"
+MACSEC_EGRESS_SC_TABLE = "MACSEC_EGRESS_SC_TABLE"
+MACSEC_EGRESS_SA_TABLE = "MACSEC_EGRESS_SA_TABLE"
 MACSEC_INGRESS_SC_TABLE = "MACSEC_INGRESS_SC_TABLE"
 MACSEC_INGRESS_SA_TABLE = "MACSEC_INGRESS_SA_TABLE"
 
@@ -267,6 +269,20 @@ def get_macsec_profile_config(host, interface, profile_name):
         "MACSEC_PROFILE|{}".format(profile_name))
 
 
+def get_macsec_appl_port_state(host, interface):
+    """Read the namespace-local controlled-port APPL_DB row."""
+    return _read_hash(
+        host, get_namespace_option(host, interface), "APPL_DB",
+        "{}:{}".format(MACSEC_PORT_TABLE, interface))
+
+
+def get_macsec_controlled_port_state(host, interface):
+    """Read the namespace-local operational port status without masking DB errors."""
+    return _read_hash(
+        host, get_namespace_option(host, interface), "STATE_DB",
+        "{}|{}".format(MACSEC_PORT_TABLE, interface))
+
+
 def get_mka_state(host, interface):
     """Return the MKA session row and participant rows for *interface*."""
     namespace_option = get_namespace_option(host, interface)
@@ -294,10 +310,10 @@ def get_mka_state(host, interface):
     return session, participants
 
 
-def get_macsec_ingress_sc_state(host, interface):
-    """Enumerate actual ingress SC/SAs for a namespace-local MACsec port."""
+def _get_macsec_sc_state(host, interface, sc_table, sa_table):
+    """Enumerate observed SCs and SAs without inferring a peer MAC or SCI."""
     namespace_option = get_namespace_option(host, interface)
-    pattern = "{}:{}:*".format(MACSEC_INGRESS_SC_TABLE, interface)
+    pattern = "{}:{}:*".format(sc_table, interface)
     result = host.command(
         "sonic-db-cli {} APPL_DB KEYS '{}'".format(
             namespace_option, pattern),
@@ -306,23 +322,37 @@ def get_macsec_ingress_sc_state(host, interface):
     )
     if result.get("failed") or result.get("rc", 0) != 0:
         raise RuntimeError(
-            "Unable to read APPL_DB ingress SC KEYS for {}".format(interface))
+            "Unable to read APPL_DB {} KEYS for {}".format(
+                sc_table, interface))
     keys = result.get("stdout_lines", [])
-    prefix = "{}:{}:".format(MACSEC_INGRESS_SC_TABLE, interface)
+    prefix = "{}:{}:".format(sc_table, interface)
     entries = []
     for key in sorted(key.strip() for key in keys if key.strip()):
         if not key.startswith(prefix):
-            continue
+            raise ValueError("Unexpected APPL_DB SC key for {}".format(interface))
         sci = key[len(prefix):]
         sc = _read_hash(host, namespace_option, "APPL_DB", key)
+        sa_prefix = "{}:{}:{}:".format(sa_table, interface, sci)
+        sa_result = host.command(
+            "sonic-db-cli {} APPL_DB KEYS '{}*'".format(
+                namespace_option, sa_prefix),
+            module_ignore_errors=True, verbose=False)
+        if sa_result.get("failed") or sa_result.get("rc", 0) != 0:
+            raise RuntimeError(
+                "Unable to read APPL_DB {} KEYS for {}".format(
+                    sa_table, interface))
         sas = {}
-        for an in range(4):
-            sa_key = "{}:{}:{}:{}".format(
-                MACSEC_INGRESS_SA_TABLE, interface, sci, an)
-            sa = _read_hash(
+        for sa_key in sa_result.get("stdout_lines", []):
+            sa_key = sa_key.strip()
+            if not sa_key:
+                continue
+            if not sa_key.startswith(sa_prefix):
+                raise ValueError("Unexpected APPL_DB SA key for {}".format(interface))
+            an = int(sa_key[len(sa_prefix):])
+            if an in sas:
+                raise ValueError("Duplicate APPL_DB SA AN for {}".format(interface))
+            sas[an] = _read_hash(
                 host, namespace_option, "APPL_DB", sa_key)
-            if sa:
-                sas[an] = sa
         entries.append({
             "key": key,
             "sci": sci,
@@ -330,6 +360,71 @@ def get_macsec_ingress_sc_state(host, interface):
             "sas": sas,
         })
     return entries
+
+
+def get_macsec_egress_sc_state(host, interface):
+    """Enumerate actual egress SC/SAs for a namespace-local MACsec port."""
+    return _get_macsec_sc_state(
+        host, interface, MACSEC_EGRESS_SC_TABLE, MACSEC_EGRESS_SA_TABLE)
+
+
+def get_macsec_ingress_sc_state(host, interface):
+    """Enumerate actual ingress SC/SAs for a namespace-local MACsec port."""
+    return _get_macsec_sc_state(
+        host, interface, MACSEC_INGRESS_SC_TABLE, MACSEC_INGRESS_SA_TABLE)
+
+
+def get_macsec_link_sc_state(host, interface):
+    """Read both directions' observed SC/SA keys in one namespace-local scan."""
+    namespace_option = get_namespace_option(host, interface)
+    result = host.command(
+        "sonic-db-cli {} APPL_DB KEYS 'MACSEC_*_TABLE:{}:*'".format(
+            namespace_option, interface),
+        module_ignore_errors=True, verbose=False)
+    if result.get("failed") or result.get("rc", 0) != 0:
+        raise RuntimeError(
+            "Unable to enumerate APPL_DB MACsec SC/SA keys for {}".format(
+                interface))
+    prefixes = {
+        "egress": (
+            "{}:{}:".format(MACSEC_EGRESS_SC_TABLE, interface),
+            "{}:{}:".format(MACSEC_EGRESS_SA_TABLE, interface)),
+        "ingress": (
+            "{}:{}:".format(MACSEC_INGRESS_SC_TABLE, interface),
+            "{}:{}:".format(MACSEC_INGRESS_SA_TABLE, interface)),
+    }
+    entries = {"egress": {}, "ingress": {}}
+    for key in result.get("stdout_lines", []):
+        key = key.strip()
+        if not key:
+            continue
+        for direction, (sc_prefix, sa_prefix) in prefixes.items():
+            if key.startswith(sc_prefix):
+                sci = key[len(sc_prefix):]
+                entry = entries[direction].setdefault(
+                    sci, {"key": key, "sci": sci, "sc": {}, "sas": {}})
+                if entry["sc"]:
+                    raise ValueError("Duplicate MACsec SC for {}".format(interface))
+                entry["sc"] = _read_hash(host, namespace_option, "APPL_DB", key)
+                break
+            if key.startswith(sa_prefix):
+                sci, separator, an_text = key[len(sa_prefix):].rpartition(":")
+                if not separator:
+                    raise ValueError("Malformed MACsec SA key for {}".format(interface))
+                an = int(an_text)
+                entry = entries[direction].setdefault(
+                    sci, {"key": sc_prefix + sci, "sci": sci, "sc": {}, "sas": {}})
+                if an in entry["sas"]:
+                    raise ValueError("Duplicate MACsec SA for {}".format(interface))
+                entry["sas"][an] = _read_hash(
+                    host, namespace_option, "APPL_DB", key)
+                break
+        else:
+            raise ValueError("Unexpected MACsec APPL_DB key for {}".format(interface))
+    return (
+        list(entries["egress"].values()),
+        list(entries["ingress"].values()),
+    )
 
 
 def validate_point_to_point_ingress_sc(entries):
@@ -342,6 +437,8 @@ def validate_point_to_point_ingress_sc(entries):
             )
         ]
     entry = entries[0]
+    if not entry.get("sc"):
+        return ["ingress SC {} is missing".format(entry.get("sci"))]
     active_sas = [
         (an, sa) for an, sa in entry.get("sas", {}).items()
         if sa.get("active") == "true"
