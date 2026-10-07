@@ -1172,7 +1172,22 @@ def _probe_transit(endpoint):
         "{} ping -c 3 -I {} {}".format(
             _ping_namespace_prefix(host, port), source, destination),
         module_ignore_errors=True, verbose=False)
-    return not result.get("failed") and result.get("rc", 0) == 0
+    output = "{}\n{}".format(
+        result.get("stdout", ""), result.get("stderr", ""))
+    rc = result.get("rc")
+    if rc == 2 and re.search(r"\bping:.*Network is unreachable", output):
+        return False
+    summary = _parse_ping_output(output)["summary"]
+    if (rc not in (0, 1) or not summary
+            or result.get("stderr", "").strip()
+            or (rc == 0 and result.get("failed"))
+            or summary["transmitted"] != 3
+            or not 0 <= summary["received"] <= 3
+            or (rc == 0 and summary["received"] == 0)
+            or (rc == 1 and summary["received"] == 3)):
+        raise RuntimeError("Transit ping did not return a valid ICMP verdict on {}".format(
+            host.hostname))
+    return summary["received"] > 0
 
 
 def _start_bidirectional_traffic(endpoints):
@@ -2041,9 +2056,6 @@ def test_both_invalid_tears_down_and_matching_profile_recovers(
     profile = environment["profile"]
     port, _ = _select_routed_link(
         environment, upstream_links)
-    assert _selected_link_ping_succeeds(
-        environment, upstream_links, port), (
-            "Neighbor-to-neighbor transit path was not healthy before invalidating both CAKs")
     adapter = peer_adapter(environment, port)
     invalid_primary_cak, invalid_primary_ckn = generate_macsec_key_pair(
         profile["cipher_suite"])
@@ -2051,24 +2063,29 @@ def test_both_invalid_tears_down_and_matching_profile_recovers(
         profile["cipher_suite"])
     original_profile_name = environment["neighbor_profiles"][port]
     original_peer_profile = dict(environment["peer_profiles"][port])
-    temp_profile_name = None
     invalid_primary = (invalid_primary_cak, invalid_primary_ckn)
     invalid_fallback = (invalid_fallback_cak, invalid_fallback_ckn)
-    if adapter.provider == "ceos":
-        with _primary_mismatch(environment, port, invalid_primary):
-            with _ceos_fallback_mismatch(
-                    environment, port, adapter, invalid_fallback):
-                traffic_results = _selected_link_ping_results(
-                    environment, upstream_links, port)
-                assert not any(traffic_results), (
-                    "Traffic still forwarded with both CAKs mismatched: "
-                    "selected_to_other={}, other_to_selected={}"
-                ).format(*traffic_results)
-    else:
-        dut_last_updated = _snapshot(
-            environment, port).session.get("last_updated")
-        peer_last_updated = adapter.publication_marker()
-        try:
+
+    with _transit_path(environment, upstream_links, port) as endpoints:
+        healthy_results = tuple(_probe_transit(endpoint) for endpoint in endpoints)
+        assert all(healthy_results), (
+            "Neighbor-to-neighbor transit path was not healthy before invalidating both CAKs: "
+            "selected_to_other={}, other_to_selected={}".format(*healthy_results))
+
+        if adapter.provider == "ceos":
+            with _primary_mismatch(environment, port, invalid_primary):
+                with _ceos_fallback_mismatch(
+                        environment, port, adapter, invalid_fallback):
+                    traffic_results = tuple(
+                        _probe_transit(endpoint) for endpoint in endpoints)
+                    assert not any(traffic_results), (
+                        "Traffic still forwarded with both CAKs mismatched: "
+                        "selected_to_other={}, other_to_selected={}"
+                    ).format(*traffic_results)
+        else:
+            dut_last_updated = _snapshot(
+                environment, port).session.get("last_updated")
+            peer_last_updated = adapter.publication_marker()
             temp_profile_name = "MKA_BOTH_INVALID_{}".format(
                 adapter.peer_port)
             both_invalid_profile = dict(original_peer_profile)
@@ -2079,37 +2096,51 @@ def test_both_invalid_tears_down_and_matching_profile_recovers(
                 "fallback_cak": invalid_fallback_cak,
                 "fallback_ckn": invalid_fallback_ckn,
             })
-            adapter.create_profile(temp_profile_name, both_invalid_profile)
-            adapter.rebind(temp_profile_name, both_invalid_profile)
 
-            _wait_link_blocked(
-                environment, port,
-                (profile["primary_ckn"], profile["fallback_ckn"]),
-                previous_last_updated=dut_last_updated)
-            _wait_peer_blocked(
-                adapter, (invalid_primary_ckn, invalid_fallback_ckn),
-                previous_last_updated=peer_last_updated)
-            traffic_results = _selected_link_ping_results(
-                environment, upstream_links, port)
-            assert not any(traffic_results), (
-                "Traffic still forwarded with both CAKs mismatched: "
-                "selected_to_other={}, other_to_selected={}"
-            ).format(*traffic_results)
+            def _delete_temporary_profile():
+                attachment = adapter.host.command(
+                    "sonic-db-cli {} CONFIG_DB HGET 'PORT|{}' macsec".format(
+                        adapter.namespace_option, adapter.peer_port),
+                    module_ignore_errors=True, verbose=False)
+                if attachment.get("failed") or attachment.get("rc", 0) != 0:
+                    raise RuntimeError("Unable to verify original peer profile binding")
+                assert attachment.get("stdout", "").strip() == original_profile_name, (
+                    "Peer binding was not restored; retaining temporary MACsec profile")
+                delete_macsec_profile(
+                    adapter.host, temp_profile_name,
+                    namespace_option=adapter.namespace_option)
+                assert not get_macsec_profile_config(
+                    adapter.host, adapter.peer_port, temp_profile_name), (
+                        "Temporary MACsec profile was not removed")
 
-            adapter.rebind(original_profile_name, original_peer_profile)
-            delete_macsec_profile(adapter.host, temp_profile_name)
-            temp_profile_name = None
-        finally:
-            if temp_profile_name:
-                adapter.rebind(
-                    original_profile_name, original_peer_profile)
-                delete_macsec_profile(adapter.host, temp_profile_name)
+            with FailureSafeCleanup("both-invalid peer profile") as cleanup:
+                cleanup.callback(_delete_temporary_profile)
+                adapter.create_profile(temp_profile_name, both_invalid_profile)
+                cleanup.callback(
+                    adapter.rebind, original_profile_name, original_peer_profile)
+                adapter.rebind(temp_profile_name, both_invalid_profile)
 
-    _wait_link_protected(
-        environment, port, profile["primary_ckn"])
-    _wait_peer_protected(
-        adapter, original_peer_profile,
-        original_peer_profile["primary_ckn"])
-    assert _selected_link_ping_succeeds(
-        environment, upstream_links, port), \
-        "Traffic did not recover after restoring a matching profile"
+                _wait_link_blocked(
+                    environment, port,
+                    (profile["primary_ckn"], profile["fallback_ckn"]),
+                    previous_last_updated=dut_last_updated)
+                _wait_peer_blocked(
+                    adapter, (invalid_primary_ckn, invalid_fallback_ckn),
+                    previous_last_updated=peer_last_updated)
+                traffic_results = tuple(
+                    _probe_transit(endpoint) for endpoint in endpoints)
+                assert not any(traffic_results), (
+                    "Traffic still forwarded with both CAKs mismatched: "
+                    "selected_to_other={}, other_to_selected={}"
+                ).format(*traffic_results)
+
+        _wait_link_protected(
+            environment, port, profile["primary_ckn"])
+        _wait_peer_protected(
+            adapter, original_peer_profile,
+            original_peer_profile["primary_ckn"])
+        recovery_results = tuple(_probe_transit(endpoint) for endpoint in endpoints)
+        assert all(recovery_results), (
+            "Neighbor-to-neighbor transit traffic did not recover "
+            "after restoring a matching profile: "
+            "selected_to_other={}, other_to_selected={}".format(*recovery_results))

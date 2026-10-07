@@ -374,6 +374,14 @@ installed only when needed and removed on cleanup. Both neighbor routes and
 the DUT's connected routes are checked against the selected protected ports
 (direct or single-member PortChannels), so a bypass or ECMP path is not accepted.
 Topologies without two such neighbors explicitly skip transit traffic cases.
+The both-invalid case establishes one healthy, pinned transit path before
+changing either CAK and retains its endpoints and owned routes through both
+blocked-direction probes and matching-profile recovery. A blocked MACsec
+session may make a fresh gateway route lookup unreachable; this is not itself
+the traffic verdict. Zero ping replies (or an explicit ping network-unreachable
+error) establish no forwarding; transport, authentication, and invalid ping
+errors fail rather than counting as blocked traffic. The same pinned path must
+forward again after profile restoration, before any test-owned route is removed.
 For primary/fallback profile rotation (including stress/periodic cases),
 prerequisite health, route setup, warm-up, and baseline snapshots happen before
 the loss window. Both continuous transit streams establish a startup reply
