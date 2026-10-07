@@ -360,7 +360,7 @@ SONiC or cEOS peers. Its requirements come from the
 | --- | --- |
 | Primary and fallback healthy | Exact configured/runtime CKNs and roles, protected Controlled Port, one receive SC, encoding SA, and required namespace-local MKA STATE_DB fields including key-server SCI |
 | Primary mismatch/deletion and recovery | Fallback then primary ownership, observed new SAK distribution/reception and transmit encoding key, bidirectional key convergence and old-SA retirement |
-| Primary/fallback hot replacement | One mutation per peer/namespace/profile scope, survivor protection, new participant convergence, and state-aware independent restoration |
+| Primary/fallback hot replacement | One mutation per peer/namespace/profile scope, measured forward survivor protection and new participant/SAK convergence, followed by independently verified restoration outside the loss window |
 | Unsafe alternate with safe sibling | Structurally valid update persists desired CONFIG_DB; unsafe peer-present port retains its original applied participant with `query_status=ok,config_status=degraded` while safe sibling applies the replacement; after the alternate recovers, the pending port converges without a second CLI update |
 | Invalid profile update | Unknown/duplicate/malformed CKN, malformed CAK, and primary-only profile updates are rejected without CONFIG_DB mutation, including an unattached primary-only profile |
 | Both CAs invalid | Blocked Controlled Port, no SAs, failed traffic in both directions, then recovery of a matching profile (cEOS also restores fallback before primary) |
@@ -374,9 +374,17 @@ installed only when needed and removed on cleanup. Both neighbor routes and
 the DUT's connected routes are checked against the selected protected ports
 (direct or single-member PortChannels), so a bypass or ECMP path is not accepted.
 Topologies without two such neighbors explicitly skip transit traffic cases.
-Traffic remains active through promotion,
-the deferred SAK distribution, encoding rollover, old-SA retirement, and key
-restoration. A protocol-derived settle window and the 20-second retirement
+For primary/fallback profile rotation (including stress/periodic cases),
+prerequisite health, route setup, warm-up, and baseline snapshots happen before
+the loss window. Both continuous transit streams establish a startup reply
+boundary before the first key update; only replies after those boundaries
+count toward the strict zero-loss verdict. The window covers all forward DUT
+and peer key changes, affected DUT SAK/SC/SA convergence, and both
+traffic-endpoint peers. It is drained and
+assessed before the serial all-peer audit and original-key restoration. Those
+later steps still must pass functional state checks but are not claimed hitless.
+Other scenarios retain their existing traffic boundaries. A protocol-derived
+settle window and the 20-second retirement
 failsafe are combined with publication/convergence evidence, rather than
 closing the window as soon as a principal row appears. Standby rotation with
 periodic rekey disabled must leave the active SAK unchanged. These are sampled
@@ -414,8 +422,9 @@ APPL_DB enable, actual SA teardown, and traffic instead.
 Once every DUT link settles within that protocol deadline, all affected peers
 are inspected serially under a separate bounded audit (30 seconds plus 15
 seconds per link). A final batched DUT read must still show the expected
-principal, SAK, and retired SC/SA state after the peer audit, while traffic
-remains active through both phases and restoration.
+principal, SAK, and retired SC/SA state after the peer audit. For profile
+rotation this final audit and subsequent recovery are outside the measured
+forward-rotation traffic window.
 Desired CONFIG_DB is not rolled back by runtime failure: a healthy old applied
 participant can remain degraded/pending until fresh safe conditions allow
 reconciliation. The multi-port case verifies this separately from normal

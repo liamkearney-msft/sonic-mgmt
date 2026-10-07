@@ -179,7 +179,8 @@ def _wait_rotation_settled(
 
 def _wait_rotations_settled(
         environment, before, principal_ckn, require_rekey=True,
-        require_all_live=True, check_peers=False, published=None):
+        require_all_live=True, check_peers=False, published=None,
+        on_dut_settled=None):
     """Settle all DUT links, then inspect peers and revalidate the DUT."""
     settle = {
         port: mka_hello_timeout_seconds(snapshot.session, 3)
@@ -238,6 +239,9 @@ def _wait_rotations_settled(
         time.sleep(min(1, max(0, deadline - time.monotonic())))
     assert dut_settled, "DUT rollover did not distribute/converge/retire on {}: {}".format(
         sorted(errors), errors)
+
+    if on_dut_settled is not None:
+        on_dut_settled()
 
     if check_peers:
         peer_deadline = time.monotonic() + 30 + 15 * len(before)
@@ -474,37 +478,57 @@ def _restore_peer_step(environment, port, role, old_profile, new_pair):
 
 
 @contextmanager
-def _rotated_cak(environment, role, new_pair, selected_port):
-    """Replace one role per configuration scope and observe both directions of restoration."""
+def _rotated_cak(environment, role, new_pair, selected_port, upstream_links):
+    """Measure the forward replacement; verify restoration outside traffic."""
     profile = environment["profile"]
     original_profile = dict(profile)
     old_pair = (profile["{}_cak".format(role)], profile["{}_ckn".format(role)])
     peer_originals = {port: dict(value) for port, value in environment["peer_profiles"].items()}
     before = _snapshots(environment, environment["links"])
+    transit_ports = (selected_port, _transit_peer(
+        environment, upstream_links, selected_port))
     attempted = []
     completed = [False]
     with FailureSafeCleanup("{} rotation".format(role)) as cleanup:
         cleanup.callback(
             _restore_rotation, environment, role, original_profile,
             peer_originals, new_pair, attempted, completed)
-        _profile_update(
-            environment["duthost"], profile["name"], old_pair[0], old_pair[1],
-            new_pair[0], new_pair[1], is_fallback=role == "fallback")
-        profile["{}_cak".format(role)], profile["{}_ckn".format(role)] = new_pair
-        if role == "primary":
+        with _TrafficWindow(environment, upstream_links, port=selected_port) as traffic:
+            _profile_update(
+                environment["duthost"], profile["name"], old_pair[0], old_pair[1],
+                new_pair[0], new_pair[1], is_fallback=role == "fallback")
+            profile["{}_cak".format(role)], profile["{}_ckn".format(role)] = new_pair
+            if role == "primary":
+                _wait_rotations_settled(
+                    environment, before, profile["fallback_ckn"],
+                    require_all_live=False)
+                before = _snapshots(environment, environment["links"])
+            ports = [selected_port] + [port for port in environment["links"] if port != selected_port]
+            for adapter in peer_adapters(environment, ports):
+                attempted.append(adapter.port)
+                adapter.rotate(role, old_pair, new_pair)
+            require_rekey = True if role == "primary" else (
+                False if profile["rekey_period"] == 0 else None)
+
+            def _finish_measured_rotation():
+                for port in transit_ports:
+                    _wait_peer_protected(
+                        peer_adapter(environment, port),
+                        environment["peer_profiles"][port],
+                        profile["primary_ckn"])
+                endpoint_snapshots = _snapshots(environment, transit_ports)
+                for port, snapshot in endpoint_snapshots.items():
+                    assert not snapshot.protected_errors(
+                        profile, profile["primary_ckn"]), (
+                            "Transit link {} did not remain protected".format(port))
+                    assert not snapshot.rollover_errors(before[port], require_rekey), (
+                        "Transit link {} did not finish the forward SAK rollover".format(port))
+                traffic.assert_zero_loss()
+
             _wait_rotations_settled(
-                environment, before, profile["fallback_ckn"],
-                require_all_live=False)
-            before = _snapshots(environment, environment["links"])
-        ports = [selected_port] + [port for port in environment["links"] if port != selected_port]
-        for adapter in peer_adapters(environment, ports):
-            attempted.append(adapter.port)
-            adapter.rotate(role, old_pair, new_pair)
-        _wait_rotations_settled(
-            environment, before, profile["primary_ckn"],
-            require_rekey=True if role == "primary" else (
-                False if profile["rekey_period"] == 0 else None),
-            check_peers=True)
+                environment, before, profile["primary_ckn"],
+                require_rekey=require_rekey, check_peers=True,
+                on_dut_settled=_finish_measured_rotation)
         completed[0] = True
         yield
 
@@ -966,8 +990,8 @@ def _parse_ping_output(output):
     }
 
 
-def _ping_observation_result(pre_stop_output, final_output):
-    """Measure loss only through the last reply seen before shutdown."""
+def _ping_observation_result(pre_stop_output, final_output, start_boundary=0):
+    """Measure replies after startup through the last pre-stop reply."""
     pre_stop = _parse_ping_output(pre_stop_output)
     final = _parse_ping_output(final_output)
     received_before_stop = pre_stop["received_sequences"]
@@ -982,12 +1006,12 @@ def _ping_observation_result(pre_stop_output, final_output):
     boundary = max(received_before_stop)
     received_by_exit = final["received_sequences"]
     missing_sequences = sorted(
-        set(range(1, boundary + 1)) - received_by_exit)
+        set(range(start_boundary + 1, boundary + 1)) - received_by_exit)
     errors = []
-    if boundary < 10:
+    if boundary - start_boundary < 10:
         errors.append(
-            "traffic sample ended at sequence {}, expected at least 10"
-            .format(boundary))
+            "traffic sample ended at sequence {} after starting at {}, "
+            "expected at least 10".format(boundary, start_boundary))
     if missing_sequences:
         errors.append(
             "missing ping sequences within observation window")
@@ -1087,23 +1111,26 @@ def _stop_ping(ping, assert_loss=True):
     ).format(ping)
     assert exited, "Continuous ping did not exit after SIGINT: {}".format(
         ping)
-    observation = _ping_observation_result(pre_stop_output, output)
+    start_boundary = ping.get("start_boundary", 0)
+    observation = _ping_observation_result(
+        pre_stop_output, output, start_boundary=start_boundary)
     if assert_loss:
         assert not observation["errors"], (
             "Traffic loss detected during MACsec transition:\n{}\n"
-            "Observation boundary: {}\nMissing ICMP sequences: {}\n"
+            "Observation start/end: {}/{}\nMissing ICMP sequences: {}\n"
             "Final ping summary: {}"
         ).format(
             output,
+            start_boundary,
             observation["boundary"],
             observation["missing_sequences"][:200],
             summary,
         )
     boundary = observation["boundary"]
     return {
-        "transmitted": boundary,
+        "transmitted": boundary - start_boundary if boundary is not None else 0,
         "received": (
-            boundary - len(observation["missing_sequences"])
+            boundary - start_boundary - len(observation["missing_sequences"])
             if boundary is not None else 0),
         "loss_percent": (
             0.0 if boundary and not observation["missing_sequences"]
@@ -1111,6 +1138,7 @@ def _stop_ping(ping, assert_loss=True):
         "summary_transmitted": summary["transmitted"],
         "summary_received": summary["received"],
         "summary_loss_percent": summary["loss_percent"],
+        "observation_start": start_boundary,
         "observation_boundary": boundary,
     }
 
@@ -1155,6 +1183,21 @@ def _start_bidirectional_traffic(endpoints):
         for index, (host, port, source, destination, _, _) in enumerate(endpoints):
             traffic.append(_start_ping(
                 host, port, source, destination, "transit_{}".format(index)))
+
+        for ping in traffic:
+            deadline = time.monotonic() + 15
+            while time.monotonic() < deadline:
+                assert _ping_process_running(ping), (
+                    "Continuous transit ping exited before observation began")
+                received = _parse_ping_output(
+                    _read_ping_output(ping))["received_sequences"]
+                if len(received) >= 10:
+                    ping["start_boundary"] = max(received)
+                    break
+                time.sleep(0.2)
+            else:
+                raise AssertionError(
+                    "Continuous transit ping did not establish a startup baseline")
     except BaseException:
         try:
             cleanup_all(traffic, _abort_partial_ping)
@@ -1450,18 +1493,17 @@ def test_principal_migration_preserves_counters(
         traffic.assert_zero_loss()
 
 
-def test_primary_rotation_and_recovery_are_hitless(
+def test_primary_rotation_is_hitless(
         fallback_macsec_environment, upstream_links):
-    """Rotate the primary CAK through supported config without traffic loss."""
+    """Measure primary replacement without loss, then verify recovery."""
     environment = fallback_macsec_environment
     profile = environment["profile"]
     new_pair = generate_macsec_key_pair(profile["cipher_suite"])
     selected_port, _ = _select_routed_link(environment, upstream_links)
 
-    with _TrafficWindow(environment, upstream_links) as traffic:
-        with _rotated_cak(environment, "primary", new_pair, selected_port):
-            pass
-        traffic.assert_zero_loss()
+    with _rotated_cak(
+            environment, "primary", new_pair, selected_port, upstream_links):
+        pass
 
 
 def test_fallback_rotation_keeps_primary_and_traffic(
@@ -1472,10 +1514,9 @@ def test_fallback_rotation_keeps_primary_and_traffic(
     new_pair = generate_macsec_key_pair(profile["cipher_suite"])
     selected_port, _ = _select_routed_link(environment, upstream_links)
 
-    with _TrafficWindow(environment, upstream_links) as traffic:
-        with _rotated_cak(environment, "fallback", new_pair, selected_port):
-            pass
-        traffic.assert_zero_loss()
+    with _rotated_cak(
+            environment, "fallback", new_pair, selected_port, upstream_links):
+        pass
 
 
 def test_crossed_roles_follow_key_server_primary(
@@ -1559,37 +1600,36 @@ def test_cak_rotation_at_periodic_rekey_boundary(
             _environment_is_healthy, environment,
         ), "MKA did not converge with the short rekey period"
 
-        with _TrafficWindow(environment, upstream_links) as traffic:
-            port, _ = _select_routed_link(environment, upstream_links)
-            before = _snapshot(environment, port).active_key_identity()
-            assert wait_until(
-                90, 2, 0,
-                lambda: _snapshot(
-                    environment, port).active_key_identity() != before,
-            ), "No periodic SAK rekey was observed"
+        port, _ = _select_routed_link(environment, upstream_links)
+        assert _selected_link_ping_succeeds(
+            environment, upstream_links, port), (
+                "Transit path was not healthy before periodic rekey")
+        before = _snapshot(environment, port).active_key_identity()
+        assert wait_until(
+            90, 2, 0,
+            lambda: _snapshot(
+                environment, port).active_key_identity() != before,
+        ), "No periodic SAK rekey was observed"
 
-            with _rotated_cak(environment, "primary", new_pair, port):
-                pass
-            traffic.assert_zero_loss()
+        with _rotated_cak(environment, "primary", new_pair, port, upstream_links):
+            pass
 
 
 @pytest.mark.stress_test
 def test_back_to_back_cak_rotation_stress(
         fallback_macsec_environment, upstream_links):
-    """Alternate bounded replacements and restorations without traffic loss."""
+    """Measure each forward replacement, restoring between rotations."""
     environment = fallback_macsec_environment
     profile = environment["profile"]
     if profile["name"] != FALLBACK_PROFILE:
         pytest.skip("Rotation stress runs only on the static fallback profile")
 
-    with _TrafficWindow(environment, upstream_links) as traffic:
-        port, _ = _select_routed_link(environment, upstream_links)
-        for iteration in range(STRESS_ROTATIONS):
-            role = "fallback" if iteration % 2 else "primary"
-            new_pair = generate_macsec_key_pair(profile["cipher_suite"])
-            with _rotated_cak(environment, role, new_pair, port):
-                pass
-        traffic.assert_zero_loss()
+    port, _ = _select_routed_link(environment, upstream_links)
+    for iteration in range(STRESS_ROTATIONS):
+        role = "fallback" if iteration % 2 else "primary"
+        new_pair = generate_macsec_key_pair(profile["cipher_suite"])
+        with _rotated_cak(environment, role, new_pair, port, upstream_links):
+            pass
 
 
 def test_profile_update_validation_and_unattached_update(
