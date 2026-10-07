@@ -297,64 +297,6 @@ def get_mka_state(host, interface):
     return session, participants
 
 
-def _get_macsec_sc_state(host, interface, sc_table, sa_table):
-    """Enumerate observed SCs and SAs without inferring a peer MAC or SCI."""
-    namespace_option = get_namespace_option(host, interface)
-    pattern = "{}:{}:*".format(sc_table, interface)
-    result = host.command(
-        "sonic-db-cli {} APPL_DB KEYS '{}'".format(
-            namespace_option, pattern),
-        module_ignore_errors=True,
-        verbose=False,
-    )
-    if result.get("failed") or result.get("rc", 0) != 0:
-        raise RuntimeError(
-            "Unable to read APPL_DB {} KEYS for {}".format(
-                sc_table, interface))
-    keys = result.get("stdout_lines", [])
-    prefix = "{}:{}:".format(sc_table, interface)
-    entries = []
-    for key in sorted(key.strip() for key in keys if key.strip()):
-        if not key.startswith(prefix):
-            raise ValueError("Unexpected APPL_DB SC key for {}".format(interface))
-        sci = key[len(prefix):]
-        sc = _read_hash(host, namespace_option, "APPL_DB", key)
-        sa_prefix = "{}:{}:{}:".format(sa_table, interface, sci)
-        sa_result = host.command(
-            "sonic-db-cli {} APPL_DB KEYS '{}*'".format(
-                namespace_option, sa_prefix),
-            module_ignore_errors=True, verbose=False)
-        if sa_result.get("failed") or sa_result.get("rc", 0) != 0:
-            raise RuntimeError(
-                "Unable to read APPL_DB {} KEYS for {}".format(
-                    sa_table, interface))
-        sas = {}
-        for sa_key in sa_result.get("stdout_lines", []):
-            sa_key = sa_key.strip()
-            if not sa_key:
-                continue
-            if not sa_key.startswith(sa_prefix):
-                raise ValueError("Unexpected APPL_DB SA key for {}".format(interface))
-            an = int(sa_key[len(sa_prefix):])
-            if an in sas:
-                raise ValueError("Duplicate APPL_DB SA AN for {}".format(interface))
-            sas[an] = _read_hash(
-                host, namespace_option, "APPL_DB", sa_key)
-        entries.append({
-            "key": key,
-            "sci": sci,
-            "sc": sc,
-            "sas": sas,
-        })
-    return entries
-
-
-def get_macsec_ingress_sc_state(host, interface):
-    """Enumerate actual ingress SC/SAs for a namespace-local MACsec port."""
-    return _get_macsec_sc_state(
-        host, interface, MACSEC_INGRESS_SC_TABLE, MACSEC_INGRESS_SA_TABLE)
-
-
 _SNAPSHOT_SCRIPT = """
 import json
 import sys
