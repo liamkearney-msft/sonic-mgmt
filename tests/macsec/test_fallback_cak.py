@@ -523,13 +523,13 @@ def _rotated_cak(environment, role, new_pair, selected_port, upstream_links):
                             "Transit link {} did not remain protected".format(port))
                     assert not snapshot.rollover_errors(before[port], require_rekey), (
                         "Transit link {} did not finish the forward SAK rollover".format(port))
+                completed[0] = True
                 traffic.assert_zero_loss()
 
             _wait_rotations_settled(
                 environment, before, profile["primary_ckn"],
                 require_rekey=require_rekey, check_peers=True,
                 on_dut_settled=_finish_measured_rotation)
-        completed[0] = True
         yield
 
 
