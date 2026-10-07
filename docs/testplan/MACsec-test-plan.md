@@ -367,9 +367,14 @@ SONiC or cEOS peers. Its requirements come from the
 | Explicit disable and manager restart | Disable independently deletes both MKA tables; restart requires newer successful publication, a new manager PID, unchanged WPA processes and strict traffic continuity |
 | Bounded stress and counters | Alternating replacements/restorations and a periodic-SAK boundary; counters are compared across migration only while the same installed SAK is observable |
 
-Exact-loss checks use continuous 10-Hz ICMP streams from both endpoints.
-They require a direct or single-member protected routed link so a bundle cannot
-route around the selected interface. Traffic remains active through promotion,
+Exact-loss checks use continuous 10-Hz ICMP streams in both directions between
+two distinct controlled neighbors on the same ASIC; neither endpoint is a DUT
+address. A source-bound host route via each neighbor's DUT-facing gateway is
+installed only when needed and removed on cleanup. Both neighbor routes and
+the DUT's connected routes are checked against the selected protected ports
+(direct or single-member PortChannels), so a bypass or ECMP path is not accepted.
+Topologies without two such neighbors explicitly skip transit traffic cases.
+Traffic remains active through promotion,
 the deferred SAK distribution, encoding rollover, old-SA retirement, and key
 restoration. A protocol-derived settle window and the 20-second retirement
 failsafe are combined with publication/convergence evidence, rather than

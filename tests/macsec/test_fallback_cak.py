@@ -1,6 +1,8 @@
 import json
 import logging
 import re
+import shlex
+import sys
 import time
 from contextlib import AbstractContextManager, contextmanager
 
@@ -47,7 +49,7 @@ from tests.common.macsec.mka_state_helper import (
     validate_multi_port_alternate_state,
     parse_mka_timestamp,
 )
-from tests.common.utilities import ping_ip, wait_until
+from tests.common.utilities import wait_until
 
 
 logger = logging.getLogger(__name__)
@@ -677,12 +679,151 @@ def _ceos_fallback_mismatch(
 
 def _select_routed_link(environment, upstream_links, ports=None):
     portchannels = get_portchannel(environment["duthost"])
-    for port in environment["links"] if ports is None else ports:
-        neighbor = environment["links"][port]
+    duthost = environment["duthost"]
+    eligible = []
+    for port in environment["links"]:
         portchannel = find_portchannel_from_member(port, portchannels)
         if port in upstream_links and (not portchannel or len(portchannel["members"]) == 1):
-            return port, neighbor
-    pytest.skip("Exact per-link traffic observation requires a direct or single-member controlled routed link")
+            eligible.append(port)
+    for port in eligible if ports is None else ports:
+        if port not in eligible:
+            continue
+        if any(
+                other != port
+                and environment["links"][other]["name"] != environment["links"][port]["name"]
+                and upstream_links[other]["local_ipv4_addr"] != upstream_links[port]["local_ipv4_addr"]
+                and (not duthost.is_multi_asic or get_namespace_option(duthost, other)
+                     == get_namespace_option(duthost, port))
+                for other in eligible):
+            return port, environment["links"][port]
+    pytest.skip(
+        "Transit MACsec traffic requires two distinct controlled routed neighbors "
+        "on the same ASIC, each direct or on a single-member PortChannel")
+
+
+def _transit_peer(environment, upstream_links, selected_port):
+    duthost = environment["duthost"]
+    portchannels = get_portchannel(duthost)
+    selected = environment["links"][selected_port]
+    for port, neighbor in environment["links"].items():
+        if port == selected_port or port not in upstream_links:
+            continue
+        pc = find_portchannel_from_member(port, portchannels)
+        if pc and len(pc["members"]) != 1:
+            continue
+        if (neighbor["name"] != selected["name"]
+                and upstream_links[port]["local_ipv4_addr"]
+                != upstream_links[selected_port]["local_ipv4_addr"]
+                and (not duthost.is_multi_asic or get_namespace_option(duthost, port)
+                     == get_namespace_option(duthost, selected_port))):
+            return port
+    pytest.skip("No distinct controlled neighbor on the selected ASIC for transit traffic")
+
+
+def _route_result(host, port, command, allow_unreachable=False):
+    result = host.command(
+        "{} {}".format(_ping_namespace_prefix(host, port), command),
+        module_ignore_errors=True, verbose=False)
+    if result.get("failed") or result.get("rc", 0) != 0:
+        if (allow_unreachable and "Network is unreachable" in result.get("stderr", "")):
+            return ""
+        raise RuntimeError("Unable to verify transit route on {}: {}".format(
+            host.hostname, command))
+    return result["stdout"].strip()
+
+
+def _route_value(output, field):
+    words = shlex.split(output)
+    return words[words.index(field) + 1] if field in words and words.index(field) + 1 < len(words) else None
+
+
+def _route_source(output):
+    return _route_value(output, "from") or _route_value(output, "src")
+
+
+@contextmanager
+def _transit_path(environment, upstream_links, selected_port):
+    """Own only newly added endpoint routes; verify both ASIC transit directions."""
+    other_port = _transit_peer(environment, upstream_links, selected_port)
+    duthost = environment["duthost"]
+    portchannels = get_portchannel(duthost)
+    endpoints = []
+
+    def _dut_route_correct(port, destination_port):
+        source = upstream_links[port]["local_ipv4_addr"]
+        destination = upstream_links[destination_port]["local_ipv4_addr"]
+        incoming_pc = find_portchannel_from_member(port, portchannels)
+        incoming_dev = incoming_pc["name"] if incoming_pc else port
+        route = _route_result(
+            duthost, destination_port,
+            "ip -4 route get {} from {} iif {}".format(
+                destination, source, incoming_dev))
+        outgoing_pc = find_portchannel_from_member(destination_port, portchannels)
+        expected_dev = outgoing_pc["name"] if outgoing_pc else destination_port
+        return (_route_value(route, "dev") == expected_dev
+                and not _route_value(route, "via")
+                and "nexthop" not in route.split())
+
+    for port, destination_port in ((selected_port, other_port), (other_port, selected_port)):
+        link = upstream_links[port]
+        neighbor = environment["links"][port]
+        destination = upstream_links[destination_port]["local_ipv4_addr"]
+        host = neighbor["host"]
+        source = link["local_ipv4_addr"]
+        gateway = link["peer_ipv4_addr"]
+        local_route = _route_result(
+            host, neighbor["port"], "ip -4 route get {} from {}".format(gateway, source))
+        device = _route_value(local_route, "dev")
+        if not device or _route_source(local_route) != source:
+            pytest.skip("Neighbor has no source-bound data route to its DUT-facing gateway")
+        if not _dut_route_correct(port, destination_port):
+            pytest.skip("DUT route to {} does not use protected port {}".format(
+                destination, destination_port))
+        endpoints.append((host, neighbor["port"], source, destination, gateway, device))
+
+    def _check_route(endpoint):
+        host, port, source, destination, gateway, device = endpoint
+        route = _route_result(
+            host, port, "ip -4 route get {} from {}".format(destination, source),
+            allow_unreachable=True)
+        return (_route_value(route, "via") == gateway
+                and _route_value(route, "dev") == device
+                and _route_source(route) == source
+                and "nexthop" not in route.split())
+
+    def _remove_route(endpoint):
+        host, port, source, destination, gateway, device = endpoint
+        exact = _route_result(
+            host, port, "ip -4 route show exact {}/32".format(destination))
+        if not exact:
+            return
+        if (len(exact.splitlines()) != 1
+                or _route_value(exact, "via") != gateway
+                or _route_value(exact, "dev") != device):
+            raise AssertionError("Test-owned transit route changed before cleanup")
+        _route_result(host, port, "sudo ip -4 route del {}/32 via {} dev {}".format(
+            destination, gateway, device))
+
+    with FailureSafeCleanup("transit route restoration") as cleanup:
+        for endpoint in endpoints:
+            if _check_route(endpoint):
+                continue
+            host, port, source, destination, gateway, device = endpoint
+            exact = _route_result(
+                host, port, "ip -4 route show exact {}/32".format(destination))
+            if exact:
+                pytest.skip("Existing host route prevents pinned transit path to {}".format(destination))
+            cleanup.callback(_remove_route, endpoint)
+            _route_result(host, port, "sudo ip -4 route add {}/32 via {} dev {} src {}".format(
+                destination, gateway, device, source))
+        assert all(_check_route(endpoint) for endpoint in endpoints), (
+            "Transit route did not pin both neighbor endpoints through the DUT")
+        yield endpoints
+        assert all(_check_route(endpoint) for endpoint in endpoints), (
+            "Transit neighbor route changed during the observation")
+        assert (_dut_route_correct(selected_port, other_port)
+                and _dut_route_correct(other_port, selected_port)), (
+            "DUT transit forwarding route changed during the observation")
 
 
 def _set_rekey_period(host, port, profile_name, rekey_period):
@@ -770,11 +911,12 @@ def _environment_is_healthy(
     return True
 
 
-def _start_ping(host, port, destination, suffix):
+def _start_ping(host, port, source, destination, suffix):
     path = "/tmp/macsec_fallback_{}_{}.log".format(port, suffix)
     host.shell("rm -f {}".format(path), module_ignore_errors=True)
     prefix = _ping_namespace_prefix(host, port)
-    command = "{} ping -D -i 0.1 {}".format(prefix, destination)
+    command = "{} ping -D -i 0.1 -I {} {}".format(
+        prefix, source, destination)
     result = host.shell(
         "nohup {} > {} 2>&1 < /dev/null & echo $!".format(command, path))
     pid = int(result["stdout_lines"][-1])
@@ -996,27 +1138,23 @@ def _abort_partial_ping(ping):
                    module_ignore_errors=True)
 
 
-def _start_bidirectional_traffic(environment, upstream_links, port=None):
-    duthost = environment["duthost"]
-    port, neighbor = _select_routed_link(
-        environment, upstream_links, [port] if port is not None else None)
-    link = upstream_links[port]
-    assert ping_ip(
-        duthost, link["local_ipv4_addr"], count=3,
-        cmd_prefix=_ping_namespace_prefix(duthost, port),
-    ), "Unable to warm the DUT-to-neighbor traffic path"
-    assert ping_ip(
-        neighbor["host"], link["peer_ipv4_addr"], count=3,
-        cmd_prefix=_ping_namespace_prefix(
-            neighbor["host"], neighbor["port"]),
-    ), "Unable to warm the neighbor-to-DUT traffic path"
+def _probe_transit(endpoint):
+    host, port, source, destination, _, _ = endpoint
+    result = host.command(
+        "{} ping -c 3 -I {} {}".format(
+            _ping_namespace_prefix(host, port), source, destination),
+        module_ignore_errors=True, verbose=False)
+    return not result.get("failed") and result.get("rc", 0) == 0
+
+
+def _start_bidirectional_traffic(endpoints):
+    assert _probe_transit(endpoints[0]), "Unable to warm first neighbor-to-neighbor transit path"
+    assert _probe_transit(endpoints[1]), "Unable to warm reverse neighbor-to-neighbor transit path"
     traffic = []
     try:
-        traffic.append(_start_ping(
-            duthost, port, link["local_ipv4_addr"], "dut_to_neighbor"))
-        traffic.append(_start_ping(
-            neighbor["host"], neighbor["port"],
-            link["peer_ipv4_addr"], "neighbor_to_dut"))
+        for index, (host, port, source, destination, _, _) in enumerate(endpoints):
+            traffic.append(_start_ping(
+                host, port, source, destination, "transit_{}".format(index)))
     except BaseException:
         try:
             cleanup_all(traffic, _abort_partial_ping)
@@ -1027,18 +1165,8 @@ def _start_bidirectional_traffic(environment, upstream_links, port=None):
 
 
 def _selected_link_ping_results(environment, upstream_links, port):
-    duthost = environment["duthost"]
-    neighbor = environment["links"][port]
-    link = upstream_links[port]
-    return (
-        ping_ip(
-            duthost, link["local_ipv4_addr"], count=3,
-            cmd_prefix=_ping_namespace_prefix(duthost, port)),
-        ping_ip(
-            neighbor["host"], link["peer_ipv4_addr"], count=3,
-            cmd_prefix=_ping_namespace_prefix(
-                neighbor["host"], neighbor["port"])),
-    )
+    with _transit_path(environment, upstream_links, port) as endpoints:
+        return tuple(_probe_transit(endpoint) for endpoint in endpoints)
 
 
 def _selected_link_ping_succeeds(environment, upstream_links, port):
@@ -1102,10 +1230,22 @@ class _TrafficWindow(AbstractContextManager):
         self.port = port
         self.traffic = []
         self.results = None
+        self.routes = None
 
     def __enter__(self):
-        self.traffic = _start_bidirectional_traffic(
-            self.environment, self.upstream_links, self.port)
+        selected_port = self.port
+        if selected_port is None:
+            selected_port, _ = _select_routed_link(
+                self.environment, self.upstream_links)
+        self.routes = _transit_path(
+            self.environment, self.upstream_links, selected_port)
+        endpoints = self.routes.__enter__()
+        try:
+            self.traffic = _start_bidirectional_traffic(endpoints)
+        except BaseException:
+            self.routes.__exit__(*sys.exc_info())
+            self.routes = None
+            raise
         return self
 
     def close(self, assert_loss=True):
@@ -1118,6 +1258,9 @@ class _TrafficWindow(AbstractContextManager):
             finally:
                 self.results = results
                 self.traffic = []
+                if self.routes is not None:
+                    routes, self.routes = self.routes, None
+                    routes.__exit__(*sys.exc_info())
         return self.results
 
     def assert_zero_loss(self):
@@ -1858,6 +2001,9 @@ def test_both_invalid_tears_down_and_matching_profile_recovers(
     profile = environment["profile"]
     port, _ = _select_routed_link(
         environment, upstream_links)
+    assert _selected_link_ping_succeeds(
+        environment, upstream_links, port), (
+            "Neighbor-to-neighbor transit path was not healthy before invalidating both CAKs")
     adapter = peer_adapter(environment, port)
     invalid_primary_cak, invalid_primary_ckn = generate_macsec_key_pair(
         profile["cipher_suite"])
@@ -1876,7 +2022,7 @@ def test_both_invalid_tears_down_and_matching_profile_recovers(
                     environment, upstream_links, port)
                 assert not any(traffic_results), (
                     "Traffic still forwarded with both CAKs mismatched: "
-                    "dut_to_peer={}, peer_to_dut={}"
+                    "selected_to_other={}, other_to_selected={}"
                 ).format(*traffic_results)
     else:
         dut_last_updated = _snapshot(
@@ -1907,7 +2053,7 @@ def test_both_invalid_tears_down_and_matching_profile_recovers(
                 environment, upstream_links, port)
             assert not any(traffic_results), (
                 "Traffic still forwarded with both CAKs mismatched: "
-                "dut_to_peer={}, peer_to_dut={}"
+                "selected_to_other={}, other_to_selected={}"
             ).format(*traffic_results)
 
             adapter.rebind(original_profile_name, original_peer_profile)
