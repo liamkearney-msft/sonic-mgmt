@@ -358,17 +358,29 @@ def get_macsec_ingress_sc_state(host, interface):
 _SNAPSHOT_SCRIPT = """
 import json
 import sys
-from swsscommon.swsscommon import SonicV2Connector
+from swsscommon.swsscommon import SonicDBConfig, SonicV2Connector
 
 ports, profile = json.loads(sys.argv[1])
+try:
+    if any(namespace for _, namespace in ports):
+        SonicDBConfig.load_sonic_global_db_config()
+    else:
+        SonicDBConfig.load_sonic_db_config()
+except Exception as error:
+    raise RuntimeError("MACsec snapshot DB config initialization failed") from error
 rows = {}
 connectors = {}
 for port, namespace in ports:
     if namespace not in connectors:
-        connector = SonicV2Connector(
-            use_unix_socket_path=True, namespace=namespace)
-        for database in ("STATE_DB", "APPL_DB", "CONFIG_DB"):
-            connector.connect(getattr(connector, database))
+        try:
+            connector = SonicV2Connector(
+                use_unix_socket_path=True, namespace=namespace)
+            for database in ("STATE_DB", "APPL_DB", "CONFIG_DB"):
+                connector.connect(getattr(connector, database))
+        except Exception as error:
+            raise RuntimeError(
+                "MACsec snapshot DB connection failed for namespace {}".format(
+                    namespace or "default")) from error
         connectors[namespace] = connector
     connector = connectors[namespace]
 
