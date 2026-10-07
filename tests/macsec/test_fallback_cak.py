@@ -178,7 +178,7 @@ def _wait_rotation_settled(
 def _wait_rotations_settled(
         environment, before, principal_ckn, require_rekey=True,
         require_all_live=True, check_peers=False, published=None):
-    """Check every affected link under one protocol/publication deadline."""
+    """Settle all DUT links, then inspect peers and revalidate the DUT."""
     settle = {
         port: mka_hello_timeout_seconds(snapshot.session, 3)
         for port, snapshot in before.items()
@@ -191,6 +191,7 @@ def _wait_rotations_settled(
     deadline = started + max(settle.values()) + SA_RETIRE_TIMEOUT + MKA_STATE_PUBLISH_TIMEOUT
     stable = {}
     errors = {}
+    dut_settled = False
 
     def _problems(port, snapshot):
         problems = snapshot.protected_errors(
@@ -230,39 +231,47 @@ def _wait_rotations_settled(
             else:
                 errors[port] = ["SAK/participant settle interval pending"]
         if ready == len(before) and time.monotonic() < deadline:
-            if check_peers:
-                for port in before:
-                    if time.monotonic() >= deadline:
-                        errors[port] = ["peer confirmation deadline elapsed"]
-                        continue
-                    adapter = peer_adapter(environment, port)
-                    problems = adapter.protected_errors(
-                        environment["peer_profiles"][port], principal_ckn,
-                        require_all_live=require_all_live)
-                    if published and port in published["peers"] and not problems:
-                        if parse_mka_timestamp(adapter.publication_marker()) <= parse_mka_timestamp(
-                                published["peers"][port]):
-                            problems.append("peer MKA publication did not advance")
-                    if problems:
-                        errors[port] = problems
-                if errors:
-                    time.sleep(min(1, max(0, deadline - time.monotonic())))
-                    continue
-            if time.monotonic() < deadline:
-                final = _snapshots(environment, before)
-                errors = {}
-                for port, snapshot in final.items():
-                    problems = _problems(port, snapshot)
-                    if snapshot.active_key_identity() != stable[port][0]:
-                        problems.append("encoding SAK changed before final validation")
-                    if problems:
-                        stable.pop(port, None)
-                        errors[port] = problems
-                if not errors and time.monotonic() < deadline:
-                    return
+            dut_settled = True
+            break
         time.sleep(min(1, max(0, deadline - time.monotonic())))
-    assert False, "Rollover did not distribute/converge/retire on {}: {}".format(
+    assert dut_settled, "DUT rollover did not distribute/converge/retire on {}: {}".format(
         sorted(errors), errors)
+
+    if check_peers:
+        peer_deadline = time.monotonic() + 30 + 15 * len(before)
+        peer_errors = {}
+        for port in before:
+            if time.monotonic() >= peer_deadline:
+                peer_errors[port] = ["peer inspection deadline elapsed"]
+                break
+            adapter = peer_adapter(environment, port)
+            problems = adapter.protected_errors(
+                environment["peer_profiles"][port], principal_ckn,
+                require_all_live=require_all_live)
+            if published and port in published["peers"] and not problems:
+                if parse_mka_timestamp(adapter.publication_marker()) <= parse_mka_timestamp(
+                        published["peers"][port]):
+                    problems.append("peer MKA publication did not advance")
+            if problems:
+                peer_errors[port] = problems
+            if time.monotonic() >= peer_deadline:
+                peer_errors[port] = peer_errors.get(port, []) + [
+                    "peer inspection deadline elapsed"]
+                break
+        assert not peer_errors, (
+            "Peer confirmation failed on {}: {}"
+        ).format(sorted(peer_errors), peer_errors)
+
+    final = _snapshots(environment, before)
+    final_errors = {}
+    for port, snapshot in final.items():
+        problems = _problems(port, snapshot)
+        if snapshot.active_key_identity() != stable[port][0]:
+            problems.append("encoding SAK changed during peer inspection")
+        if problems:
+            final_errors[port] = problems
+    assert not final_errors, "DUT regressed after peer confirmation: {}".format(
+        final_errors)
 
 
 def _capture_environment_last_updated(

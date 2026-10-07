@@ -406,6 +406,11 @@ per link. Read errors propagate; missing or extra SC/SA rows cannot count as
 healthy. SONiC's `MACSEC_PORT_TABLE.state=ok` records port creation, not
 authenticated Controlled Port status; blocked-state verdicts use MKA state,
 APPL_DB enable, actual SA teardown, and traffic instead.
+Once every DUT link settles within that protocol deadline, all affected peers
+are inspected serially under a separate bounded audit (30 seconds plus 15
+seconds per link). A final batched DUT read must still show the expected
+principal, SAK, and retired SC/SA state after the peer audit, while traffic
+remains active through both phases and restoration.
 Desired CONFIG_DB is not rolled back by runtime failure: a healthy old applied
 participant can remain degraded/pending until fresh safe conditions allow
 reconciliation. The multi-port case verifies this separately from normal
