@@ -1,4 +1,5 @@
 import json
+import ipaddress
 import logging
 import re
 import shlex
@@ -45,6 +46,7 @@ from tests.common.macsec.mka_state_helper import (
     macsecmgrd_restart_ready,
     mka_hello_timeout_seconds,
     mka_state_cli_supported,
+    parse_db_hash,
     select_independent_port_pair,
     validate_multi_port_alternate_state,
     parse_mka_timestamp,
@@ -765,10 +767,335 @@ def _route_source(output):
     return _route_value(output, "from") or _route_value(output, "src")
 
 
+def _stable_data_loopback(host, port):
+    output = _route_result(host, port, "ip -o -4 addr show")
+    candidates = {
+        address
+        for device, address in re.findall(
+            r"^\d+:\s+(\S+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)/32\b",
+            output, re.MULTILINE)
+        if (device in ("lo", "lo0") or device.startswith("Loopback"))
+        and not ipaddress.ip_address(address).is_loopback
+    }
+    if len(candidates) != 1:
+        pytest.skip("Stable transit requires one data-VRF /32 loopback on each neighbor")
+    return candidates.pop()
+
+
 @contextmanager
-def _transit_path(environment, upstream_links, selected_port):
+def _stable_transit_path(environment, upstream_links, selected_port, other_port):
+    """Own reversible neighbor and DUT routes to stable data-VRF loopbacks."""
+    duthost = environment["duthost"]
+    ports = (selected_port, other_port)
+    portchannels = get_portchannel(duthost)
+    sources = {
+        port: _stable_data_loopback(
+            environment["links"][port]["host"],
+            environment["links"][port]["port"])
+        for port in ports
+    }
+    if sources[selected_port] == sources[other_port]:
+        pytest.skip("Transit neighbor loopback addresses must be distinct")
+    endpoints = []
+    routes = []
+    for port, destination_port in ((selected_port, other_port), (other_port, selected_port)):
+        neighbor = environment["links"][port]
+        host = neighbor["host"]
+        gateway = upstream_links[port]["peer_ipv4_addr"]
+        address = upstream_links[port]["local_ipv4_addr"]
+        destination = sources[destination_port]
+        local_route = _route_result(
+            host, neighbor["port"],
+            "ip -4 route get {} from {}".format(gateway, sources[port]))
+        link_route = _route_result(
+            host, neighbor["port"],
+            "ip -4 route get {} from {}".format(gateway, address))
+        device = _route_value(local_route, "dev")
+        if (not device or device != _route_value(link_route, "dev")
+                or _route_source(local_route) != sources[port]
+                or _route_value(local_route, "via")):
+            pytest.skip("Neighbor loopback cannot reach its protected DUT gateway")
+        endpoints.append((
+            host, neighbor["port"], sources[port], destination, gateway, device))
+        routes.append((
+            destination_port, "{}/32".format(destination),
+            upstream_links[destination_port]["local_ipv4_addr"]))
+
+    namespace = get_namespace_option(duthost, selected_port)
+    ns_name = namespace.split()[-1] if namespace else ""
+
+    def _checked(host, command):
+        result = host.command(command, module_ignore_errors=True, verbose=False)
+        if result.get("failed") or result.get("rc", 0) != 0:
+            raise RuntimeError("Transit route command failed on {}: {}".format(
+                host.hostname, command))
+        return result
+
+    def _db(db, operation, key):
+        return _checked(
+            duthost, "sonic-db-cli {} {} {} {}".format(
+                namespace, db, operation, shlex.quote(key)))
+
+    def _route_keys(prefix):
+        pattern = "ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY:*{}*".format(prefix)
+        return [
+            key for key in _db("ASIC_DB", "KEYS", pattern).get("stdout_lines", [])
+            if key.strip()
+        ]
+
+    def _asic_route(prefix):
+        matches = []
+        marker = "ASIC_STATE:SAI_OBJECT_TYPE_ROUTE_ENTRY:"
+        switches = [
+            key.strip() for key in _db(
+                "ASIC_DB", "KEYS", "ASIC_STATE:SAI_OBJECT_TYPE_SWITCH:*"
+            ).get("stdout_lines", []) if key.strip()
+        ]
+        if len(switches) != 1:
+            return []
+        switch = parse_db_hash(_db(
+            "ASIC_DB", "HGETALL", switches[0]).get("stdout", ""))
+        default_vr = switch.get("SAI_SWITCH_ATTR_DEFAULT_VIRTUAL_ROUTER_ID")
+        if not default_vr:
+            default_routes = []
+            for key in _route_keys("0.0.0.0/0"):
+                if not key.startswith(marker):
+                    raise ValueError("Unexpected ASIC default route key")
+                default_route = json.loads(key[len(marker):])
+                if default_route.get("dest") == "0.0.0.0/0":
+                    default_routes.append(default_route.get("vr"))
+            if len(default_routes) != 1 or not default_routes[0]:
+                return []
+            default_vr = default_routes[0]
+        for key in _route_keys(prefix):
+            if not key.startswith(marker):
+                raise ValueError("Unexpected ASIC route key")
+            try:
+                route = json.loads(key[len(marker):])
+            except (TypeError, ValueError) as error:
+                raise ValueError("Malformed ASIC route key") from error
+            if route.get("dest") == prefix:
+                if route.get("vr") != default_vr:
+                    raise AssertionError("ASIC route is not in the default data VRF")
+                matches.append(key)
+        return matches
+
+    def _vtysh(line):
+        command = "vtysh -c {} -c {}".format(
+            shlex.quote("configure terminal"), shlex.quote(line))
+        if ns_name:
+            command = duthost.get_vtysh_cmd_for_namespace(command, ns_name)
+        return _checked(duthost, command)
+
+    def _running_static(prefix):
+        command = "vtysh -c {}".format(shlex.quote("show running-config"))
+        if ns_name:
+            command = duthost.get_vtysh_cmd_for_namespace(command, ns_name)
+        lines = _checked(duthost, command).get("stdout", "").splitlines()
+        return [
+            line.strip() for line in lines
+            if re.match(r"^\s*ip route {}(?:\s|$)".format(re.escape(prefix)), line)
+        ]
+
+    def _owned_dut_route(port, prefix, nexthop):
+        expected_dev = find_portchannel_from_member(port, portchannels)
+        expected_dev = expected_dev["name"] if expected_dev else port
+        if _running_static(prefix) != ["ip route {} {}".format(prefix, nexthop)]:
+            return False
+        row = parse_db_hash(_db(
+            "APPL_DB", "HGETALL", "ROUTE_TABLE:{}".format(prefix)).get("stdout", ""))
+        if row and (row.get("nexthop") != nexthop
+                    or row.get("ifname") != expected_dev):
+            return False
+        keys = _asic_route(prefix)
+        if len(keys) != 1:
+            return False
+        route = parse_db_hash(_db("ASIC_DB", "HGETALL", keys[0]).get("stdout", ""))
+        oid = route.get("SAI_ROUTE_ENTRY_ATTR_NEXT_HOP_ID", "")
+        if not oid.startswith("oid:"):
+            return False
+        nexthop_row = parse_db_hash(_db(
+            "ASIC_DB", "HGETALL",
+            "ASIC_STATE:SAI_OBJECT_TYPE_NEXT_HOP:{}".format(oid)).get("stdout", ""))
+        rif = nexthop_row.get("SAI_NEXT_HOP_ATTR_ROUTER_INTERFACE_ID", "")
+        if not rif.startswith("oid:"):
+            return False
+        rif_row = parse_db_hash(_db(
+            "ASIC_DB", "HGETALL",
+            "ASIC_STATE:SAI_OBJECT_TYPE_ROUTER_INTERFACE:{}".format(rif)
+        ).get("stdout", ""))
+        port_oid = _checked(
+            duthost, "sonic-db-cli {} COUNTERS_DB HGET {} {}".format(
+                namespace, shlex.quote("COUNTERS_PORT_NAME_MAP"),
+                shlex.quote(expected_dev))).get("stdout", "").strip()
+        return (
+            nexthop_row.get("SAI_NEXT_HOP_ATTR_IP") == nexthop
+            and nexthop_row.get("SAI_NEXT_HOP_ATTR_TYPE") == "SAI_NEXT_HOP_TYPE_IP"
+            and bool(port_oid)
+            and rif_row.get("SAI_ROUTER_INTERFACE_ATTR_PORT_ID") == port_oid)
+
+    def _dut_route_correct(port, destination_port):
+        source = sources[port]
+        destination = sources[destination_port]
+        incoming = find_portchannel_from_member(port, portchannels)
+        incoming_dev = incoming["name"] if incoming else port
+        outgoing = find_portchannel_from_member(destination_port, portchannels)
+        expected_dev = outgoing["name"] if outgoing else destination_port
+        route = _route_result(
+            duthost, destination_port,
+            "ip -4 route get {} from {} iif {}".format(
+                destination, source, incoming_dev))
+        return (
+            _route_value(route, "dev") == expected_dev
+            and _route_value(route, "via")
+            == upstream_links[destination_port]["local_ipv4_addr"]
+            and "nexthop" not in route.split())
+
+    def _peer_config(endpoint):
+        host, port, source, destination, gateway, device = endpoint
+        line = "ip route {}{}/32 {}".format(
+            "vrf {} ".format(host.bgp_vrf) if isinstance(host, EosHost) and host.bgp_vrf else "",
+            destination, gateway)
+        result = host.eos_command(commands=["show running-config | include ^ip route"])
+        if result.get("failed") or result.get("rc", 0) != 0:
+            raise RuntimeError("Unable to read neighbor static route configuration")
+        output = result.get("stdout", [])
+        if not output or not isinstance(output[0], str):
+            raise ValueError("Malformed neighbor static route configuration")
+        present = [
+            entry.strip() for entry in output[0].splitlines()
+            if re.search(r"(?<!\S){}/32(?:\s|$)".format(re.escape(destination)), entry)
+        ]
+        return line, present
+
+    def _remove_peer_route(endpoint):
+        host, port, source, destination, gateway, device = endpoint
+        if not isinstance(host, EosHost):
+            exact = _route_result(host, port, "ip -4 route show exact {}/32".format(destination))
+            if exact:
+                if (_route_value(exact, "via") != gateway
+                        or _route_value(exact, "dev") != device):
+                    raise AssertionError("Test-owned neighbor route changed during cleanup")
+                _route_result(host, port, "sudo ip -4 route del {}/32 via {} dev {}".format(
+                    destination, gateway, device))
+            return
+        line, present = _peer_config(endpoint)
+        if not present:
+            return
+        if present != [line]:
+            raise AssertionError("Test-owned EOS static route changed during cleanup")
+        result = host.eos_config(lines=["no {}".format(line)])
+        if result.get("failed") or result.get("rc", 0) != 0:
+            raise RuntimeError("Unable to remove test-owned EOS static route")
+        assert not _peer_config(endpoint)[1], "Test-owned EOS static route remains configured"
+
+    def _remove_dut_route(route):
+        port, prefix, nexthop = route
+        line = "ip route {} {}".format(prefix, nexthop)
+        configured = _running_static(prefix)
+        if configured:
+            assert configured == [line], "Test-owned DUT static route changed during cleanup"
+            _vtysh("no {}".format(line))
+
+        def _absent():
+            return (
+                not _running_static(prefix)
+                and not _db("CONFIG_DB", "KEYS",
+                            "STATIC_ROUTE*{}*".format(prefix)).get("stdout", "").strip()
+                and not parse_db_hash(_db(
+                    "APPL_DB", "HGETALL", "ROUTE_TABLE:{}".format(prefix)
+                ).get("stdout", ""))
+                and not _asic_route(prefix)
+                and not _route_result(
+                    duthost, port, "ip -4 route show exact {}".format(prefix)))
+
+        _await_route(_absent, 60, "Test-owned DUT route did not withdraw")
+
+    def _await_route(condition, timeout, message):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if condition():
+                return
+            time.sleep(2)
+        raise AssertionError(message)
+
+    for port, prefix, nexthop in routes:
+        if (_running_static(prefix)
+                or _db("CONFIG_DB", "KEYS", "STATIC_ROUTE*{}*".format(prefix)).get("stdout", "").strip()
+                or parse_db_hash(_db(
+                    "APPL_DB", "HGETALL", "ROUTE_TABLE:{}".format(prefix)
+                ).get("stdout", ""))
+                or _asic_route(prefix)
+                or _route_result(duthost, port, "ip -4 route show exact {}".format(prefix))):
+            pytest.skip("Cannot own existing DUT /32 route {}".format(prefix))
+    for endpoint in endpoints:
+        if isinstance(endpoint[0], EosHost) and _peer_config(endpoint)[1]:
+            pytest.skip("Cannot own existing EOS /32 route to stable neighbor loopback")
+        if not isinstance(endpoint[0], EosHost) and _route_result(
+                endpoint[0], endpoint[1],
+                "ip -4 route show exact {}/32".format(endpoint[3])):
+            pytest.skip("Cannot own existing neighbor /32 route")
+
+    with FailureSafeCleanup("stable transit route restoration") as cleanup:
+        for route in routes:
+            port, prefix, nexthop = route
+            cleanup.callback(_remove_dut_route, route)
+            _vtysh("ip route {} {}".format(prefix, nexthop))
+        _await_route(
+            lambda: all(_owned_dut_route(*route) for route in routes)
+            and all(_dut_route_correct(port, other) for port, other in (
+                (selected_port, other_port), (other_port, selected_port))),
+            90, "DUT static routes did not reach the selected FRR/ASIC forwarding paths")
+        assert all(not _db(
+            "CONFIG_DB", "KEYS", "STATIC_ROUTE*{}*".format(prefix)
+        ).get("stdout", "").strip() for _, prefix, _ in routes), (
+            "Runtime DUT route unexpectedly appeared in persisted CONFIG_DB")
+        for endpoint in endpoints:
+            host, port, source, destination, gateway, device = endpoint
+            cleanup.callback(_remove_peer_route, endpoint)
+            if isinstance(host, EosHost):
+                line, _ = _peer_config(endpoint)
+                result = host.eos_config(lines=[line])
+                if result.get("failed") or result.get("rc", 0) != 0:
+                    raise RuntimeError("Unable to install test-owned EOS static route")
+                assert _peer_config(endpoint)[1] == [line], (
+                    "EOS data-VRF static route was not installed")
+            else:
+                _route_result(
+                    host, port,
+                    "sudo ip -4 route add {}/32 via {} dev {} src {}".format(
+                        destination, gateway, device, source))
+
+        def _neighbor_route(endpoint):
+            host, port, source, destination, gateway, device = endpoint
+            route = _route_result(
+                host, port, "ip -4 route get {} from {}".format(destination, source))
+            return (_route_value(route, "via") == gateway
+                    and _route_value(route, "dev") == device
+                    and _route_source(route) == source
+                    and "nexthop" not in route.split())
+        _await_route(
+            lambda: all(_neighbor_route(endpoint) for endpoint in endpoints),
+            60, "Neighbor stable loopback routes did not pin through the DUT")
+        yield endpoints
+        assert all(_neighbor_route(endpoint) for endpoint in endpoints), (
+            "Neighbor stable routes did not recover after MACsec restoration")
+        assert all(_owned_dut_route(*route) for route in routes), (
+            "DUT hardware routes did not recover after MACsec restoration")
+        assert (_dut_route_correct(selected_port, other_port)
+                and _dut_route_correct(other_port, selected_port)), (
+            "DUT stable transit route changed after MACsec restoration")
+
+
+@contextmanager
+def _transit_path(environment, upstream_links, selected_port, stable_endpoints=False):
     """Own only newly added endpoint routes; verify both ASIC transit directions."""
     other_port = _transit_peer(environment, upstream_links, selected_port)
+    if stable_endpoints:
+        with _stable_transit_path(
+                environment, upstream_links, selected_port, other_port) as endpoints:
+            yield endpoints
+        return
     duthost = environment["duthost"]
     portchannels = get_portchannel(duthost)
     endpoints = []
@@ -2066,7 +2393,8 @@ def test_both_invalid_tears_down_and_matching_profile_recovers(
     invalid_primary = (invalid_primary_cak, invalid_primary_ckn)
     invalid_fallback = (invalid_fallback_cak, invalid_fallback_ckn)
 
-    with _transit_path(environment, upstream_links, port) as endpoints:
+    with _transit_path(
+            environment, upstream_links, port, stable_endpoints=True) as endpoints:
         healthy_results = tuple(_probe_transit(endpoint) for endpoint in endpoints)
         assert all(healthy_results), (
             "Neighbor-to-neighbor transit path was not healthy before invalidating both CAKs: "

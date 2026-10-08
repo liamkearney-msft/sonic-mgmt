@@ -374,14 +374,26 @@ installed only when needed and removed on cleanup. Both neighbor routes and
 the DUT's connected routes are checked against the selected protected ports
 (direct or single-member PortChannels), so a bypass or ECMP path is not accepted.
 Topologies without two such neighbors explicitly skip transit traffic cases.
-The both-invalid case establishes one healthy, pinned transit path before
-changing either CAK and retains its endpoints and owned routes through both
-blocked-direction probes and matching-profile recovery. A blocked MACsec
+The both-invalid case uses each neighbor's existing data-VRF `/32` loopback,
+not its routed MACsec interface address (which can disappear while blocked).
+It owns temporary EOS static `/32` routes via each DUT gateway and runtime-only,
+namespace-local DUT FRR `/32` routes via the selected neighbor links. Existing
+exact routes are never replaced; no route is saved to CONFIG_DB or disk. The
+test checks the namespace-local FRR route, exact ASIC route and direct
+next-hop IP and default VRF, with the next-hop router-interface port OID
+matching the selected protected port's COUNTERS_DB mapping. An APPL route row,
+if still present, must agree; kernel route-get alone is not ASIC forwarding
+proof. If the switch lacks a default-VRF attribute, the existing ASIC default
+route's VRF ID supplies the comparison; absent/ambiguous VRF evidence is an
+error, not success. Both forwarding interfaces and healthy two-way transit
+are checked before changing either CAK. The same endpoints and owned routes
+remain through both
+blocked-direction probes and matching-profile recovery, after which each
+owned route is independently removed and absence verified. A blocked MACsec
 session may make a fresh gateway route lookup unreachable; this is not itself
 the traffic verdict. Zero ping replies (or an explicit ping network-unreachable
-error) establish no forwarding; transport, authentication, and invalid ping
-errors fail rather than counting as blocked traffic. The same pinned path must
-forward again after profile restoration, before any test-owned route is removed.
+error) establish no forwarding; bind, transport, authentication, and invalid
+ping errors fail instead. Unsupported loopback or FIB proof is not a pass.
 For primary/fallback profile rotation (including stress/periodic cases),
 prerequisite health, route setup, warm-up, and baseline snapshots happen before
 the loss window. Both continuous transit streams establish a startup reply
