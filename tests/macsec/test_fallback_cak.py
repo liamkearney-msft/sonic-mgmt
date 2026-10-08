@@ -69,6 +69,27 @@ MKA_STATE_PUBLISH_TIMEOUT = 60
 STRESS_ROTATIONS = 10
 SA_RETIRE_TIMEOUT = 20
 
+NATIVE_COUNTER = re.compile(
+    r"^(SAI_MACSEC_(?:PORT|SC|SA)_(?:STAT_[A-Z0-9_]+|ATTR_CURRENT_XPN))\s+(\d+)$")
+PORT_COUNTER_FIELDS = (
+    "SAI_PORT_STAT_IF_IN_DISCARDS",
+    "SAI_PORT_STAT_IF_IN_ERRORS",
+    "SAI_PORT_STAT_IF_OUT_DISCARDS",
+    "SAI_PORT_STAT_IF_OUT_ERRORS",
+)
+LAG_COUNTER_FIELDS = (
+    "SAI_LAG_STAT_IF_IN_DISCARDS",
+    "SAI_LAG_STAT_IF_IN_ERRORS",
+    "SAI_LAG_STAT_IF_OUT_DISCARDS",
+    "SAI_LAG_STAT_IF_OUT_ERRORS",
+)
+KERNEL_RX_FIELDS = frozenset((
+    "InPktsBadTag", "InPktsUnknownSCI", "InPktsNoSA",
+    "InPktsInvalid", "InPktsLate", "InPktsNotValid",
+    "InPktsNotUsingSA", "InPktsUnusedSA", "InPktsOK",
+    "InOctetsDecrypted", "InOctetsValidated",
+))
+
 
 def _profile_kwargs(profile, priority=None):
     return {
@@ -132,6 +153,266 @@ def _snapshots(environment, ports):
             environment["profile"]["name"], rows=rows[port])
         for port in ports
     }
+
+
+def _counter_result(host, command):
+    result = host.command(command, module_ignore_errors=True, verbose=False)
+    if result.get("failed") or result.get("rc", 0) != 0:
+        raise RuntimeError("Unable to read MACsec diagnostic counters with {}".format(command))
+    return result.get("stdout", "")
+
+
+def _native_counter_sections(output):
+    """Extract only numeric MACsec counters; never retain CLI key material."""
+    sections = {"port": {}, "egress_sc": {}, "egress_sa": {},
+                "ingress_sc": {}, "ingress_sa": {}}
+    current = None
+    for line in output.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("MACsec port("):
+            current = ("port", "port")
+        else:
+            heading = re.match(
+                r"MACsec (Egress|Ingress) (SC|SA) \(([^)]+)\)", stripped)
+            if heading:
+                scope = "{}_{}".format(
+                    heading.group(1).lower(), heading.group(2).lower())
+                current = scope, "sample_{}".format(len(sections[scope]) + 1)
+        if not current or not re.match(
+                r"SAI_MACSEC_(?:PORT|SC|SA)_(?:STAT_|ATTR_CURRENT_XPN\b)",
+                stripped):
+            continue
+        match = NATIVE_COUNTER.fullmatch(stripped)
+        if not match:
+            raise ValueError("Malformed MACsec numeric counter in {}".format(
+                current[0]))
+        scope, identity = current
+        bucket = sections[scope].setdefault(identity, {})
+        if match.group(1) in bucket:
+            raise ValueError("Duplicate MACsec counter in {}".format(scope))
+        bucket[match.group(1)] = int(match.group(2))
+    return {
+        scope: values if values else {"unsupported": "no native counters published"}
+        for scope, values in sections.items()
+    }
+
+
+def _asic_interface_counters(host, namespace, name, portchannel=False):
+    mapping = "COUNTERS_LAG_NAME_MAP" if portchannel else "COUNTERS_PORT_NAME_MAP"
+    oid = _counter_result(
+        host, "sonic-db-cli {} COUNTERS_DB HGET {} {}".format(
+            namespace, shlex.quote(mapping), shlex.quote(name))).strip()
+    if not oid:
+        return {"unsupported": "{} has no COUNTERS_DB object".format(name)}
+    if not re.fullmatch(r"oid:0x[0-9a-fA-F]+", oid):
+        raise ValueError("Invalid COUNTERS_DB object ID for {}".format(name))
+    row = parse_db_hash(_counter_result(
+        host, "sonic-db-cli {} COUNTERS_DB HGETALL {}".format(
+            namespace, shlex.quote("COUNTERS:{}".format(oid)))))
+    fields = LAG_COUNTER_FIELDS if portchannel else PORT_COUNTER_FIELDS
+    counters = {}
+    for field in fields:
+        if field not in row:
+            continue
+        if not row[field].isdigit():
+            raise ValueError("Non-numeric interface diagnostic counter {} on {}".format(
+                field, name))
+        counters[field] = int(row[field])
+    return {
+        "object": oid,
+        "values": counters,
+        "unsupported_fields": sorted(set(fields) - counters.keys()),
+        "unsupported": None if counters else "drop/error fields not published",
+    }
+
+
+def _kernel_rx_counters(value):
+    """Allowlist numeric receive stats; never return raw netlink key material."""
+    if isinstance(value, list):
+        return [_kernel_rx_counters(item) for item in value]
+    if not isinstance(value, dict):
+        return {}
+    result = {
+        key: _counter_number(item, key) if key in KERNEL_RX_FIELDS
+        else _kernel_rx_counters(item)
+        for key, item in value.items()
+        if key in KERNEL_RX_FIELDS or (
+            key in ("rx_sc", "sa_list") and isinstance(item, (dict, list)))
+    }
+    for identity in ("sci", "an", "pn"):
+        item = value.get(identity)
+        if identity == "sci" and isinstance(item, str) and re.fullmatch(r"[0-9a-fA-F:]{1,24}", item):
+            result[identity] = item
+        elif identity in ("an", "pn") and isinstance(item, int) and not isinstance(item, bool) and item >= 0:
+            result[identity] = item
+    expected = ("InPktsBadTag", "InPktsUnknownSCI", "InPktsNoSA") \
+        if "ifname" in value else (
+            "InPktsInvalid", "InPktsLate", "InPktsNotValid",
+            "InPktsNotUsingSA", "InPktsUnusedSA", "InPktsOK",
+        ) if "sci" in value or "an" in value else ()
+    missing = sorted(set(expected) - value.keys())
+    if missing:
+        result["unsupported_fields"] = missing
+    return result
+
+
+def _counter_number(value, field):
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("Invalid kernel diagnostic counter {}".format(field))
+    return value
+
+
+def _kernel_counter_snapshot(host, port):
+    prefix = get_ipnetns_prefix(host, port) + " "
+    links_result = host.command(prefix + "ip -j -d link show",
+                                module_ignore_errors=True, verbose=False)
+    if links_result.get("rc", 0) != 0 or links_result.get("failed"):
+        if "invalid option" in links_result.get("stderr", "").lower():
+            return {"unsupported": "kernel ip link JSON unavailable"}
+        raise RuntimeError("Unable to read kernel MACsec link identities on {}".format(port))
+    links = json.loads(links_result["stdout"])
+    if not isinstance(links, list) or any(not isinstance(link, dict) for link in links):
+        raise ValueError("Invalid kernel MACsec link identities on {}".format(port))
+    underlay = next((link for link in links if link.get("ifname") == port), None)
+    devices = [link for link in links
+               if link.get("linkinfo", {}).get("info_kind") == "macsec"]
+    if not devices:
+        return {"unsupported": "no kernel MACsec netdevices"}
+    matched = [link for link in devices if underlay is not None
+               and link.get("link_index") is not None
+               and link.get("link_index") == underlay.get("ifindex")
+               and isinstance(link.get("ifname"), str)]
+    result = host.command(prefix + "ip -j -s macsec show",
+                          module_ignore_errors=True, verbose=False)
+    if result.get("rc", 0) != 0 or result.get("failed"):
+        stderr = result.get("stderr", "").lower()
+        if ("operation not supported" in stderr
+                or "macsec" in stderr and "unknown" in stderr):
+            return {"unsupported": "kernel MACsec counters not supported"}
+        raise RuntimeError("Unable to read kernel MACsec counters on {}".format(port))
+    stats = json.loads(result["stdout"])
+    if not isinstance(stats, list):
+        raise ValueError("Invalid kernel MACsec counters on {}".format(port))
+    observations = {}
+    for device in devices:
+        if not isinstance(device.get("ifname"), str):
+            raise ValueError("Invalid kernel MACsec device name on {}".format(port))
+        name = device["ifname"]
+        entries = [entry for entry in stats if isinstance(entry, dict)
+                   and entry.get("ifname") == name]
+        observations[name] = {
+            "ifindex": device.get("ifindex"),
+            "underlay_ifindex": device.get("link_index"),
+            "rx": [_kernel_rx_counters(entry) for entry in entries],
+            "unsupported": None if entries else "kernel MACsec RX stats not published",
+            "port_attribution": "selected port" if device in matched else "unmapped namespace device",
+        }
+    return {"devices": observations,
+            "comparability": "absolute only; SC/SA generation not established"}
+
+
+def _kernel_link_counters(host, port, name):
+    command = get_ipnetns_prefix(host, port) + " ip -j -s link show dev " + shlex.quote(name)
+    result = host.command(command, module_ignore_errors=True, verbose=False)
+    if result.get("rc", 0) != 0 or result.get("failed"):
+        if "does not exist" in result.get("stderr", "").lower():
+            return {"unsupported": "kernel link absent in selected namespace"}
+        raise RuntimeError("Unable to read kernel link counters on {}".format(name))
+    parsed = json.loads(result["stdout"])
+    if not isinstance(parsed, list) or len(parsed) != 1 or not isinstance(parsed[0], dict):
+        raise ValueError("Invalid kernel link counters on {}".format(name))
+    link = parsed[0]
+    stats = link.get("stats64", link.get("stats", {}))
+    return {
+        "ifindex": link.get("ifindex"),
+        "underlay_ifindex": link.get("link_index"),
+        "values": {
+            direction: {
+                key: _counter_number(values[key], key)
+                for key in ("dropped", "errors") if key in values
+            }
+            for direction in ("rx", "tx")
+            for values in [stats.get(direction, {})]
+        },
+        "unsupported_fields": {
+            direction: sorted({"dropped", "errors"} - set(stats.get(direction, {})))
+            for direction in ("rx", "tx")
+        },
+        "comparability": "absolute only; kernel interface generation not established",
+    }
+
+
+def _rotation_counter_snapshot(environment, ports):
+    host = environment["duthost"]
+    portchannels = get_portchannel(host)
+    observations = {}
+    for port in ports:
+        namespace = get_namespace_option(host, port)
+        result = host.command(
+            "show macsec {}".format(shlex.quote(port)),
+            module_ignore_errors=True, verbose=False)
+        if result.get("failed") or result.get("rc", 0) != 0:
+            message = "{}\n{}".format(
+                result.get("stdout", ""), result.get("stderr", ""))
+            if re.search(r"(?:no such|unknown|unrecognized) command", message, re.IGNORECASE):
+                native = {"unsupported": "native MACsec counter command unavailable"}
+            else:
+                raise RuntimeError("Unable to read native MACsec counters on {}".format(port))
+        else:
+            native = _native_counter_sections(result.get("stdout", ""))
+            if not result.get("stdout", "").strip():
+                native = {"unsupported": "native MACsec counters not published"}
+        interface = {"port": _asic_interface_counters(host, namespace, port)}
+        pc = find_portchannel_from_member(port, portchannels)
+        if pc:
+            interface["portchannel"] = _asic_interface_counters(
+                host, namespace, pc["name"], portchannel=True)
+        kernel_links = {"port": _kernel_link_counters(host, port, port)}
+        if pc:
+            kernel_links["portchannel"] = _kernel_link_counters(host, port, pc["name"])
+        observations[port] = {
+            "namespace": namespace or "default",
+            "native": native,
+            "interface": interface,
+            "kernel_links": kernel_links,
+            "kernel": _kernel_counter_snapshot(host, port),
+        }
+    return observations
+
+
+def _counter_comparison(before, after):
+    deltas = {}
+    for port, current in after.items():
+        previous = before[port]
+        port_result = {}
+        for scope, values in current["interface"].items():
+            baseline = previous["interface"].get(scope)
+            if (current["namespace"] != previous["namespace"]
+                    or baseline is None or "object" not in baseline
+                    or "object" not in values
+                    or baseline["object"] != values["object"]):
+                port_result[scope] = {"not_comparable": "namespace/object changed or unavailable"}
+                continue
+            common = baseline["values"].keys() & values["values"].keys()
+            port_result[scope] = {
+                field: (values["values"][field] - baseline["values"][field]
+                        if values["values"][field] >= baseline["values"][field]
+                        else "not_comparable: counter reset")
+                for field in sorted(common)
+            }
+            for field in baseline["values"].keys() ^ values["values"].keys():
+                port_result[scope][field] = "not_comparable: counter field absent at one boundary"
+            if not common:
+                port_result[scope]["not_comparable"] = "counter fields unavailable"
+        deltas[port] = {
+            "namespace": current["namespace"],
+            "interface": port_result,
+            "native": {"not_comparable":
+                       "SA/SC object identity not published; absolute counters only"},
+            "kernel": {"not_comparable":
+                       "kernel SC/SA generation not established; absolute counters only"},
+        }
+    return deltas
 
 
 def _wait_link_protected(
@@ -489,49 +770,85 @@ def _rotated_cak(environment, role, new_pair, selected_port, upstream_links):
     before = _snapshots(environment, environment["links"])
     transit_ports = (selected_port, _transit_peer(
         environment, upstream_links, selected_port))
+    counter_samples = {
+        "before_forward": _rotation_counter_snapshot(environment, transit_ports)}
+    logger.info("MACsec %s counter diagnostics before_forward: %s",
+                role, counter_samples["before_forward"])
     attempted = []
     completed = [False]
-    with FailureSafeCleanup("{} rotation".format(role)) as cleanup:
-        cleanup.callback(
-            _restore_rotation, environment, role, original_profile,
+    started = [False]
+    restored = [False]
+
+    def _record_counters(phase):
+        if not started[0]:
+            logger.info("MACsec %s counter diagnostics %s: forward rotation not started",
+                        role, phase)
+            return
+        if phase == "after_restored" and not restored[0]:
+            phase = "after_restoration_failed"
+        counters = _rotation_counter_snapshot(environment, transit_ports)
+        counter_samples[phase] = counters
+        logger.info("MACsec %s counter diagnostics %s: %s; relative_to_before: %s",
+                    role, phase, counters, _counter_comparison(
+                        counter_samples["before_forward"], counters))
+
+    def _restore_keys():
+        _restore_rotation(
+            environment, role, original_profile,
             peer_originals, new_pair, attempted, completed)
-        with _TrafficWindow(environment, upstream_links, port=selected_port) as traffic:
-            _profile_update(
-                environment["duthost"], profile["name"], old_pair[0], old_pair[1],
-                new_pair[0], new_pair[1], is_fallback=role == "fallback")
-            profile["{}_cak".format(role)], profile["{}_ckn".format(role)] = new_pair
-            if role == "primary":
+        restored[0] = True
+
+    with FailureSafeCleanup("{} rotation".format(role)) as cleanup:
+        cleanup.callback(_record_counters, "after_restored")
+        cleanup.callback(_restore_keys)
+        try:
+            with _TrafficWindow(environment, upstream_links, port=selected_port) as traffic:
+                started[0] = True
+                _profile_update(
+                    environment["duthost"], profile["name"], old_pair[0], old_pair[1],
+                    new_pair[0], new_pair[1], is_fallback=role == "fallback")
+                profile["{}_cak".format(role)], profile["{}_ckn".format(role)] = new_pair
+                if role == "primary":
+                    _wait_rotations_settled(
+                        environment, before, profile["fallback_ckn"],
+                        require_all_live=False)
+                    before = _snapshots(environment, environment["links"])
+                ports = [selected_port] + [port for port in environment["links"] if port != selected_port]
+                for adapter in peer_adapters(environment, ports):
+                    attempted.append(adapter.port)
+                    adapter.rotate(role, old_pair, new_pair)
+                require_rekey = True if role == "primary" else (
+                    False if profile["rekey_period"] == 0 else None)
+
+                def _finish_measured_rotation():
+                    for port in transit_ports:
+                        _wait_peer_protected(
+                            peer_adapter(environment, port),
+                            environment["peer_profiles"][port],
+                            profile["primary_ckn"])
+                    endpoint_snapshots = _snapshots(environment, transit_ports)
+                    for port, snapshot in endpoint_snapshots.items():
+                        assert not snapshot.protected_errors(
+                            profile, profile["primary_ckn"]), (
+                                "Transit link {} did not remain protected".format(port))
+                        assert not snapshot.rollover_errors(before[port], require_rekey), (
+                            "Transit link {} did not finish the forward SAK rollover".format(port))
+                    completed[0] = True
+                    traffic.assert_zero_loss()
+
                 _wait_rotations_settled(
-                    environment, before, profile["fallback_ckn"],
-                    require_all_live=False)
-                before = _snapshots(environment, environment["links"])
-            ports = [selected_port] + [port for port in environment["links"] if port != selected_port]
-            for adapter in peer_adapters(environment, ports):
-                attempted.append(adapter.port)
-                adapter.rotate(role, old_pair, new_pair)
-            require_rekey = True if role == "primary" else (
-                False if profile["rekey_period"] == 0 else None)
-
-            def _finish_measured_rotation():
-                for port in transit_ports:
-                    _wait_peer_protected(
-                        peer_adapter(environment, port),
-                        environment["peer_profiles"][port],
-                        profile["primary_ckn"])
-                endpoint_snapshots = _snapshots(environment, transit_ports)
-                for port, snapshot in endpoint_snapshots.items():
-                    assert not snapshot.protected_errors(
-                        profile, profile["primary_ckn"]), (
-                            "Transit link {} did not remain protected".format(port))
-                    assert not snapshot.rollover_errors(before[port], require_rekey), (
-                        "Transit link {} did not finish the forward SAK rollover".format(port))
-                completed[0] = True
-                traffic.assert_zero_loss()
-
-            _wait_rotations_settled(
-                environment, before, profile["primary_ckn"],
-                require_rekey=require_rekey, check_peers=True,
-                on_dut_settled=_finish_measured_rotation)
+                    environment, before, profile["primary_ckn"],
+                    require_rekey=require_rekey, check_peers=True,
+                    on_dut_settled=_finish_measured_rotation)
+        finally:
+            if started[0]:
+                body_failed = sys.exc_info()[0] is not None
+                try:
+                    _record_counters("after_forward")
+                except BaseException:
+                    if not body_failed:
+                        raise
+                    logger.exception("MACsec %s forward counter diagnostics failed after scenario error", role)
         yield
 
 

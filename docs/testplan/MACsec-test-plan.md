@@ -445,6 +445,24 @@ seconds per link). A final batched DUT read must still show the expected
 principal, SAK, and retired SC/SA state after the peer audit. For profile
 rotation this final audit and subsequent recovery are outside the measured
 forward-rotation traffic window.
+Primary and fallback forward rotations also log diagnostic-only DUT counter
+snapshots at `before_forward` (after healthy preflight, before the first
+mutation), `after_forward` (after both ping streams stop, before restoring
+original keys), and `after_restored` when traffic setup began. Forward-end
+capture runs even on a ping-loss failure, and all reads are outside the
+strict loss window. Each snapshot records numeric-only `show macsec` MACsec
+port/SC/SA fields, selected namespace `COUNTERS_DB` Ethernet and PortChannel
+drop/error fields, and kernel link drop/error counts. Where the kernel exposes
+MACsec RX device/SC/SA counters, these are recorded separately; an unproven
+kernel netdevice-to-SONiC-port mapping is marked **unmapped**, not attributed
+to the protected port. Missing capability or fields are explicitly marked
+unsupported, never reported as zero. Only unchanged COUNTERS_DB object OIDs
+with monotonic common fields yield deltas; reset, recreated, or missing objects
+are not comparable. Native MACsec SC/SA and kernel counters remain absolute
+because matching an SCI or AN alone cannot establish the same SA generation.
+No CAK, SAK, or unfiltered MACsec command output is logged. Counters provide
+diagnosis, not a new verdict: exact bidirectional ping loss and protected
+session/SA checks retain their existing requirements.
 Desired CONFIG_DB is not rolled back by runtime failure: a healthy old applied
 participant can remain degraded/pending until fresh safe conditions allow
 reconciliation. The multi-port case verifies this separately from normal
