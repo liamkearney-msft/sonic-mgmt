@@ -781,8 +781,8 @@ def _rotated_cak(environment, role, new_pair, selected_port, upstream_links):
         environment, upstream_links, selected_port))
     counter_samples = {
         "before_forward": _rotation_counter_snapshot(environment, transit_ports)}
-    logger.info("MACsec %s counter diagnostics before_forward: %s",
-                role, counter_samples["before_forward"])
+    logger.warning("MACsec %s counter diagnostics before_forward (diagnostic only): %s",
+                   role, counter_samples["before_forward"])
     attempted = []
     completed = [False]
     started = [False]
@@ -790,16 +790,16 @@ def _rotated_cak(environment, role, new_pair, selected_port, upstream_links):
 
     def _record_counters(phase):
         if not started[0]:
-            logger.info("MACsec %s counter diagnostics %s: forward rotation not started",
-                        role, phase)
+            logger.warning("MACsec %s counter diagnostics %s (diagnostic only): "
+                           "forward rotation not started", role, phase)
             return
         if phase == "after_restored" and not restored[0]:
             phase = "after_restoration_failed"
         counters = _rotation_counter_snapshot(environment, transit_ports)
         counter_samples[phase] = counters
-        logger.info("MACsec %s counter diagnostics %s: %s; relative_to_before: %s",
-                    role, phase, counters, _counter_comparison(
-                        counter_samples["before_forward"], counters))
+        logger.warning("MACsec %s counter diagnostics %s (diagnostic only): %s; relative_to_before: %s",
+                       role, phase, counters, _counter_comparison(
+                           counter_samples["before_forward"], counters))
 
     def _restore_keys():
         _restore_rotation(

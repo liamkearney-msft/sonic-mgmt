@@ -463,7 +463,10 @@ are not comparable. Native MACsec SC/SA and kernel counters remain absolute
 because matching an SCI or AN alone cannot establish the same SA generation.
 No CAK, SAK, or unfiltered MACsec command output is logged. Counters provide
 diagnosis, not a new verdict: exact bidirectional ping loss and protected
-session/SA checks retain their existing requirements.
+session/SA checks retain their existing requirements. These sanitized phase
+records use the warning console level so scheduler test logs retain them even
+when `--log-cli-level=warning`; the warning level is for visibility, not an
+additional test failure.
 Desired CONFIG_DB is not rolled back by runtime failure: a healthy old applied
 participant can remain degraded/pending until fresh safe conditions allow
 reconciliation. The multi-port case verifies this separately from normal
