@@ -77,15 +77,11 @@ PORT_COUNTER_FIELDS = (
     "SAI_PORT_STAT_IF_OUT_DISCARDS",
     "SAI_PORT_STAT_IF_OUT_ERRORS",
 )
-LAG_COUNTER_FIELDS = (
-    "SAI_LAG_STAT_IF_IN_DISCARDS",
-    "SAI_LAG_STAT_IF_IN_ERRORS",
-    "SAI_LAG_STAT_IF_OUT_DISCARDS",
-    "SAI_LAG_STAT_IF_OUT_ERRORS",
-)
 KERNEL_RX_FIELDS = frozenset((
     "InPktsBadTag", "InPktsUnknownSCI", "InPktsNoSA",
+    "InPktsNoTag", "InPktsNoSCI", "InPktsOverrun",
     "InPktsInvalid", "InPktsLate", "InPktsNotValid",
+    "InPktsDelayed", "InPktsUnchecked",
     "InPktsNotUsingSA", "InPktsUnusedSA", "InPktsOK",
     "InOctetsDecrypted", "InOctetsValidated",
 ))
@@ -209,7 +205,7 @@ def _asic_interface_counters(host, namespace, name, portchannel=False):
     row = parse_db_hash(_counter_result(
         host, "sonic-db-cli {} COUNTERS_DB HGETALL {}".format(
             namespace, shlex.quote("COUNTERS:{}".format(oid)))))
-    fields = LAG_COUNTER_FIELDS if portchannel else PORT_COUNTER_FIELDS
+    fields = PORT_COUNTER_FIELDS
     counters = {}
     for field in fields:
         if field not in row:
@@ -222,7 +218,9 @@ def _asic_interface_counters(host, namespace, name, portchannel=False):
         "object": oid,
         "values": counters,
         "unsupported_fields": sorted(set(fields) - counters.keys()),
-        "unsupported": None if counters else "drop/error fields not published",
+        "unsupported": None if counters else (
+            "LAG object has no published port drop/error fields" if portchannel
+            else "drop/error fields not published"),
     }
 
 
@@ -245,11 +243,22 @@ def _kernel_rx_counters(value):
             result[identity] = item
         elif identity in ("an", "pn") and isinstance(item, int) and not isinstance(item, bool) and item >= 0:
             result[identity] = item
-    expected = ("InPktsBadTag", "InPktsUnknownSCI", "InPktsNoSA") \
-        if "ifname" in value else (
+    if "ifname" in value:
+        expected = ("InPktsBadTag", "InPktsUnknownSCI", "InPktsNoSA",
+                    "InPktsNoTag", "InPktsNoSCI", "InPktsOverrun")
+    elif "sci" in value:
+        expected = (
             "InPktsInvalid", "InPktsLate", "InPktsNotValid",
             "InPktsNotUsingSA", "InPktsUnusedSA", "InPktsOK",
-        ) if "sci" in value or "an" in value else ()
+            "InPktsDelayed", "InPktsUnchecked",
+        )
+    elif "an" in value:
+        expected = (
+            "InPktsInvalid", "InPktsLate", "InPktsNotValid",
+            "InPktsNotUsingSA", "InPktsUnusedSA", "InPktsOK",
+        )
+    else:
+        expected = ()
     missing = sorted(set(expected) - value.keys())
     if missing:
         result["unsupported_fields"] = missing

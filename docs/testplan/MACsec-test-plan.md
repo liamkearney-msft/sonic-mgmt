@@ -452,7 +452,8 @@ original keys), and `after_restored` when traffic setup began. Forward-end
 capture runs even on a ping-loss failure, and all reads are outside the
 strict loss window. Each snapshot records numeric-only `show macsec` MACsec
 port/SC/SA fields, selected namespace `COUNTERS_DB` Ethernet and PortChannel
-drop/error fields, and kernel link drop/error counts. Where the kernel exposes
+drop/error fields (PortChannel LAG objects often publish none), and kernel link
+drop/error counts. Where the kernel exposes
 MACsec RX device/SC/SA counters, these are recorded separately; an unproven
 kernel netdevice-to-SONiC-port mapping is marked **unmapped**, not attributed
 to the protected port. Missing capability or fields are explicitly marked
