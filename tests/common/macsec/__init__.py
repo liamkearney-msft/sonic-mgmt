@@ -18,7 +18,7 @@ from .macsec_config_helper import setup_macsec_configuration
 from .macsec_config_helper import cleanup_macsec_configuration
 from .macsec_config_helper import is_macsec_configured
 from .macsec_config_helper import get_macsec_enable_status, get_macsec_profile
-from .macsec_config_helper import generate_macsec_profile
+from .macsec_config_helper import generate_per_interface_macsec_profiles
 from .macsec_config_helper import setup_macsec_multi_profile_configuration
 from .macsec_config_helper import cleanup_macsec_multi_profile_configuration
 from .macsec_config_helper import enable_macsec_port
@@ -29,6 +29,11 @@ from tests.common.plugins.sanity_check import sanity_check
 from tests.common.utilities import wait_until
 
 logger = logging.getLogger(__name__)
+
+FALLBACK_ONLY_PROFILES = {
+    "MACSEC_PROFILE_FALLBACK",
+    "MACSEC_PROFILE_FALLBACK_INTEGRITY",
+}
 
 
 class MacsecPlugin(object):
@@ -48,7 +53,9 @@ class MacsecPlugin(object):
     def _generate_macsec_profile(self, metafunc):
         value = metafunc.config.getoption("macsec_profile")
         if value == 'all':
-            return natsort.natsorted(list(self.macsec_profiles.keys()))
+            return natsort.natsorted(
+                name for name in self.macsec_profiles
+                if name not in FALLBACK_ONLY_PROFILES)
         return [x for x in value.split(',') if x in self.macsec_profiles]
 
     def pytest_generate_tests(self, metafunc):
@@ -59,6 +66,10 @@ class MacsecPlugin(object):
                                  [self.macsec_profiles[x] for x in profiles],
                                  ids=profiles,
                                  scope="module")
+
+    def use_all_links(self, macsec_duthost):
+        return macsec_duthost.duthosts.request.config.getoption(
+            "--macsec_all_links", default=False)
 
     def get_ctrl_nbr_names(self, macsec_duthost, nbrhosts, tbinfo):
         return NotImplementedError()
@@ -77,41 +88,39 @@ class MacsecPlugin(object):
         When ``--per_interface_macsec`` is set, generates a unique
         ``MACSEC_PROFILE_<port>`` for every controlled port using the same
         cipher_suite, policy, send_sci, priority, and rekey_period as the base
-        ``--macsec_profile``, but with unique CAK/CKN per port.
+        ``--macsec_profile``, with unique primary and fallback CAK/CKN pairs.
         """
         if not request.config.getoption("per_interface_macsec", default=False):
             return None
         if len(ctrl_links) < 2:
             pytest.skip("Per-interface profile tests require at least 2 controlled links")
-        profiles = {}
-        for dut_port in ctrl_links:
-            profiles[dut_port] = generate_macsec_profile(
-                port_name=dut_port,
-                cipher_suite=macsec_profile["cipher_suite"],
-                priority=macsec_profile["priority"],
-                policy=macsec_profile["policy"],
-                send_sci=macsec_profile["send_sci"],
-                rekey_period=macsec_profile["rekey_period"],
-            )
-        return profiles
+        return generate_per_interface_macsec_profiles(
+            ctrl_links, macsec_profile)
 
     @pytest.fixture(scope="module")
     def start_macsec_service(self, macsec_duthost, macsec_nbrhosts):
         def __start_macsec_service():
-            enable_macsec_feature(macsec_duthost, macsec_nbrhosts)
+            return enable_macsec_feature(macsec_duthost, macsec_nbrhosts)
         return __start_macsec_service
 
     @pytest.fixture(scope="module")
     def stop_macsec_service(self, macsec_duthost, macsec_nbrhosts):
-        def __stop_macsec_service():
-            disable_macsec_feature(macsec_duthost, macsec_nbrhosts)
+        def __stop_macsec_service(changed_hosts=None):
+            disable_macsec_feature(
+                macsec_duthost,
+                macsec_nbrhosts,
+                changed_hosts=changed_hosts,
+            )
         return __stop_macsec_service
 
     @pytest.fixture(scope="module")
     def macsec_feature(self, start_macsec_service, stop_macsec_service):
-        start_macsec_service()
-        yield
-        stop_macsec_service()
+        changed_hosts = start_macsec_service()
+        try:
+            yield
+        finally:
+            if changed_hosts:
+                stop_macsec_service(changed_hosts)
 
     @pytest.fixture(scope="module")
     def startup_macsec(self, request, macsec_duthost, ctrl_links, macsec_profile, port_profiles, tbinfo):
@@ -150,9 +159,15 @@ class MacsecPlugin(object):
                 setup_macsec_configuration(macsec_duthost, ctrl_links,
                                            profile['name'], profile['priority'], profile['cipher_suite'],
                                            profile['primary_cak'], profile['primary_ckn'], profile['policy'],
-                                           profile['send_sci'], profile['rekey_period'], tbinfo)
+                                           profile['send_sci'], profile['rekey_period'], tbinfo,
+                                           profile.get('fallback_cak'), profile.get('fallback_ckn'))
             logger.info(
-                "Setup MACsec configuration with arguments:\n{}".format(locals()))
+                "Setup MACsec configuration profile=%s ports=%s "
+                "per_interface=%s",
+                profile["name"],
+                sorted(ctrl_links),
+                bool(port_profiles),
+            )
 
         return __startup_macsec
 
@@ -332,6 +347,8 @@ class MacsecPluginT0(MacsecPlugin):
         super(MacsecPluginT0, self).__init__()
 
     def get_ctrl_nbr_names(self, macsec_duthost, nbrhosts, tbinfo):
+        if self.use_all_links(macsec_duthost):
+            return natsort.natsorted(nbrhosts.keys())
         ctrl_nbr_names = natsort.natsorted(nbrhosts.keys())[:2]
         return ctrl_nbr_names
 
@@ -355,6 +372,8 @@ class MacsecPluginT2(MacsecPlugin):
         super(MacsecPluginT2, self).__init__()
 
     def get_ctrl_nbr_names(self, macsec_duthost, nbrhosts, tbinfo):
+        if self.use_all_links(macsec_duthost):
+            return natsort.natsorted(nbrhosts.keys())
         ctrl_nbr_names = []
         mg_facts = macsec_duthost.get_extended_minigraph_facts(tbinfo)
         if 'macsec_neighbors' in mg_facts:

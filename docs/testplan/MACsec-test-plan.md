@@ -48,7 +48,7 @@
 | Check the Data plane                                                 | Completed |                                                   |
 | Refresh SAK - timer based                                            | Completed |                                                   |
 | Refresh SAK - packet number based                                    |  Ongoing  |                                                   |
-| MACsec Key rotation, Primary/Fallback CAK                            | Not start | Feature hasn't been supported                    |
+| MACsec Key rotation, Primary/Fallback CAK                            | Implemented; targeted validation | Explicit dual-CA opt-in; primary and fallback rotation passed on physical hardware; remaining scenarios need lab validation |
 | MACsec Counters                                                      |  Ongoing  |                                                   |
 | COPP                                                                 |  Ongoing  |                                                   |
 | Port channel with MACsec                                             | Completed |                                                   |
@@ -117,6 +117,21 @@ About the detail to set the testbed, please refer the doc: https://github.com/so
 ``` bash
 ./run_tests.sh -u -n vms-kvm-t0 -d vlab-01 -c macsec/test_macsec.py -f vtestbed.csv -i veos_vtb -e "--neighbor_type=sonic"
 ```
+
+Fallback CAK/rollover tests require an explicitly selected dual-CA profile, for
+example `--macsec_profile MACSEC_PROFILE_FALLBACK` (or
+`MACSEC_PROFILE_FALLBACK_INTEGRITY`). These profiles are not included in the
+legacy `--macsec_profile all` sweep. Selecting a primary-only profile skips
+`macsec/test_fallback_cak.py` before MACsec setup; an incomplete fallback CAK/CKN
+pair is a configuration error, not a skip.
+
+The targeted fallback module uses a shared profile. `--per_interface_macsec`
+is a separate, explicitly selected generation mode: it creates unique primary
+and fallback pairs for the normal per-interface/control-plane/deployment tests,
+and skips the shared-profile fallback module. Stress cases additionally require
+`--run-stress-tests`; all-link scale coverage requires `--macsec_all_links`.
+The cold-reboot and bounded rotation stress cases run only with
+`MACSEC_PROFILE_FALLBACK`, not the integrity profile.
 
 ## Common Configuration
 
@@ -336,7 +351,121 @@ SAI_MACSEC_SA_ATTR_CONFIGURED_EGRESS_XPN            │
 
 #### MACsec Key rotation, Primary/Fallback CAK
 
-   TODO
+`macsec/test_fallback_cak.py` exercises supported SONiC config commands with
+SONiC or cEOS peers. Its requirements come from the
+[fallback CAK HLD](https://github.com/sonic-net/SONiC/pull/2495) and
+[MKA state/rotation HLD](https://github.com/sonic-net/SONiC/pull/2545).
+
+| Scenario | Acceptance evidence |
+| --- | --- |
+| Primary and fallback healthy | Exact configured/runtime CKNs and roles, protected Controlled Port, one receive SC, encoding SA, and required namespace-local MKA STATE_DB fields including key-server SCI |
+| Primary mismatch/deletion and recovery | Fallback then primary ownership, observed new SAK distribution/reception and transmit encoding key, bidirectional key convergence and old-SA retirement |
+| Primary/fallback hot replacement | One mutation per peer/namespace/profile scope, measured forward survivor protection and new participant/SAK convergence, followed by independently verified restoration outside the loss window |
+| Unsafe alternate with safe sibling | Structurally valid update persists desired CONFIG_DB; unsafe peer-present port retains its original applied participant with `query_status=ok,config_status=degraded` while safe sibling applies the replacement; after the alternate recovers, the pending port converges without a second CLI update |
+| Invalid profile update | Unknown/duplicate/malformed CKN, malformed CAK, and primary-only profile updates are rejected without CONFIG_DB mutation, including an unattached primary-only profile |
+| Both CAs invalid | Blocked Controlled Port, no SAs, failed traffic in both directions, then recovery of a matching profile (cEOS also restores fallback before primary) |
+| Explicit disable and manager restart | Disable independently deletes both MKA tables; restart requires newer successful publication, a new manager PID, unchanged WPA processes and strict traffic continuity |
+| Bounded stress and counters | Alternating replacements/restorations and a periodic-SAK boundary; counters are compared across migration only while the same installed SAK is observable |
+
+Exact-loss checks use continuous 10-Hz ICMP streams in both directions between
+two distinct controlled neighbors on the same ASIC; neither endpoint is a DUT
+address. A source-bound host route via each neighbor's DUT-facing gateway is
+installed only when needed and removed on cleanup. Both neighbor routes and
+the DUT's connected routes are checked against the selected protected ports
+(direct or single-member PortChannels), so a bypass or ECMP path is not accepted.
+Topologies without two such neighbors explicitly skip transit traffic cases.
+The both-invalid case uses each neighbor's existing data-VRF `/32` loopback,
+not its routed MACsec interface address (which can disappear while blocked).
+It owns temporary EOS static `/32` routes via each DUT gateway and runtime-only,
+namespace-local DUT FRR `/32` routes via the selected neighbor links. Existing
+exact routes are never replaced; no route is saved to CONFIG_DB or disk. The
+test checks the namespace-local FRR route, exact ASIC route and direct
+next-hop IP and default VRF, with the next-hop router-interface port OID
+matching the selected protected port's COUNTERS_DB mapping. An APPL route row,
+if still present, must agree; kernel route-get alone is not ASIC forwarding
+proof. If the switch lacks a default-VRF attribute, the existing ASIC default
+route's VRF ID supplies the comparison; absent/ambiguous VRF evidence is an
+error, not success. Both forwarding interfaces and healthy two-way transit
+are checked before changing either CAK. The same endpoints and owned routes
+remain through both
+blocked-direction probes and matching-profile recovery, after which each
+owned route is independently removed and absence verified. A blocked MACsec
+session may make a fresh gateway route lookup unreachable; this is not itself
+the traffic verdict. Zero ping replies (or an explicit ping network-unreachable
+error) establish no forwarding; bind, transport, authentication, and invalid
+ping errors fail instead. Unsupported loopback or FIB proof is not a pass.
+For primary/fallback profile rotation (including stress/periodic cases),
+prerequisite health, route setup, warm-up, and baseline snapshots happen before
+the loss window. Both continuous transit streams establish a startup reply
+boundary before the first key update; only replies after those boundaries
+count toward the strict zero-loss verdict. The window covers all forward DUT
+and peer key changes, affected DUT SAK/SC/SA convergence, and both
+traffic-endpoint peers. It is drained and
+assessed before the serial all-peer audit and original-key restoration. Those
+later steps still must pass functional state checks but are not claimed hitless.
+Other scenarios retain their existing traffic boundaries. A protocol-derived
+settle window and the 20-second retirement
+failsafe are combined with publication/convergence evidence, rather than
+closing the window as soon as a principal row appears. Standby rotation with
+periodic rekey disabled must leave the active SAK unchanged. These are sampled
+endpoint traffic checks, not an independent line-rate packet-generator result.
+At shutdown each ping is allowed a short post-exit log flush before its summary
+is read; only an in-flight final probe beyond the pre-stop reply boundary is
+excluded. Any missing sequence inside the measured window remains a failure.
+
+cEOS supports delete-only key injection; that scenario is not exposed by the
+supported SONiC configuration API. Crossed-role peer-key-server coverage
+requires four-SA capability. Counter preservation requires a non-periodic
+SONiC key server and a cEOS peer; if publication/sampling misses the inherited
+SA interval, the counter case explicitly skips rather than comparing counters
+on a newly installed SA. The known manager-reconstruction failure on physical
+`vms26-t2-7800-1` skips only manager restart, not explicit disable.
+
+The suite checks the MKA CLI only for command availability to select supported
+images; it intentionally does not assert `show macsec --mka` compact/detail
+output fields or formatting. Protocol and rollover verdicts come from
+namespace-local STATE_DB, configured profiles, installed SAs, and traffic.
+Fallback link snapshots enumerate SONiC ingress and egress SC/SA rows by their
+actual namespace-local APPL_DB keys; they do not query a routed cEOS port's MAC
+(which would toggle its interface mode). On cEOS peers the suite checks
+read-only participant, configured CKN, and controlled-port status; it does not
+claim cEOS-side SC/SA or packet-counter snapshots. DUT receive/transmit SAK
+agreement, old-SA retirement, and exact bidirectional endpoint traffic remain
+mandatory. A serialized, read-only DUT command gathers namespace-local MKA
+and SC/SA rows for all affected links in one observation, rather than
+dispatching overlapping Ansible connections against a shared host. The
+protocol/publication deadline is shared across links instead of resetting
+per link. Read errors propagate; missing or extra SC/SA rows cannot count as
+healthy. SONiC's `MACSEC_PORT_TABLE.state=ok` records port creation, not
+authenticated Controlled Port status; blocked-state verdicts use MKA state,
+APPL_DB enable, actual SA teardown, and traffic instead.
+Once every DUT link settles within that protocol deadline, all affected peers
+are inspected serially under a separate bounded audit (30 seconds plus 15
+seconds per link). A final batched DUT read must still show the expected
+principal, SAK, and retired SC/SA state after the peer audit. For profile
+rotation this final audit and subsequent recovery are outside the measured
+forward-rotation traffic window.
+Desired CONFIG_DB is not rolled back by runtime failure: a healthy old applied
+participant can remain degraded/pending until fresh safe conditions allow
+reconciliation. The multi-port case verifies this separately from normal
+healthy `in-sync` assertions; it does not use missing alternate liveness alone
+as proof of peerlessness. Peerless owned-runtime, parser/scheduler faults,
+partial add/retry, and direct primary-only desired-state injection require
+controlled component stimuli and are not simulated by this integration suite.
+
+CP-phase injection, slow-peer confirmation, and constrained-SA peer
+interoperability also remain owning-component or specialized acceptance cases;
+the integration suite does not claim coverage from fake helpers or unit tests.
+Stable peer SCI and coherent per-CA key-server election are hitless
+prerequisites, not guarantees for unsupported combinations.
+The cleaned source passed the primary and fallback rotation selectors on an
+Arista 7800 multi-ASIC/cEOS testbed in the
+[2026-10-12 physical run](https://elastictest.org/scheduler/testplan/6acc157e8b5a37fb72edba9f).
+Both strict bidirectional zero-loss checks passed; this run did not exercise
+the entire module. An earlier run of the same test revision had primary
+traffic loss and a fallback peer-command timeout, so one successful run does
+not establish that the scenarios are consistently hitless. The both-invalid
+scenario and other specialized cases still need physical validation.
 
 #### MACsec Counters
 

@@ -9,6 +9,12 @@ from tests.common.macsec.macsec_helper import check_wpa_supplicant_process, chec
                            get_mka_session, get_sci, get_appl_db, get_ipnetns_prefix
 from tests.common.macsec.macsec_config_helper import setup_macsec_configuration, delete_macsec_profile
 from tests.common.macsec.macsec_platform_helper import get_platform, get_macsec_ifname
+from tests.common.macsec.mka_state_helper import (
+    find_secret_fields,
+    get_mka_state,
+    mka_state_cli_supported,
+    validate_mka_snapshot,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +69,37 @@ class TestControlPlane():
             return True
         assert wait_until(300, 5, 3, _test_mka_session)
 
+    def test_mka_operational_state(
+            self, duthost, ctrl_links, macsec_profile, port_profiles,
+            wait_mka_establish):
+        """Verify profiles publish the expected secret-free participants."""
+        if not mka_state_cli_supported(duthost):
+            pytest.skip("SONiC image does not expose MKA operational state")
+
+        for port_name in ctrl_links:
+            profile = (
+                port_profiles[port_name]
+                if port_profiles else macsec_profile
+            )
+
+            def _state_is_healthy():
+                session, participants = get_mka_state(duthost, port_name)
+                if validate_mka_snapshot(
+                        session, participants, profile, profile["primary_ckn"]):
+                    return False
+                return True
+
+            assert wait_until(60, 3, 0, _state_is_healthy), (
+                "MKA operational state did not become healthy on {}"
+            ).format(port_name)
+            session, participants = get_mka_state(duthost, port_name)
+            expected_count = 2 if profile.get("fallback_ckn") else 1
+            assert len(participants) == expected_count
+            assert not find_secret_fields({
+                "session": session,
+                "participants": participants,
+            })
+
     def test_rekey_by_period(self, duthost, ctrl_links, upstream_links, rekey_period, wait_mka_establish):
         if rekey_period == 0:
             pytest.skip("If the rekey period is 0 which means rekey by period isn't active.")
@@ -91,7 +128,9 @@ class TestControlPlane():
     @pytest.mark.disable_loganalyzer
     def test_profile_replace(self, duthost, ctrl_links, port_profiles,
                              profile_name, default_priority, cipher_suite,
-                             primary_cak, primary_ckn, policy, send_sci, rekey_period, tbinfo, wait_mka_establish):
+                             primary_cak, primary_ckn, fallback_cak,
+                             fallback_ckn, policy, send_sci, rekey_period,
+                             tbinfo, wait_mka_establish):
         if port_profiles:
             pytest.skip("Per-interface profile replacement tested in test_per_interface_profile")
         # Only pick one controlled link for profile replace test
@@ -102,7 +141,8 @@ class TestControlPlane():
         # Replace existing profile with new profile
         new_profile_name = profile_name+"_NEW"
         setup_macsec_configuration(duthost, ctrl_link, new_profile_name, default_priority,
-                                   cipher_suite, primary_cak, primary_ckn, policy, send_sci, rekey_period, tbinfo)
+                                   cipher_suite, primary_cak, primary_ckn, policy, send_sci,
+                                   rekey_period, tbinfo, fallback_cak, fallback_ckn)
 
         def check_mka_new_session():
             _, _, new_dut_ingress_sc_table, new_dut_egress_sa_table, new_dut_ingress_sa_table = get_appl_db(
@@ -119,6 +159,7 @@ class TestControlPlane():
         finally:
             # Revert back to original configuration
             setup_macsec_configuration(duthost, ctrl_link, profile_name, default_priority,
-                                       cipher_suite, primary_cak, primary_ckn, policy, send_sci, rekey_period, tbinfo)
+                                       cipher_suite, primary_cak, primary_ckn, policy, send_sci,
+                                       rekey_period, tbinfo, fallback_cak, fallback_ckn)
             # Clean up new macsec profile
             delete_macsec_profile(duthost, new_profile_name)

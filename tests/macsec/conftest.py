@@ -1,6 +1,10 @@
 import pytest
 
+from tests.common.macsec.macsec_config_helper import (
+    macsec_profile_has_fallback,
+)
 from tests.common.macsec.macsec_helper import check_appl_db
+from tests.common.macsec.mka_state_helper import mka_state_cli_supported
 from tests.common.utilities import wait_until
 
 
@@ -22,6 +26,28 @@ def pytest_collection_modifyitems(config, items):
         for item in items:
             if item.path.name == "test_per_interface_profile.py":
                 item.add_marker(skip_per_interface)
+
+    if not config.getoption("enable_macsec"):
+        return
+
+    for item in items:
+        if item.path.name != "test_fallback_cak.py":
+            continue
+        profile = item.callspec.params["macsec_profile"]
+        try:
+            has_fallback = macsec_profile_has_fallback(profile)
+        except ValueError as error:
+            raise pytest.UsageError(
+                "MACsec profile {}: {}".format(profile["name"], error))
+        if not has_fallback:
+            item.add_marker(pytest.mark.skip(
+                reason="Selected MACsec profile has no fallback CAK/CKN pair"))
+
+
+@pytest.fixture(scope="module")
+def mka_state_supported(duthost, wait_mka_establish):
+    """Remember image capability before any deployment transition."""
+    return mka_state_cli_supported(duthost)
 
 
 @pytest.fixture(scope="module")
@@ -64,6 +90,16 @@ def primary_ckn(macsec_profile):
 @pytest.fixture(scope="module")
 def primary_cak(macsec_profile):
     return macsec_profile['primary_cak']
+
+
+@pytest.fixture(scope="module")
+def fallback_ckn(macsec_profile):
+    return macsec_profile.get('fallback_ckn')
+
+
+@pytest.fixture(scope="module")
+def fallback_cak(macsec_profile):
+    return macsec_profile.get('fallback_cak')
 
 
 @pytest.fixture(scope="module")
