@@ -125,21 +125,26 @@ legacy `--macsec_profile all` sweep. Selecting a primary-only profile skips
 `macsec/test_fallback_cak.py` before MACsec setup; an incomplete fallback CAK/CKN
 pair is a configuration error, not a skip.
 
-The targeted fallback module uses a shared profile. `--per_interface_macsec`
+The targeted fallback module uses one shared test-owned DUT profile on two
+selected same-ASIC routed links to different neighbors. `--per_interface_macsec`
 is a separate, explicitly selected generation mode: it creates unique primary
 and fallback pairs for the normal per-interface/control-plane/deployment tests,
 and skips the shared-profile fallback module. Bounded rotation stress cases
 additionally require `--run-stress-tests`; all-link scale coverage is not part
 of this change.
 Both opt-in static fallback profiles explicitly configure a 30-second
-periodic rekey interval using the public profile-add command on the DUT
-and its peer; the fallback fixture checks public profile readback on both
-sides. If an already-bound testbed profile still has a different period, the
-targeted fallback module owns a separate temporary 30-second profile with
-the fixture's known keys, rebinds only its selected controlled DUT/peer links
-through public commands, then restores each observed original binding and
-deletes only its unattached temporary profiles even on failure. It never
-overwrites an existing temporary-profile name or saves this configuration.
+periodic rekey interval. The targeted module always creates one temporary
+30-second DUT profile shared by its two routed links and compatible, independently
+scoped peer profiles using the known fixture keys and the endpoints' public
+key-server priorities. It checks public profile readback on both sides, saves
+the actual original DUT/peer interface bindings, rebinds only those four
+endpoints, then attempts every original binding restoration before deleting
+only unattached test-owned profiles. It refuses pre-existing owned-profile
+names, leaves every other controlled port on its original profile, and never
+saves this configuration. Profile creation, rotation and restoration on
+multi-ASIC DUTs target only the selected pair's ASIC namespace. This is the
+same setup whether the original
+profile's period reads back as 0 or 30 seconds.
 Non-fallback profiles remain unchanged. The cold-reboot and bounded
 replacement stress cases run only with
 `MACSEC_PROFILE_FALLBACK`, not the integrity profile.
@@ -383,7 +388,9 @@ address. A source-bound host route via each neighbor's DUT-facing gateway is
 installed only when needed and removed on cleanup. Both neighbor routes and
 the DUT's connected routes are checked against the selected protected ports
 (direct or single-member PortChannels), so a bypass or ECMP path is not accepted.
-Topologies without two such neighbors explicitly skip transit traffic cases.
+Topologies without two such neighbors skip the targeted fallback module before
+it rebinds any port; the shared fixture pair also supports the unsafe/safe
+desired-state case.
 The both-invalid case uses each neighbor's existing data-VRF `/32` loopback,
 not its routed MACsec interface address (which can disappear while blocked).
 It owns temporary EOS static `/32` routes via each DUT gateway and runtime-only,
@@ -413,7 +420,7 @@ natural SAK refresh after the new selection settles. The second refresh is
 observed from a fresh post-transition SAK baseline with unchanged accepted
 CKNs while both traffic streams are still active; the CAK update's initial
 SAK change cannot by itself satisfy this check. The window is drained and
-assessed before the serial all-peer audit and original-key restoration. Those
+assessed before the serial selected-peer audit and original-key restoration. Those
 later steps still must pass functional state checks but are not claimed hitless.
 Other scenarios retain their existing traffic boundaries. The public MKA
 status and per-port MACsec show commands provide full CKN selection,
@@ -446,9 +453,9 @@ participant/configuration and controlled-port CLI; it does not claim EOS-side
 SAK inspection. A port's admin/oper up state alone is never treated as proof
 of protected traffic. Internal STATE_DB schema, APPL_DB/ASIC_DB row layout,
 process PID and exact old-SA-object retirement are not integration verdicts.
-Once every DUT link settles within that protocol deadline, all affected peers
+Once both selected DUT links settle within that protocol deadline, both peers
 are inspected serially under a separate bounded audit (30 seconds plus 15
-seconds per link). A final batched DUT read must still show the expected
+seconds per link). a final serial DUT read must still show the expected
 principal and public active SAK after the peer audit. For profile
 rotation this final audit and subsequent recovery are outside the measured
 forward-rotation traffic window.
@@ -465,17 +472,26 @@ interoperability also remain owning-component or specialized acceptance cases;
 the integration suite does not claim coverage from fake helpers or unit tests.
 Stable peer SCI and coherent per-CA key-server election are hitless
 prerequisites, not guarantees for unsupported combinations.
-The cleaned source passed the primary and fallback rotation selectors on an
+An earlier source revision passed the primary and fallback rotation selectors on an
 Arista 7800 multi-ASIC/cEOS testbed in the
 [2026-10-12 physical run](https://elastictest.org/scheduler/testplan/6acc157e8b5a37fb72edba9f).
 Both strict bidirectional zero-loss checks passed; this run did not exercise
 the entire module. An earlier run of the same test revision had primary
 traffic loss and a fallback peer-command timeout, so one successful run does
-not establish that the scenarios are consistently hitless. The current
-public-CLI-only simplification has not been physically or VS validated; the
-earlier run is not evidence for its changed operational-state observations.
-The both-invalid scenario and other specialized cases still need physical
-validation.
+not establish that the scenarios are consistently hitless. The subsequent public-CLI revision passed two selected primary/fallback
+rotation cases on SONiC-peer VS with a preconfigured 30-second profile.
+A separate full-module VS run of that revision collected ten cases:
+five passed, two failed in their test bodies, and three skipped. The first
+failure was a peer protected-state assertion after DUT checks passed; the
+second was a timeout while waiting for the unsafe port and peer to reconcile.
+Neither archived failure recorded the specific public condition that failed.
+The skips were cEOS-only deletion on SONiC peers, an existing BGP `/32` route
+guard, and bounded stress without `--run-stress-tests`. The owned-two-link
+fixture and more explicit test flow described above are newer local changes
+and have **not** been exercised on VS or physical hardware; those previous
+runs do not validate this revision. Period-zero original profiles, cEOS and
+multi-ASIC behavior, both-invalid recovery, stress and the full module still
+require appropriate lab coverage.
 
 #### MACsec Counters
 

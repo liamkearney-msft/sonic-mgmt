@@ -289,16 +289,6 @@ def mka_hello_timeout_seconds(session, intervals, default_hello_ms=2000):
     return max(1, int(math.ceil(intervals * hello_ms / 1000.0)))
 
 
-def select_independent_port_pair(ports, scope_by_port):
-    """Pick two ports with distinct peer/profile scopes."""
-    ports = list(ports)
-    for index, unsafe_port in enumerate(ports):
-        for safe_port in ports[index + 1:]:
-            if scope_by_port[unsafe_port] != scope_by_port[safe_port]:
-                return unsafe_port, safe_port
-    return None
-
-
 def cleanup_all(items, cleanup):
     """Run cleanup for every item and re-raise the first failure afterward."""
     first_error = None
