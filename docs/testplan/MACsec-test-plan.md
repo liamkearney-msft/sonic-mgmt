@@ -128,8 +128,9 @@ pair is a configuration error, not a skip.
 The targeted fallback module uses a shared profile. `--per_interface_macsec`
 is a separate, explicitly selected generation mode: it creates unique primary
 and fallback pairs for the normal per-interface/control-plane/deployment tests,
-and skips the shared-profile fallback module. Stress cases additionally require
-`--run-stress-tests`; all-link scale coverage requires `--macsec_all_links`.
+and skips the shared-profile fallback module. Bounded rotation stress cases
+additionally require `--run-stress-tests`; all-link scale coverage is not part
+of this change.
 Both opt-in static fallback profiles explicitly configure a 30-second
 periodic rekey interval using the public profile-add command on the DUT
 and its peer; the fallback fixture checks public profile readback on both

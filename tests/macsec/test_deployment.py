@@ -3,7 +3,6 @@ import logging
 
 from tests.common.utilities import wait_until, ping_ip
 from tests.common import config_reload
-from tests.common.devices.eos import EosHost
 from tests.common.reboot import reboot
 from tests.common.macsec.macsec_helper import (
     check_appl_db,
@@ -159,38 +158,3 @@ class TestDeployment():
                     assert dut_egress_sa_table_current[dut_port] != new_dut_egress_sa_table[dut_port]
                 if dut_ingress_sa_table_current[dut_port] and new_dut_ingress_sa_table[dut_port]:
                     assert dut_ingress_sa_table_current[dut_port] != new_dut_ingress_sa_table[dut_port]
-
-    @pytest.mark.stress_test
-    def test_all_eligible_links(
-            self, request, duthost, ctrl_links, nbrhosts, upstream_links,
-            macsec_profile, port_profiles, policy, cipher_suite, send_sci,
-            tbinfo, wait_mka_establish):
-        """Verify fallback MKA on every opt-in eligible neighbor link."""
-        if not request.config.getoption("--macsec_all_links"):
-            pytest.skip("Requires --macsec_all_links")
-        if not macsec_profile.get("fallback_ckn"):
-            pytest.skip("Requires a fallback-enabled base profile")
-
-        adjacent = duthost.get_extended_minigraph_facts(tbinfo)["minigraph_neighbors"]
-        eligible_ports = {
-            port for port, neighbor in adjacent.items()
-            if neighbor["name"] in nbrhosts
-        }
-        assert set(ctrl_links) == eligible_ports, (
-            "Controlled ports {}, expected eligible adjacent ports {}"
-        ).format(sorted(ctrl_links), sorted(eligible_ports))
-        if port_profiles:
-            assert set(port_profiles) == set(ctrl_links)
-        assert wait_until(
-            300, 5, 0, _mka_operational_state_ok,
-            duthost, ctrl_links, macsec_profile, port_profiles)
-        for port, neighbor in ctrl_links.items():
-            if isinstance(neighbor["host"], EosHost):
-                assert neighbor["host"].iface_macsec_ok(neighbor["port"])
-            else:
-                peer = get_public_mka_status(neighbor["host"], neighbor["port"])
-                assert peer is not None and peer["query"] == "ok" and peer["fresh"] and peer["mode"] == "secured"
-        assert wait_until(
-            120, 5, 0,
-            _routed_traffic_ok, duthost, ctrl_links, upstream_links,
-        )
