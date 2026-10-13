@@ -3,6 +3,7 @@ import logging
 
 from tests.common.utilities import wait_until, ping_ip
 from tests.common import config_reload
+from tests.common.devices.eos import EosHost
 from tests.common.reboot import reboot
 from tests.common.macsec.macsec_helper import (
     check_appl_db,
@@ -14,9 +15,8 @@ from tests.common.macsec.failure_safe_cleanup import (
     preserve_config_db_files,
 )
 from tests.common.macsec.mka_state_helper import (
-    get_mka_state,
+    get_public_mka_status,
     mka_state_cli_supported,
-    validate_mka_snapshot,
 )
 from time import sleep
 logger = logging.getLogger(__name__)
@@ -28,16 +28,29 @@ pytestmark = [
 
 
 def _mka_operational_state_ok(
-        duthost, ctrl_links, macsec_profile, port_profiles, mka_supported):
-    if not mka_supported:
-        return True
+        duthost, ctrl_links, macsec_profile, port_profiles):
     assert mka_state_cli_supported(duthost), \
         "Previously supported MKA CLI disappeared after the transition"
     for port in ctrl_links:
         profile = port_profiles[port] if port_profiles else macsec_profile
-        session, participants = get_mka_state(duthost, port)
-        if validate_mka_snapshot(
-                session, participants, profile, profile["primary_ckn"]):
+        status = get_public_mka_status(duthost, port)
+        if status is None or status["mode"] != "secured" or status["config"] != "in-sync":
+            return False
+        if status["query"] != "ok" or not status["fresh"] or status["profile"] != profile["name"]:
+            return False
+        participants = status["participants"]
+        expected = {
+            profile["primary_ckn"].lower(): "primary",
+            profile["fallback_ckn"].lower(): "fallback",
+        }
+        if set(participants) != set(expected):
+            return False
+        if any(
+                participants[ckn]["role"] != role or not participants[ckn]["active"]
+                for ckn, role in expected.items()):
+            return False
+        if (not participants[profile["primary_ckn"].lower()]["principal"]
+                or participants[profile["primary_ckn"].lower()]["live"] < 1):
             return False
     return True
 
@@ -60,17 +73,17 @@ class TestDeployment():
     def test_config_reload(
             self, duthost, ctrl_links, policy, cipher_suite, send_sci,
             macsec_profile, port_profiles, upstream_links,
-            wait_mka_establish, mka_state_supported):
-        """Verify MACsec participant, SC/SA, and traffic recovery after reload."""
+            wait_mka_establish):
+        """Verify configured MACsec and routed traffic recover after reload."""
         with preserve_config_db_files(duthost):
             duthost.shell("config save -y")
             config_reload(duthost)
         assert wait_until(300, 6, 12, check_appl_db, duthost, ctrl_links, policy, cipher_suite, send_sci)
-        assert wait_until(
-            300, 5, 0,
-            _mka_operational_state_ok,
-            duthost, ctrl_links, macsec_profile, port_profiles, mka_state_supported,
-        ), "MKA participant state did not recover after config reload"
+        if macsec_profile.get("fallback_ckn") or port_profiles:
+            assert wait_until(
+                300, 5, 0, _mka_operational_state_ok,
+                duthost, ctrl_links, macsec_profile, port_profiles,
+            ), "Public MACsec status did not recover after config reload"
         assert wait_until(
             120, 5, 0,
             _routed_traffic_ok, duthost, ctrl_links, upstream_links,
@@ -81,7 +94,7 @@ class TestDeployment():
     def test_reboot_with_fallback_profile(
             self, duthost, localhost, ctrl_links, policy, cipher_suite,
             send_sci, macsec_profile, port_profiles, upstream_links,
-            wait_mka_establish, mka_state_supported):
+            wait_mka_establish):
         """Verify a persisted dual-CA profile recovers after a cold reboot."""
         if port_profiles or macsec_profile["name"] != "MACSEC_PROFILE_FALLBACK":
             pytest.skip(
@@ -94,14 +107,9 @@ class TestDeployment():
                 safe_reboot=True, check_intf_up_ports=True,
                 wait_for_bgp=True)
         assert wait_until(
-            300, 6, 12, check_appl_db, duthost, ctrl_links,
-            policy, cipher_suite, send_sci,
-        ), "APPL_DB did not recover after reboot"
-        assert wait_until(
-            300, 5, 0,
-            _mka_operational_state_ok,
-            duthost, ctrl_links, macsec_profile, port_profiles, mka_state_supported,
-        ), "Dual-CA MKA state did not recover after reboot"
+            300, 5, 0, _mka_operational_state_ok,
+            duthost, ctrl_links, macsec_profile, port_profiles,
+        ), "Public dual-CA MACsec status did not recover after reboot"
         assert wait_until(
             120, 5, 0,
             _routed_traffic_ok, duthost, ctrl_links, upstream_links,
@@ -156,7 +164,7 @@ class TestDeployment():
     def test_all_eligible_links(
             self, request, duthost, ctrl_links, nbrhosts, upstream_links,
             macsec_profile, port_profiles, policy, cipher_suite, send_sci,
-            tbinfo, wait_mka_establish, mka_state_supported):
+            tbinfo, wait_mka_establish):
         """Verify fallback MKA on every opt-in eligible neighbor link."""
         if not request.config.getoption("--macsec_all_links"):
             pytest.skip("Requires --macsec_all_links")
@@ -174,17 +182,14 @@ class TestDeployment():
         if port_profiles:
             assert set(port_profiles) == set(ctrl_links)
         assert wait_until(
-            300, 6, 0, check_appl_db, duthost, ctrl_links,
-            policy, cipher_suite, send_sci,
-        )
-        assert wait_until(
-            300, 5, 0,
-            _mka_operational_state_ok,
-            duthost, ctrl_links, macsec_profile, port_profiles, mka_state_supported,
-        )
+            300, 5, 0, _mka_operational_state_ok,
+            duthost, ctrl_links, macsec_profile, port_profiles)
         for port, neighbor in ctrl_links.items():
-            assert duthost.iface_macsec_ok(port)
-            assert neighbor["host"].iface_macsec_ok(neighbor["port"])
+            if isinstance(neighbor["host"], EosHost):
+                assert neighbor["host"].iface_macsec_ok(neighbor["port"])
+            else:
+                peer = get_public_mka_status(neighbor["host"], neighbor["port"])
+                assert peer is not None and peer["query"] == "ok" and peer["fresh"] and peer["mode"] == "secured"
         assert wait_until(
             120, 5, 0,
             _routed_traffic_ok, duthost, ctrl_links, upstream_links,

@@ -80,7 +80,8 @@
         "fallback_cak": "165b5d56797f717e646d7b322535272470090901075a564e41010176717171712d0b57550b035145515c022a242c05696859485744465e5a537272050a10110735",
         "fallback_ckn": "3031323334353637383941424344454647484950515253545556575859606162",
         "policy": "security",
-        "send_sci": "true"
+        "send_sci": "true",
+        "rekey_period": 30
     },
     "MACSEC_PROFILE_FALLBACK_INTEGRITY": {
         "priority": 64,
@@ -90,6 +91,7 @@
         "fallback_cak": "43030307075f0e5050000e253125207e2d565e731f1a5c4f524f4b2a2e270e0e02",
         "fallback_ckn": "30313233343536373839414243444546",
         "policy": "integrity",
-        "send_sci": "true"
+        "send_sci": "true",
+        "rekey_period": 30
     }
 }

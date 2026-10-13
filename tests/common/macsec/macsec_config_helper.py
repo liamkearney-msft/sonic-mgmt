@@ -1,4 +1,5 @@
 import logging
+import re
 import secrets
 import time
 from passlib.hash import cisco_type7
@@ -177,6 +178,47 @@ def _profile_namespace_options(host, namespace_option):
     return [""]
 
 
+def get_macsec_profile_ckns(host, profile_name, namespace_option="",
+                            include_rekey_period=False, include_priority=False):
+    """Read public profile CKNs and requested nonsecret profile settings."""
+    result = host.command(
+        "show macsec {} --profile".format(namespace_option).strip(),
+        module_ignore_errors=True, verbose=False)
+    if result.get("failed") or result.get("rc", 0) != 0:
+        raise RuntimeError("Unable to read public MACsec profiles on {}".format(host.hostname))
+    profiles = {}
+    current = None
+    for line in result.get("stdout", "").splitlines():
+        if line.startswith("MACsec profile : "):
+            current = line.partition(":")[2].strip()
+            if not current or current in profiles:
+                raise ValueError("Invalid public MACsec profile listing")
+            profiles[current] = {}
+            continue
+        if current is None:
+            continue
+        stripped = line.strip()
+        if not stripped or all(char in "- " for char in stripped):
+            continue
+        field, _, value = stripped.partition(" ")
+        if field in ("primary_ckn", "fallback_ckn"):
+            value = value.strip().lower()
+            if not re.fullmatch(r"[0-9a-f]{32}(?:[0-9a-f]{32})?", value):
+                raise ValueError("Invalid public MACsec profile CKN")
+            profiles[current][field] = value
+        elif field == "rekey_period" and include_rekey_period:
+            value = value.strip()
+            if not value.isdigit() or int(value) <= 0:
+                raise ValueError("Invalid public MACsec periodic rekey interval")
+            profiles[current][field] = value
+        elif field == "priority" and include_priority:
+            value = value.strip()
+            if not value.isdigit() or not 0 <= int(value) <= 255:
+                raise ValueError("Invalid public MACsec key-server priority")
+            profiles[current][field] = value
+    return profiles.get(profile_name)
+
+
 def restore_macsec_profile_key(
         host, profile_name, old_cak, old_ckn, new_cak, new_ckn,
         is_fallback=False, namespace_options=None):
@@ -187,27 +229,17 @@ def restore_macsec_profile_key(
     first_error = None
     for option in namespace_options:
         try:
-            result = host.command(
-                "sonic-db-cli {} CONFIG_DB HGET 'MACSEC_PROFILE|{}' "
-                "{}".format(option, profile_name, field),
-                module_ignore_errors=True, verbose=False)
-            if result.get("failed") or result.get("rc", 0) != 0:
-                raise RuntimeError(
-                    "Unable to read MACsec profile in {}".format(option))
-            current = result.get("stdout", "").strip().lower()
+            profile = get_macsec_profile_ckns(host, profile_name, option)
+            if profile is None or field not in profile:
+                raise AssertionError("Original MACsec profile is missing on {}".format(option))
+            current = profile[field]
             if current == new_ckn.lower():
                 update_macsec_profile_key(
                     host, profile_name, new_cak, new_ckn, old_cak, old_ckn,
                     is_fallback=is_fallback, namespace_option=option,
                     rollback_on_failure=False)
-                restored = host.command(
-                    "sonic-db-cli {} CONFIG_DB HGET 'MACSEC_PROFILE|{}' "
-                    "{}".format(option, profile_name, field),
-                    module_ignore_errors=True, verbose=False)
-                if (restored.get("failed") or
-                        restored.get("rc", 0) != 0 or
-                        restored.get("stdout", "").strip().lower()
-                        != old_ckn.lower()):
+                restored = get_macsec_profile_ckns(host, profile_name, option)
+                if restored is None or restored.get(field) != old_ckn.lower():
                     raise RuntimeError(
                         "MACsec profile restore did not persist in {}".format(
                             option))
@@ -367,11 +399,17 @@ def _macsec_port_command(host, port, operation, profile_name=None):
 
 
 def _macsec_port_profile(host, port):
-    return host.command(
-        "sonic-db-cli {} CONFIG_DB HGET 'PORT|{}' macsec".format(
-            getns_prefix(host, port), port),
-        module_ignore_errors=True,
-    ).get("stdout", "").strip()
+    result = host.command(
+        "show macsec {} {}".format(getns_prefix(host, port), port),
+        module_ignore_errors=True, verbose=False)
+    if result.get("failed") or result.get("rc", 0) != 0:
+        raise RuntimeError("Unable to read public MACsec port profile on {}".format(port))
+    if not re.search(r"(?m)^MACsec port\({}\)".format(re.escape(port)), result.get("stdout", "")):
+        raise ValueError("Public MACsec port output is missing on {}".format(port))
+    match = re.search(r"(?m)^\s*profile\s+(\S+)\s*$", result["stdout"])
+    if not match:
+        raise ValueError("Public MACsec port profile is missing on {}".format(port))
+    return match.group(1)
 
 
 def enable_macsec_port(host, port, profile_name):
@@ -470,15 +508,6 @@ def _macsec_feature_enabled(host):
     return features["macsec"] in ("enabled", "always_enabled")
 
 
-def _macsec_processes_running(host):
-    expected = max(1, host.num_asics())
-    containers = host.shell(
-        "docker ps | grep macsec | grep -v grep")["stdout_lines"]
-    managers = host.shell(
-        "ps -ef | grep macsecmgrd | grep -v grep")["stdout_lines"]
-    return len(containers) >= expected and len(managers) >= expected
-
-
 def disable_macsec_feature(
         duthost, macsec_nbrhosts, changed_hosts=None):
     hosts = (
@@ -510,8 +539,8 @@ def enable_macsec_feature(duthost, macsec_nbrhosts):
 
         assert wait_until(
             180, 5, 10,
-            lambda: all(_macsec_processes_running(host) for host in hosts),
-        ), "MACsec service processes did not become ready"
+            lambda: all(_macsec_feature_enabled(host) for host in hosts),
+        ), "Public MACsec feature status did not become enabled"
     except BaseException:
         try:
             disable_macsec_feature(
