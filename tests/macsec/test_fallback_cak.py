@@ -1,45 +1,25 @@
-import hashlib
 import ipaddress
 import logging
+import math
 import re
-import shlex
 import time
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
-from typing import Optional
 
 import pytest
 
 from tests.common.devices.eos import EosHost
 from tests.common.macsec.macsec_config_helper import (
     delete_macsec_profile,
-    eos_macsec_key_line,
     disable_macsec_port,
     enable_macsec_port,
-    generate_macsec_key_pair,
-    get_macsec_profile_ckns,
+    generate_macsec_profile,
     set_macsec_profile,
-    restore_macsec_profile_key,
+    setup_macsec_configuration,
     update_macsec_profile_key,
 )
-from tests.common.macsec.macsec_helper import (
-    get_ipnetns_prefix,
-)
+from tests.common.macsec.macsec_helper import get_ipnetns_prefix, get_mka_status, getns_prefix
 from tests.common.macsec.macsec_platform_helper import find_portchannel_from_member, get_portchannel
-from tests.common.macsec.mka_state_helper import (
-    get_namespace_option,
-    get_mka_status,
-    mka_hello_timeout_seconds,
-    mka_state_cli_supported,
-    parse_eos_mka_participants,
-    parse_eos_profile_ckns,
-    parse_eos_profile_rekey_period,
-    parse_eos_profile_priority,
-    validate_eos_mka_participants,
-    show_macsec_output,
-)
 from tests.common.utilities import wait_until
-
 
 logger = logging.getLogger(__name__)
 
@@ -50,2501 +30,917 @@ pytestmark = [
 ]
 
 FALLBACK_PROFILE = "MACSEC_PROFILE_FALLBACK"
-MKA_TIMEOUT = 30
+BOTH_INVALID_PROFILE = "MACSEC_PROFILE_BOTH_INVALID"
+REKEY_PERIOD = 30
+MKA_TIMEOUT = 60
 MKA_CONVERGE_TIMEOUT = 180
-MKA_STATE_PUBLISH_TIMEOUT = 60
-STRESS_ROTATIONS = 10
 SA_RETIRE_TIMEOUT = 20
+STRESS_ROTATIONS = 10
+PING_REPLY = re.compile(r"bytes from .*icmp_seq[= ](\d+)")
 
 
-def _profile_ckns(host, port, name):
-    return get_macsec_profile_ckns(host, name, get_namespace_option(host, port))
+# ---------------------------------------------------------------------------
+# Public MACsec state
+# ---------------------------------------------------------------------------
+
+def _new_key(cipher_suite):
+    """Return a fresh (cak, ckn) pair for *cipher_suite*."""
+    profile = generate_macsec_profile("FALLBACK_TEST", cipher_suite)
+    return profile["primary_cak"], profile["primary_ckn"]
 
 
-def _macsec_sa_status(host, port):
-    """Read port SAs; keep SAKs in memory, never log the raw text."""
-    output = show_macsec_output(host, port, port)
-    if not re.search(r"(?m)^MACsec port\({}\)".format(re.escape(port)), output):
-        raise ValueError("MACsec port output missing for {}".format(port))
-    result = {"port": {}, "egress": {}, "ingress": {}}
-    direction = None
-    sci = None
-    row = None
+def _profiles(host, namespace_option):
+    """Return {name: fields} from SONiC `show macsec --profile`."""
+    output = host.command("show macsec {} --profile".format(namespace_option), verbose=False)["stdout"]
+    profiles, current = {}, None
     for line in output.splitlines():
-        match = re.search(r"MACsec (Egress|Ingress) (SC|SA) \(([^)]+)\)", line)
-        if match:
-            direction = match.group(1).lower()
-            if match.group(2) == "SC":
-                sci = match.group(3)
-                if sci in result[direction]:
-                    raise ValueError("Duplicate MACsec SC on {}".format(port))
-                result[direction][sci] = {"sc": {}, "sas": {}, "sci": sci}
-                row = result[direction][sci]["sc"]
-            else:
-                if sci is None or sci not in result[direction]:
-                    raise ValueError("MACsec SA without SC on {}".format(port))
-                try:
-                    an = int(match.group(3))
-                except ValueError as error:
-                    raise ValueError("Invalid MACsec association number") from error
-                if an in result[direction][sci]["sas"]:
-                    raise ValueError("Duplicate MACsec SA on {}".format(port))
-                row = result[direction][sci]["sas"].setdefault(an, {})
-            continue
-        stripped = line.strip()
-        if not stripped or re.fullmatch(r"[- ]+", stripped) or stripped.startswith("MACsec port("):
-            if stripped.startswith("MACsec port("):
-                row = result["port"]
-            continue
-        if row is None:
-            continue
-        name, _, value = stripped.partition(" ")
-        if name in ("profile", "enable", "encoding_an", "active", "sak"):
-            row[name] = value.strip()
-    return result
-
-
-def _read_port_profile(host, port):
-    output = show_macsec_output(host, port, port)
-    if not re.search(r"(?m)^MACsec port\({}\)".format(re.escape(port)), output):
-        raise ValueError("MACsec port output missing for {}".format(port))
-    names = re.findall(r"(?m)^\s*profile\s+(\S+)\s*$", output)
-    if len(names) > 1 or len(names) != len(re.findall(
-            r"(?m)^\s*profile\b.*$", output)):
-        raise ValueError("MACsec port binding is ambiguous on {}".format(port))
-    return names[0] if names else None
-
-
-@dataclass
-class LinkState:
-    port: str
-    status: Optional[dict]
-    macsec: dict
-
-    @property
-    def participants(self):
-        return self.status["participants"] if self.status is not None else {}
-
-    def principal_ckns(self):
-        return sorted(
-            ckn for ckn, participant in self.participants.items()
-            if participant["principal"])
-
-    def protected_errors(
-            self, profile, expected_principal, require_all_live=True):
-        status = self.status
-        errors = []
-        if status is None:
-            return ["MKA status is missing"]
-        if status["query"] != "ok" or not status["fresh"]:
-            errors.append("MKA status is not a fresh successful query")
-        if status["profile"] != profile["name"]:
-            errors.append("unexpected MACsec profile")
-        if self.macsec["port"].get("enable") != "true":
-            errors.append("MACsec port is not enabled")
-        if status["mode"] != "secured" or status["kay"] != "active":
-            errors.append("MACsec port is not secured")
-        if status["config"] != "in-sync":
-            errors.append("MACsec configuration is not in-sync")
-        expected = {
-            profile["primary_ckn"].lower(): "primary",
-            profile["fallback_ckn"].lower(): "fallback",
-        }
-        if set(self.participants) != set(expected):
-            errors.append("unexpected MACsec participant CKNs")
-        if self.principal_ckns() != [expected_principal.lower()]:
-            errors.append(
-                "principal CKN: expected {}, observed {}".format(
-                    expected_principal.lower(), self.principal_ckns()))
-        for ckn, role in expected.items():
-            participant = self.participants.get(ckn, {})
-            if participant.get("role") != role or not participant.get("active"):
-                errors.append("{} MACsec participant is not active as {}".format(ckn, role))
-            if (require_all_live or ckn == expected_principal.lower()) and participant.get("live", 0) < 1:
-                errors.append("{} MACsec participant has no live peer".format(ckn))
-        transmitting = []
-        for tx in self.macsec["egress"].values():
-            try:
-                an = int(tx["sc"]["encoding_an"])
-            except (KeyError, TypeError, ValueError):
-                continue
-            sak = tx["sas"].get(an, {}).get("sak")
-            if sak:
-                transmitting.append(sak)
-        if len(transmitting) != 1:
-            errors.append("expected one encoding transmit SAK")
-        if not any(
-                sa.get("active") == "true" and sa.get("sak") in transmitting
-                for sc in self.macsec["ingress"].values()
-                for sa in sc["sas"].values()):
-            errors.append("receive SAK does not match active transmit SAK")
-        return errors
-
-    def blocked_errors(self, expected_ckns):
-        errors = []
-        if self.status is None:
-            return errors
-        if self.status["query"] != "ok" or not self.status["fresh"]:
-            return ["MKA status is not a fresh successful query"]
-        if self.status["mode"] == "secured":
-            errors.append("MACsec controlled port remains secured")
-        if any(sc["sas"] for sc in self.macsec["egress"].values()) or any(
-                sc["sas"] for sc in self.macsec["ingress"].values()):
-            errors.append("MACsec SAs remain installed")
-        if set(self.participants) != {ckn.lower() for ckn in expected_ckns}:
-            errors.append("participant CKN set does not match")
-        for ckn, participant in self.participants.items():
-            if not participant["active"]:
-                errors.append("{} is not active".format(ckn))
-            if participant["live"] != 0:
-                errors.append("{} retains a live peer".format(ckn))
-        return errors
-
-    def active_key_identity(self):
-        for sc in self.macsec["egress"].values():
-            an = sc["sc"].get("encoding_an")
-            if an and an.isdigit():
-                sak = sc["sas"].get(int(an), {}).get("sak")
-                if sak:
-                    return sak
-        return None
-
-    def rollover_errors(self, before, require_rekey=True):
-        current = self.active_key_identity()
-        previous = before.active_key_identity()
-        errors = []
-        if current is None:
-            errors.append("active transmit SAK is missing")
-        if require_rekey is True and current == previous:
-            errors.append("transmit SAK did not change")
-        if require_rekey is False and current != previous:
-            errors.append("standby rotation changed transmit SAK")
-        if current is not None and not any(
-                sa.get("active") == "true" and sa.get("sak") == current
-                for sc in self.macsec["ingress"].values()
-                for sa in sc["sas"].values()):
-            errors.append("active receive SAK does not match transmit SAK")
-        return errors
-
-
-def read_link_state(duthost, port):
-    status = get_mka_status(duthost, port)
-    macsec = _macsec_sa_status(duthost, port) if status is not None else {
-        "port": {}, "egress": {}, "ingress": {}}
-    return LinkState(port=port, status=status, macsec=macsec)
-
-
-class PeerAdapter:
-    provider = "peer"
-    supports_primary_delete = False
-    primary_delete_unsupported_reason = (
-        "delete-only CA fault injection is not exposed by the supported "
-        "SONiC configuration API"
-    )
-
-    def __init__(self, environment, port):
-        self.environment = environment
-        self.port = port
-        self.host = environment["links"][port]["host"]
-        self.peer_port = environment["links"][port]["port"]
-        self.profile_name = environment["neighbor_profiles"][port]
-
-    @property
-    def namespace_option(self):
-        return get_namespace_option(self.host, self.peer_port)
-
-    @staticmethod
-    def profile_with_pair(profile, role, pair):
-        updated = dict(profile)
-        updated["{}_cak".format(role)] = pair[0]
-        updated["{}_ckn".format(role)] = pair[1]
-        return updated
-
-    def commit_profile(self, profile):
-        self.environment["peer_profiles"][self.port] = dict(profile)
-
-    def rotate(
-            self, role, old_pair, new_pair, commit=True,
-            base_profile=None):
-        update_macsec_profile_key(
-            self.host,
-            self.profile_name,
-            old_pair[0],
-            old_pair[1],
-            new_pair[0],
-            new_pair[1],
-            is_fallback=role == "fallback",
-            namespace_option=self.namespace_option,
-        )
-        updated = self.profile_with_pair(
-            base_profile or self.environment["peer_profiles"][self.port],
-            role,
-            new_pair,
-        )
-        if commit:
-            self.commit_profile(updated)
-
-    def restore_key(self, role, original_profile, replacement_pair):
-        original_pair = (
-            original_profile["{}_cak".format(role)],
-            original_profile["{}_ckn".format(role)],
-        )
-        restore_macsec_profile_key(
-            self.host, self.profile_name,
-            original_pair[0], original_pair[1],
-            replacement_pair[0], replacement_pair[1],
-            is_fallback=role == "fallback",
-            namespace_options=[self.namespace_option])
-
-    def create_profile(self, profile_name, profile, priority=None):
-        set_macsec_profile(
-            self.host, profile_name,
-            profile["priority"] if priority is None else priority,
-            profile["cipher_suite"],
-            profile["primary_cak"], profile["primary_ckn"],
-            profile["policy"], profile["send_sci"],
-            profile["rekey_period"], profile.get("fallback_cak"),
-            profile.get("fallback_ckn"),
-            namespace_option=self.namespace_option,
-        )
-
-    def rebind(self, profile_name, profile=None):
-        disable_macsec_port(self.host, self.peer_port)
-        enable_macsec_port(self.host, self.peer_port, profile_name)
-        self.profile_name = profile_name
-        self.environment["neighbor_profiles"][self.port] = profile_name
-        if profile is not None:
-            self.environment["peer_profiles"][self.port] = dict(profile)
-
-    def protected_errors(
-            self, profile, expected_principal, require_all_live=True):
-        snapshot = self.snapshot()
-        peer_profile = dict(profile, name=self.environment["neighbor_profiles"][self.port])
-        return snapshot.protected_errors(
-            peer_profile,
-            expected_principal,
-            require_all_live=require_all_live,
-        )
-
-    def blocked_errors(self, expected_ckns):
-        return self.snapshot().blocked_errors(expected_ckns)
-
-    def snapshot(self):
-        return read_link_state(self.host, self.peer_port)
-
-    def normalized_state(self):
-        snapshot = self.snapshot()
-        configured = _profile_ckns(self.host, self.peer_port, self.profile_name)
-        if configured is None:
-            raise AssertionError("Peer MACsec profile is missing")
-        return {
-            "participants": snapshot.participants,
-            "configured_ckns": set(configured.values()),
-        }
-
-    def diagnostics(self):
-        return self.snapshot().status
-
-
-class EosPeerAdapter(PeerAdapter):
-    provider = "ceos"
-    supports_primary_delete = True
-
-    @property
-    def namespace_option(self):
-        return ""
-
-    def _configure_key(self, pair, fallback=False, remove=False):
-        self.host.eos_config(
-            lines=[eos_macsec_key_line(
-                pair[1], pair[0], is_fallback=fallback, remove=remove)],
-            parents=["mac security", "profile {}".format(self.profile_name)],
-        )
-
-    def delete_primary_if_supported(self, primary_pair):
-        self._configure_key(primary_pair, remove=True)
-
-    def add_primary(self, primary_pair):
-        self._configure_key(primary_pair)
-
-    def delete_fallback(self, fallback_pair):
-        self._configure_key(fallback_pair, fallback=True, remove=True)
-
-    def add_fallback(self, fallback_pair):
-        self._configure_key(fallback_pair, fallback=True)
-
-    def primary_removed_errors(self, original_profile):
-        snapshot = self.snapshot()
-        primary_ckn = original_profile["primary_ckn"].lower()
-        fallback_ckn = original_profile["fallback_ckn"].lower()
-        errors = []
-        if snapshot["configured_ckns"] != {fallback_ckn}:
-            errors.append(
-                "configured CKN set does not contain only fallback")
-        if set(snapshot["participants"]) != {fallback_ckn}:
-            errors.append(
-                "runtime participant set does not contain only fallback")
-        if primary_ckn in snapshot["participants"]:
-            errors.append("removed primary remains in runtime participants")
-        fallback = snapshot["participants"].get(fallback_ckn, {})
-        if not fallback.get("success"):
-            errors.append("fallback is not successful")
-        if not fallback.get("active"):
-            errors.append("fallback is not active")
-        if fallback.get("live_peers", 0) < 1:
-            errors.append("fallback has no live peer")
-        if not snapshot["controlled_port"]:
-            errors.append("cEOS controlled port is closed")
-        return errors
-
-    def restore_key(self, role, original_profile, mismatched_pair):
-        configured_ckns = self.snapshot()["configured_ckns"]
-        original_pair = (
-            original_profile["{}_cak".format(role)],
-            original_profile["{}_ckn".format(role)],
-        )
-        original_ckn = original_pair[1].lower()
-        mismatched_ckn = mismatched_pair[1].lower()
-        other_role = "fallback" if role == "primary" else "primary"
-        other_ckn = original_profile["{}_ckn".format(other_role)].lower()
-        unexpected = configured_ckns.difference({
-            other_ckn, original_ckn, mismatched_ckn})
-        if unexpected:
-            raise AssertionError(
-                "Peer profile contains unexpected CKNs during cleanup")
-
-        is_fallback = role == "fallback"
-        lines = []
-        if mismatched_ckn in configured_ckns:
-            lines.append(eos_macsec_key_line(
-                mismatched_pair[1], mismatched_pair[0],
-                is_fallback=is_fallback,
-                remove=True,
-            ))
-        if original_ckn not in configured_ckns:
-            lines.append(eos_macsec_key_line(
-                original_pair[1], original_pair[0],
-                is_fallback=is_fallback,
-            ))
-        if lines:
-            self.host.eos_config(
-                lines=lines,
-                parents=["mac security",
-                         "profile {}".format(self.profile_name)],
-            )
-
-    def snapshot(self):
-        output = self.host.eos_command(commands=[
-            "show mac security participants {} detail | json".format(
-                self.peer_port),
-            "show running-config section mac security",
-        ])["stdout"]
-        participants = parse_eos_mka_participants(
-            output[0] if isinstance(output[0], dict) else {},
-            self.peer_port,
-        )
-        configured_ckns = parse_eos_profile_ckns(
-            output[1] if len(output) > 1 else "",
-            self.profile_name,
-        )
-        return {
-            "profile_name": self.profile_name,
-            "configured_ckns": configured_ckns,
-            "rekey_period": parse_eos_profile_rekey_period(
-                output[1] if len(output) > 1 else "", self.profile_name),
-            "priority": parse_eos_profile_priority(
-                output[1] if len(output) > 1 else "", self.profile_name),
-            "participants": participants,
-            "controlled_port": self.host.iface_macsec_ok(self.peer_port),
-            "controlled_port_authoritative": True,
-        }
-
-    def protected_errors(
-            self, profile, expected_principal, require_all_live=True):
-        snapshot = self.snapshot()
-        expected_ckns = {
-            profile["primary_ckn"].lower(),
-            profile["fallback_ckn"].lower(),
-        }
-        errors = []
-        if snapshot["configured_ckns"] != expected_ckns:
-            errors.append("configured CKN set does not match")
-        errors.extend(validate_eos_mka_participants(
-            snapshot["participants"], profile, snapshot["controlled_port"],
-            expected_principal.lower(), require_all_live))
-        if errors:
-            principals = sorted(
-                ckn for ckn, participant in snapshot["participants"].items()
-                if participant.get("is_principal"))
-            errors.append("principal CKNs: expected {}, observed {}".format(
-                expected_principal.lower(), principals))
-        return errors
-
-    def blocked_errors(self, expected_ckns):
-        snapshot = self.snapshot()
-        errors = []
-        normalized_ckns = {ckn.lower() for ckn in expected_ckns}
-        if snapshot["configured_ckns"] != normalized_ckns:
-            errors.append("configured CKN set does not match")
-        if set(snapshot["participants"]) != normalized_ckns:
-            errors.append("runtime participant CKN set does not match")
-        for ckn, participant in snapshot["participants"].items():
-            if participant.get("live_peers", 0) != 0:
-                errors.append("{} retains a live peer".format(ckn))
-        if snapshot["controlled_port"]:
-            errors.append("cEOS controlled port remains open")
-        return errors
-
-    def normalized_state(self):
-        snapshot = self.snapshot()
-        return {
-            "participants": snapshot["participants"],
-            "configured_ckns": snapshot["configured_ckns"],
-        }
-
-    def diagnostics(self):
-        return self.snapshot()
-
-
-def peer_adapter(environment, port):
-    neighbor = environment["links"][port]
-    adapter = EosPeerAdapter if isinstance(
-        neighbor["host"], EosHost) else PeerAdapter
-    return adapter(environment, port)
-
-
-def _owned_profile_name(original_name, hostname, port):
-    identity = "{}:{}:{}:fallback".format(original_name, hostname, port)
-    return "PT" + hashlib.sha256(identity.encode("ascii")).hexdigest()[:12].upper()
-
-
-def _profile_kwargs(profile, priority=None):
-    return {
-        "priority": profile["priority"] if priority is None else priority,
-        "cipher_suite": profile["cipher_suite"],
-        "primary_cak": profile["primary_cak"],
-        "primary_ckn": profile["primary_ckn"],
-        "policy": profile["policy"],
-        "send_sci": profile["send_sci"],
-        "rekey_period": profile["rekey_period"],
-        "fallback_cak": profile.get("fallback_cak"),
-        "fallback_ckn": profile.get("fallback_ckn"),
-    }
-
-
-def _assert_profile_unchanged(before, after, description):
-    unchanged = (
-        set(after) == set(before)
-        and all(after.get(field) == value
-                for field, value in before.items())
-    )
-    assert unchanged, "{} changed MACsec profile state".format(description)
-
-
-def _set_profile(host, name, profile, priority=None, namespace_option=None):
-    set_macsec_profile(
-        host, name, namespace_option=namespace_option, **_profile_kwargs(profile, priority=priority))
-
-
-def _hello_timeout(status, port, intervals):
-    if status is None or not re.fullmatch(r"\d+ ms", status["hello"]):
-        raise ValueError("MACsec hello interval unavailable on {}".format(port))
-    return mka_hello_timeout_seconds({"mka_hello_time_ms": status["hello"].split()[0]}, intervals)
-
-
-def _protocol_timeout(environment, port, intervals):
-    return _hello_timeout(
-        get_mka_status(environment["duthost"], port), port, intervals)
-
-
-def _read_link_state(environment, port):
-    return read_link_state(environment["duthost"], port)
-
-
-def _read_link_states(environment, ports):
-    return {
-        port: _read_link_state(environment, port)
-        for port in ports
-    }
-
-
-def _wait_link_protected(
-        environment, port, principal_ckn, timeout=MKA_STATE_PUBLISH_TIMEOUT,
-        require_all_live=True):
-    errors = [None]
-
-    def _ready():
-        errors[0] = _read_link_state(environment, port).protected_errors(
-            environment["profile"],
-            principal_ckn,
-            require_all_live=require_all_live,
-        )
-        return not errors[0]
-
-    assert wait_until(timeout, 2, 0, _ready), (
-        "Link {} did not become protected by {}: {}"
-    ).format(port, principal_ckn, errors[0])
-
-
-def _wait_environment(
-        environment, principal_ckn, timeout=MKA_STATE_PUBLISH_TIMEOUT):
-    deadline = time.monotonic() + timeout
-    errors = {}
-    ports = tuple(environment["links"])
-    while time.monotonic() < deadline:
-        snapshots = _read_link_states(environment, ports)
-        errors = {
-            port: problems
-            for port, snapshot in snapshots.items()
-            if (problems := snapshot.protected_errors(
-                environment["profile"], principal_ckn))
-        }
-        if not errors and time.monotonic() < deadline:
-            return
-        time.sleep(min(2, max(0, deadline - time.monotonic())))
-    raise AssertionError("MACsec environment did not recover: {}".format(errors))
-
-
-def _wait_rotation_settled(
-        environment, port, before, principal_ckn,
-        require_rekey=True, require_all_live=True):
-    _wait_rotations_settled(
-        environment, {port: before}, principal_ckn,
-        require_rekey=require_rekey, require_all_live=require_all_live)
-
-
-def _wait_rotations_settled(
-        environment, before, principal_ckn, require_rekey=True,
-        require_all_live=True, check_peers=False,
-        on_dut_settled=None, phase="forward"):
-    """Settle MKA selection and protected peer traffic."""
-    settle = {
-        port: _hello_timeout(snapshot.status, port, 3)
-        for port, snapshot in before.items()
-    }
-    hello = {
-        port: _hello_timeout(snapshot.status, port, 1)
-        for port, snapshot in before.items()
-    }
-    started = time.monotonic()
-    deadline = started + max(settle.values()) + SA_RETIRE_TIMEOUT + MKA_STATE_PUBLISH_TIMEOUT
-    stable = {}
-    errors = {}
-    dut_settled = False
-
-    def _problems(port, snapshot):
-        problems = snapshot.protected_errors(
-            environment["profile"], principal_ckn, require_all_live)
-        problems.extend(snapshot.rollover_errors(before[port], require_rekey))
-        return problems
-
-    def _observe(port, snapshot):
-        problems = _problems(port, snapshot)
-        now = time.monotonic()
-        key = (snapshot.active_key_identity(), tuple(snapshot.principal_ckns()))
-        previous = stable.get(port)
-        settled = (
-            not problems and now - started >= settle[port]
-            and previous is not None and previous[0] == key
-            and now - previous[1] >= hello[port])
-        return port, key, now, problems, settled
-
-    while time.monotonic() < deadline:
-        snapshots = _read_link_states(environment, before)
-        errors = {}
-        ready = 0
-        for port, snapshot in snapshots.items():
-            port, key, observed_at, problems, settled = _observe(port, snapshot)
-            if problems or observed_at - started < settle[port]:
-                stable.pop(port, None)
-                errors[port] = problems
-                continue
-            if port not in stable or stable[port][0] != key:
-                stable[port] = key, observed_at
-            if settled:
-                ready += 1
-            else:
-                errors[port] = ["MKA selection settle interval pending"]
-        if ready == len(before) and time.monotonic() < deadline:
-            dut_settled = True
-            break
-        time.sleep(min(1, max(0, deadline - time.monotonic())))
-    assert dut_settled, "DUT MKA selection did not settle on {}: {}".format(
-        sorted(errors), errors)
-
-    if on_dut_settled is not None:
-        on_dut_settled()
-
-    if check_peers:
-        peer_deadline = time.monotonic() + 30 + 15 * len(before)
-        pending = set(before)
-        adapters = {port: peer_adapter(environment, port) for port in before}
-        peer_errors = {}
-        while pending and time.monotonic() < peer_deadline:
-            for port in before:
-                if port not in pending or time.monotonic() >= peer_deadline:
-                    continue
-                adapter = adapters[port]
-                problems = adapter.protected_errors(
-                    environment["peer_profiles"][port], principal_ckn,
-                    require_all_live=require_all_live)
-                if problems:
-                    peer_errors[port] = problems
-                if not problems and time.monotonic() < peer_deadline:
-                    pending.remove(port)
-                    peer_errors.pop(port, None)
-            if pending:
-                time.sleep(min(2, max(0, peer_deadline - time.monotonic())))
-        remaining = {
-            port: {
-                "host": adapters[port].host.hostname,
-                "port": adapters[port].peer_port,
-                "errors": peer_errors.get(port, ["not observed within shared deadline"]),
-            }
-            for port in pending
-        }
-        assert not pending, (
-            "{} peer confirmation timed out; expected principal {}, "
-            "pending {}: {}"
-        ).format(phase, principal_ckn.lower(), sorted(pending), remaining)
-
-    final = _read_link_states(environment, before)
-    final_errors = {}
-    periodic = environment["profile"]["rekey_period"] > 0
-    for port, snapshot in final.items():
-        problems = _problems(port, snapshot)
-        if periodic:
-            unchanged_selection = tuple(snapshot.principal_ckns()) == stable[port][0][1]
-        else:
-            unchanged_selection = (
-                snapshot.active_key_identity(), tuple(snapshot.principal_ckns())) == stable[port][0]
-        if not unchanged_selection:
-            problems.append("transmit SAK or principal CKN changed during peer inspection")
-        if problems:
-            final_errors[port] = problems
-    assert not final_errors, "DUT regressed after peer confirmation: {}".format(
-        final_errors)
-
-
-def _wait_peer_protected(
-        adapter, profile, principal_ckn,
-        timeout=MKA_STATE_PUBLISH_TIMEOUT, require_all_live=True,
-        phase="forward"):
-    errors = [None]
-
-    def _ready():
-        errors[0] = adapter.protected_errors(
-            profile, principal_ckn,
-            require_all_live=require_all_live)
-        return not errors[0]
-
-    assert wait_until(timeout, 2, 0, _ready), (
-        "{} {} peer {}:{} did not become protected by {}: {}"
-    ).format(
-        phase,
-        adapter.provider,
-        adapter.host.hostname,
-        adapter.peer_port,
-        principal_ckn,
-        errors[0],
-    )
-
-
-def _wait_peer_primary_removed(
-        adapter, original_profile, timeout=MKA_STATE_PUBLISH_TIMEOUT):
-    errors = [None]
-
-    def _removed():
-        errors[0] = adapter.primary_removed_errors(original_profile)
-        return not errors[0]
-
-    assert wait_until(timeout, 2, 0, _removed), (
-        "{} peer did not remove the original primary: {}; diagnostics={}"
-    ).format(adapter.provider, errors[0], adapter.diagnostics())
-
-
-def _restore_deleted_primary(environment, port, adapter, primary_pair):
-    before = _read_link_state(environment, port)
-    adapter.add_primary(primary_pair)
-    _wait_link_protected(
-        environment, port, environment["profile"]["primary_ckn"])
-    _wait_peer_protected(
-        adapter, environment["peer_profiles"][port],
-        primary_pair[1], phase="restoration")
-    _wait_rotation_settled(environment, port, before, primary_pair[1])
-
-
-def _restore_rotation(
-        environment, role, original_profile, peer_originals,
-        new_pair, attempted_ports, fully_rotated):
-    profile = environment["profile"]
-    old_pair = (
-        original_profile["{}_cak".format(role)],
-        original_profile["{}_ckn".format(role)],
-    )
-    before = _read_link_states(environment, environment["links"])
-    profile["{}_cak".format(role)] = old_pair[0]
-    profile["{}_ckn".format(role)] = old_pair[1]
-    try:
-        restore_macsec_profile_key(
-            environment["duthost"], profile["name"],
-            old_pair[0], old_pair[1], new_pair[0], new_pair[1],
-            is_fallback=role == "fallback",
-            namespace_options=[
-                get_namespace_option(
-                    environment["duthost"], next(iter(environment["links"])))])
-        if role == "primary" and fully_rotated[0]:
-            _wait_rotations_settled(
-                environment, before, profile["fallback_ckn"],
-                require_all_live=False, phase="restoration")
-            before = _read_link_states(environment, environment["links"])
-    finally:
-        for port in attempted_ports:
-            _restore_peer_step(
-                environment, port, role, peer_originals[port], new_pair)
-
-    if fully_rotated[0]:
-        _wait_rotations_settled(
-            environment, before, original_profile["primary_ckn"],
-            require_rekey=True if role == "primary" else (
-                False if profile["rekey_period"] == 0 else None),
-            check_peers=True, phase="restoration")
-    else:
-        assert wait_until(
-            MKA_STATE_PUBLISH_TIMEOUT, 2, 0,
-            _environment_is_healthy, environment,
-        ), "MKA did not recover after partial {} rotation".format(role)
-
-
-def _restore_peer_step(environment, port, role, old_profile, new_pair):
-    adapter = peer_adapter(environment, port)
-    try:
-        adapter.restore_key(role, old_profile, new_pair)
-    finally:
-        adapter.commit_profile(old_profile)
-
-
-def _observe_periodic_sak_during_traffic(environment, selected_port, expected_principal=None):
-    """Require a natural SAK change without test-driven CAK/CKN mutation."""
-    profile = environment["profile"]
-    if profile["rekey_period"] <= 0:
-        raise AssertionError("Fallback E2E coverage requires periodic rekey")
-    expected_ckns = {
-        field: profile[field].lower() for field in ("primary_ckn", "fallback_ckn")}
-    principal = expected_principal or profile["primary_ckn"]
-
-    def _known_profile():
-        return _profile_ckns(
-            environment["duthost"], selected_port, profile["name"]) == expected_ckns
-
-    assert _known_profile(), "Fallback profile CKNs differ before periodic observation"
-    baseline = [None]
-
-    def _baseline_ready():
-        current = _read_link_state(environment, selected_port)
-        if (not current.protected_errors(profile, principal)
-                and current.active_key_identity()):
-            baseline[0] = current.active_key_identity()
-            return True
-        return False
-
-    assert wait_until(MKA_STATE_PUBLISH_TIMEOUT, 1, 0, _baseline_ready), (
-        "Protected SAK unavailable before periodic observation")
-
-    def _changed():
-        current = _read_link_state(environment, selected_port)
-        return (
-            not current.protected_errors(profile, principal)
-            and current.active_key_identity() != baseline[0]
-        )
-
-    assert wait_until(MKA_CONVERGE_TIMEOUT, 1, 0, _changed), (
-        "No natural SAK change observed with unchanged CAK/CKN "
-        "during protected bidirectional traffic")
-    assert _known_profile(), "Fallback profile CKNs changed during periodic observation"
-
-
-@contextmanager
-def _rotation_cleanup(environment, role, new_pair):
-    """Restore original CAKs after the measured forward traffic window."""
-    profile = environment["profile"]
-    original_profile = dict(profile)
-    peer_originals = {port: dict(value) for port, value in environment["peer_profiles"].items()}
-    attempted = []
-    completed = [False]
-    with ExitStack() as cleanup:
-        cleanup.callback(
-            _restore_rotation, environment, role, original_profile,
-            peer_originals, new_pair, attempted, completed)
-        yield attempted, completed
-
-
-def _apply_forward_cak(environment, role, new_pair, selected_port, before, attempted):
-    profile = environment["profile"]
-    old_pair = (profile["{}_cak".format(role)], profile["{}_ckn".format(role)])
-    update_macsec_profile_key(
-        environment["duthost"], profile["name"], old_pair[0], old_pair[1],
-        new_pair[0], new_pair[1], is_fallback=role == "fallback",
-        namespace_option=get_namespace_option(environment["duthost"], selected_port))
-    profile["{}_cak".format(role)], profile["{}_ckn".format(role)] = new_pair
-    if role == "primary":
-        _wait_rotations_settled(
-            environment, before, profile["fallback_ckn"],
-            require_all_live=False)
-        before = _read_link_states(environment, environment["links"])
-    ports = [selected_port] + [port for port in environment["links"] if port != selected_port]
-    for port in ports:
-        attempted.append(port)
-        peer_adapter(environment, port).rotate(role, old_pair, new_pair)
-    return before
-
-
-def _confirm_transit_rotation(environment, before, require_rekey):
-    profile = environment["profile"]
-    for port in environment["links"]:
-        _wait_peer_protected(
-            peer_adapter(environment, port),
-            environment["peer_profiles"][port],
-            profile["primary_ckn"])
-        state = _read_link_state(environment, port)
-        errors = state.protected_errors(profile, profile["primary_ckn"])
-        errors.extend(state.rollover_errors(before[port], require_rekey))
-        assert not errors, "Transit link {} did not remain protected: {}".format(port, errors)
-
-
-def _wait_link_blocked(
-        environment, port, expected_ckns, timeout=MKA_STATE_PUBLISH_TIMEOUT):
-    errors = [None]
-
-    def _blocked():
-        snapshot = _read_link_state(environment, port)
-        errors[0] = snapshot.blocked_errors(expected_ckns)
-        return not errors[0]
-
-    assert wait_until(timeout, 2, 0, _blocked), (
-        "Link {} did not block: {}"
-    ).format(port, errors[0])
-
-
-def _wait_peer_blocked(
-        adapter, expected_ckns, timeout=MKA_STATE_PUBLISH_TIMEOUT):
-    errors = [None]
-
-    def _blocked():
-        errors[0] = adapter.blocked_errors(expected_ckns)
-        return not errors[0]
-
-    assert wait_until(timeout, 2, 0, _blocked), (
-        "{} peer did not block: {}"
-    ).format(adapter.provider, errors[0])
-
-
-def _diagnostics(environment, port):
-    return {
-        "dut": get_mka_status(environment["duthost"], port),
-        "peer": peer_adapter(environment, port).diagnostics(),
-    }
-
-
-def _restore_mismatch(
-        environment, port, adapter, original_profile, invalid_pair, role):
-    profile = environment["profile"]
-    principal = profile["{}_ckn".format(role)]
-    require_all_live = role == "primary"
-    before = _read_link_state(environment, port)
-    try:
-        adapter.restore_key(role, original_profile, invalid_pair)
-        _wait_link_protected(
-            environment, port, principal,
-            require_all_live=require_all_live)
-        _wait_peer_protected(
-            adapter, original_profile, principal,
-            require_all_live=require_all_live, phase="restoration")
-        if role == "primary":
-            _wait_rotation_settled(environment, port, before, principal)
-    finally:
-        adapter.commit_profile(original_profile)
-
-
-@contextmanager
-def _primary_mismatch(environment, port, invalid_pair):
-    profile = environment["profile"]
-    adapter = peer_adapter(environment, port)
-    original_profile = dict(environment["peer_profiles"][port])
-    original_pair = (
-        original_profile["primary_cak"],
-        original_profile["primary_ckn"],
-    )
-    mismatched_profile = adapter.profile_with_pair(
-        original_profile, "primary", invalid_pair)
-    before = _read_link_state(environment, port)
-
-    with ExitStack() as cleanup:
-        cleanup.callback(
-            _restore_mismatch, environment, port, adapter,
-            original_profile, invalid_pair, "primary")
-        if adapter.supports_primary_delete:
-            adapter.delete_primary_if_supported(original_pair)
-            _wait_link_protected(
-                environment, port, profile["fallback_ckn"],
-                require_all_live=False)
-            _wait_peer_primary_removed(adapter, original_profile)
-            adapter.add_primary(invalid_pair)
-        else:
-            adapter.rotate(
-                "primary",
-                original_pair,
-                invalid_pair,
-                commit=False,
-                base_profile=original_profile,
-            )
-
-        _wait_link_protected(
-            environment, port, profile["fallback_ckn"],
-            require_all_live=False)
-        _wait_peer_protected(
-            adapter,
-            mismatched_profile,
-            profile["fallback_ckn"],
-            require_all_live=False,
-        )
-        adapter.commit_profile(mismatched_profile)
-        _wait_rotation_settled(
-            environment, port, before, profile["fallback_ckn"], require_all_live=False)
-        yield adapter
-
-
-@contextmanager
-def _ceos_fallback_mismatch(
-        environment, port, adapter, invalid_pair):
-    profile = environment["profile"]
-    original_profile = dict(environment["peer_profiles"][port])
-    original_pair = (
-        original_profile["fallback_cak"],
-        original_profile["fallback_ckn"],
-    )
-    mismatched_profile = adapter.profile_with_pair(
-        original_profile, "fallback", invalid_pair)
-
-    with ExitStack() as cleanup:
-        cleanup.callback(
-            _restore_mismatch, environment, port, adapter,
-            original_profile, invalid_pair, "fallback")
-        adapter.delete_fallback(original_pair)
-        _wait_link_blocked(
-            environment, port,
-            (profile["primary_ckn"], profile["fallback_ckn"]))
-        adapter.add_fallback(invalid_pair)
-        _wait_link_blocked(
-            environment, port,
-            (profile["primary_ckn"], profile["fallback_ckn"]))
-        _wait_peer_blocked(
-            adapter,
-            (
-                mismatched_profile["primary_ckn"],
-                mismatched_profile["fallback_ckn"],
-            ),
-        )
-        adapter.commit_profile(mismatched_profile)
-        yield adapter
-
-
-def _select_routed_pair(environment, upstream_links, ports=None):
-    portchannels = get_portchannel(environment["duthost"])
-    duthost = environment["duthost"]
-    eligible = []
-    for port in environment["links"]:
-        portchannel = find_portchannel_from_member(port, portchannels)
-        if port in upstream_links and (not portchannel or len(portchannel["members"]) == 1):
-            eligible.append(port)
-    for port in eligible if ports is None else ports:
-        if port not in eligible:
-            continue
-        other = next((
-            candidate for candidate in eligible
-            if candidate != port
-            and environment["links"][candidate]["name"] != environment["links"][port]["name"]
-            and upstream_links[candidate]["local_ipv4_addr"]
-            != upstream_links[port]["local_ipv4_addr"]
-            and (not duthost.is_multi_asic or get_namespace_option(duthost, candidate)
-                 == get_namespace_option(duthost, port))
-        ), None)
-        if other is not None:
-            return port, other
-    pytest.skip(
-        "Transit MACsec traffic requires two distinct controlled routed neighbors "
-        "on the same ASIC, each direct or on a single-member PortChannel")
-
-
-def _route_result(host, port, command, allow_unreachable=False):
-    result = host.command(
-        "{} {}".format(_ping_namespace_prefix(host, port), command),
-        module_ignore_errors=True, verbose=False)
-    if result.get("failed") or result.get("rc", 0) != 0:
-        if (allow_unreachable and "Network is unreachable" in result.get("stderr", "")):
-            return ""
-        raise RuntimeError("Unable to verify transit route on {}: {}".format(
-            host.hostname, command))
-    return result["stdout"].strip()
-
-
-def _route_value(output, field):
-    words = shlex.split(output)
-    return words[words.index(field) + 1] if field in words and words.index(field) + 1 < len(words) else None
-
-
-def _route_source(output):
-    return _route_value(output, "from") or _route_value(output, "src")
-
-
-def _stable_data_loopback(host, port):
-    output = _route_result(host, port, "ip -o -4 addr show")
-    candidates = {
-        address
-        for device, address in re.findall(
-            r"^\d+:\s+(\S+)\s+inet\s+(\d+\.\d+\.\d+\.\d+)/32\b",
-            output, re.MULTILINE)
-        if (device in ("lo", "lo0") or device.startswith("Loopback"))
-        and not ipaddress.ip_address(address).is_loopback
-    }
-    if len(candidates) != 1:
-        pytest.skip("Stable transit requires one data-VRF /32 loopback on each neighbor")
-    return candidates.pop()
-
-
-def _dut_transit_route_correct(duthost, portchannels, sources, port, destination_port, via=None):
-    incoming = find_portchannel_from_member(port, portchannels)
-    outgoing = find_portchannel_from_member(destination_port, portchannels)
-    incoming_dev = incoming["name"] if incoming else port
-    expected_dev = outgoing["name"] if outgoing else destination_port
-    route = _route_result(
-        duthost, destination_port,
-        "ip -4 route get {} from {} iif {}".format(
-            sources[destination_port], sources[port], incoming_dev))
-    return (_route_value(route, "dev") == expected_dev
-            and _route_value(route, "via") == via
-            and "nexthop" not in route.split())
-
-
-@contextmanager
-def _stable_transit_path(environment, upstream_links, selected_port, other_port):
-    """Own reversible neighbor and DUT routes to stable data-VRF loopbacks."""
-    duthost = environment["duthost"]
-    ports = (selected_port, other_port)
-    portchannels = get_portchannel(duthost)
-    sources = {
-        port: _stable_data_loopback(
-            environment["links"][port]["host"],
-            environment["links"][port]["port"])
-        for port in ports
-    }
-    if sources[selected_port] == sources[other_port]:
-        pytest.skip("Transit neighbor loopback addresses must be distinct")
-    endpoints = []
-    routes = []
-    for port, destination_port in ((selected_port, other_port), (other_port, selected_port)):
-        neighbor = environment["links"][port]
-        host = neighbor["host"]
-        gateway = upstream_links[port]["peer_ipv4_addr"]
-        address = upstream_links[port]["local_ipv4_addr"]
-        destination = sources[destination_port]
-        local_route = _route_result(
-            host, neighbor["port"],
-            "ip -4 route get {} from {}".format(gateway, sources[port]))
-        link_route = _route_result(
-            host, neighbor["port"],
-            "ip -4 route get {} from {}".format(gateway, address))
-        device = _route_value(local_route, "dev")
-        if (not device or device != _route_value(link_route, "dev")
-                or _route_source(local_route) != sources[port]
-                or _route_value(local_route, "via")):
-            pytest.skip("Neighbor loopback cannot reach its protected DUT gateway")
-        endpoints.append((
-            host, neighbor["port"], sources[port], destination, gateway, device))
-        routes.append((
-            destination_port, "{}/32".format(destination),
-            upstream_links[destination_port]["local_ipv4_addr"]))
-
-    namespace = get_namespace_option(duthost, selected_port)
-    ns_name = namespace.split()[-1] if namespace else ""
-
-    def _checked(host, command):
-        result = host.command(command, module_ignore_errors=True, verbose=False)
-        if result.get("failed") or result.get("rc", 0) != 0:
-            raise RuntimeError("Transit route command failed on {}: {}".format(
-                host.hostname, command))
-        return result
-
-    def _vtysh(line):
-        command = "vtysh -c {} -c {}".format(
-            shlex.quote("configure terminal"), shlex.quote(line))
-        if ns_name:
-            command = duthost.get_vtysh_cmd_for_namespace(command, ns_name)
-        return _checked(duthost, command)
-
-    def _running_static(prefix):
-        command = "vtysh -c {}".format(shlex.quote("show running-config"))
-        if ns_name:
-            command = duthost.get_vtysh_cmd_for_namespace(command, ns_name)
-        lines = _checked(duthost, command).get("stdout", "").splitlines()
-        return [
-            line.strip() for line in lines
-            if re.match(r"^\s*ip route {}(?:\s|$)".format(re.escape(prefix)), line)
-        ]
-
-    def _owned_dut_route(port, prefix, nexthop):
-        if _running_static(prefix) != ["ip route {} {}".format(prefix, nexthop)]:
-            return False
-        return bool(_route_result(duthost, port, "ip -4 route show exact {}".format(prefix)))
-
-    def _dut_route_correct(port, destination_port):
-        return _dut_transit_route_correct(
-            duthost, portchannels, sources, port, destination_port,
-            via=upstream_links[destination_port]["local_ipv4_addr"])
-
-    def _peer_config(endpoint):
-        host, port, source, destination, gateway, device = endpoint
-        line = "ip route {}{}/32 {}".format(
-            "vrf {} ".format(host.bgp_vrf) if isinstance(host, EosHost) and host.bgp_vrf else "",
-            destination, gateway)
-        result = host.eos_command(commands=["show running-config | include ^ip route"])
-        if result.get("failed") or result.get("rc", 0) != 0:
-            raise RuntimeError("Unable to read neighbor static route configuration")
-        output = result.get("stdout", [])
-        if not output or not isinstance(output[0], str):
-            raise ValueError("Malformed neighbor static route configuration")
-        present = [
-            entry.strip() for entry in output[0].splitlines()
-            if re.search(r"(?<!\S){}/32(?:\s|$)".format(re.escape(destination)), entry)
-        ]
-        return line, present
-
-    def _remove_peer_route(endpoint):
-        host, port, source, destination, gateway, device = endpoint
-        if not isinstance(host, EosHost):
-            exact = _route_result(host, port, "ip -4 route show exact {}/32".format(destination))
-            if exact:
-                if (_route_value(exact, "via") != gateway
-                        or _route_value(exact, "dev") != device):
-                    raise AssertionError("Test-owned neighbor route changed during cleanup")
-                _route_result(host, port, "sudo ip -4 route del {}/32 via {} dev {}".format(
-                    destination, gateway, device))
-            return
-        line, present = _peer_config(endpoint)
-        if not present:
-            return
-        if present != [line]:
-            raise AssertionError("Test-owned EOS static route changed during cleanup")
-        result = host.eos_config(lines=["no {}".format(line)])
-        if result.get("failed") or result.get("rc", 0) != 0:
-            raise RuntimeError("Unable to remove test-owned EOS static route")
-        assert not _peer_config(endpoint)[1], "Test-owned EOS static route remains configured"
-
-    def _remove_dut_route(route):
-        port, prefix, nexthop = route
-        line = "ip route {} {}".format(prefix, nexthop)
-        configured = _running_static(prefix)
-        if configured:
-            assert configured == [line], "Test-owned DUT static route changed during cleanup"
-            _vtysh("no {}".format(line))
-
-        def _absent():
-            return (
-                not _running_static(prefix)
-                and not _route_result(
-                    duthost, port, "ip -4 route show exact {}".format(prefix)))
-
-        _await_route(_absent, 60, "Test-owned DUT route did not withdraw")
-
-    def _await_route(condition, timeout, message):
-        deadline = time.monotonic() + timeout
-        while time.monotonic() < deadline:
-            if condition():
-                return
-            time.sleep(2)
-        raise AssertionError(message)
-
-    for port, prefix, nexthop in routes:
-        if (_running_static(prefix)
-                or _route_result(duthost, port, "ip -4 route show exact {}".format(prefix))):
-            pytest.skip("Cannot own existing DUT /32 route {}".format(prefix))
-    for endpoint in endpoints:
-        if isinstance(endpoint[0], EosHost) and _peer_config(endpoint)[1]:
-            pytest.skip("Cannot own existing EOS /32 route to stable neighbor loopback")
-        if not isinstance(endpoint[0], EosHost) and _route_result(
-                endpoint[0], endpoint[1],
-                "ip -4 route show exact {}/32".format(endpoint[3])):
-            pytest.skip("Cannot own existing neighbor /32 route")
-
-    with ExitStack() as cleanup:
-        for route in routes:
-            port, prefix, nexthop = route
-            cleanup.callback(_remove_dut_route, route)
-            _vtysh("ip route {} {}".format(prefix, nexthop))
-        _await_route(
-            lambda: all(_owned_dut_route(*route) for route in routes)
-            and all(_dut_route_correct(port, other) for port, other in (
-                (selected_port, other_port), (other_port, selected_port))),
-            90, "DUT static routes did not reach the selected forwarding paths")
-        for endpoint in endpoints:
-            host, port, source, destination, gateway, device = endpoint
-            cleanup.callback(_remove_peer_route, endpoint)
-            if isinstance(host, EosHost):
-                line, _ = _peer_config(endpoint)
-                result = host.eos_config(lines=[line])
-                if result.get("failed") or result.get("rc", 0) != 0:
-                    raise RuntimeError("Unable to install test-owned EOS static route")
-                assert _peer_config(endpoint)[1] == [line], (
-                    "EOS data-VRF static route was not installed")
-            else:
-                _route_result(
-                    host, port,
-                    "sudo ip -4 route add {}/32 via {} dev {} src {}".format(
-                        destination, gateway, device, source))
-
-        def _neighbor_route(endpoint):
-            host, port, source, destination, gateway, device = endpoint
-            route = _route_result(
-                host, port, "ip -4 route get {} from {}".format(destination, source))
-            return (_route_value(route, "via") == gateway
-                    and _route_value(route, "dev") == device
-                    and _route_source(route) == source
-                    and "nexthop" not in route.split())
-        _await_route(
-            lambda: all(_neighbor_route(endpoint) for endpoint in endpoints),
-            60, "Neighbor stable loopback routes did not pin through the DUT")
-        yield endpoints
-        assert all(_neighbor_route(endpoint) for endpoint in endpoints), (
-            "Neighbor stable routes did not recover after MACsec restoration")
-        assert all(_owned_dut_route(*route) for route in routes), (
-            "DUT routes did not recover after MACsec restoration")
-        assert (_dut_route_correct(selected_port, other_port)
-                and _dut_route_correct(other_port, selected_port)), (
-            "DUT stable transit route changed after MACsec restoration")
-
-
-@contextmanager
-def _transit_path(environment, upstream_links, selected_port, stable_endpoints=False):
-    """Own only newly added endpoint routes; verify both ASIC transit directions."""
-    if len(environment["links"]) != 2 or selected_port not in environment["links"]:
-        raise AssertionError("Transit requires the fixture-selected two-link pair")
-    other_port = next(port for port in environment["links"] if port != selected_port)
-    portchannels = get_portchannel(environment["duthost"])
-    for port in environment["links"]:
-        portchannel = find_portchannel_from_member(port, portchannels)
-        if portchannel and len(portchannel["members"]) != 1:
-            pytest.skip("Transit requires direct or single-member PortChannel links")
-    if stable_endpoints:
-        with _stable_transit_path(
-                environment, upstream_links, selected_port, other_port) as endpoints:
-            yield endpoints
-        return
-    duthost = environment["duthost"]
-    endpoints = []
-    sources = {port: upstream_links[port]["local_ipv4_addr"]
-               for port in (selected_port, other_port)}
-
-    def _dut_route_correct(port, destination_port):
-        return _dut_transit_route_correct(
-            duthost, portchannels, sources, port, destination_port)
-
-    for port, destination_port in ((selected_port, other_port), (other_port, selected_port)):
-        link = upstream_links[port]
-        neighbor = environment["links"][port]
-        destination = upstream_links[destination_port]["local_ipv4_addr"]
-        host = neighbor["host"]
-        source = link["local_ipv4_addr"]
-        gateway = link["peer_ipv4_addr"]
-        local_route = _route_result(
-            host, neighbor["port"], "ip -4 route get {} from {}".format(gateway, source))
-        device = _route_value(local_route, "dev")
-        if not device or _route_source(local_route) != source:
-            pytest.skip("Neighbor has no source-bound data route to its DUT-facing gateway")
-        if not _dut_route_correct(port, destination_port):
-            pytest.skip("DUT route to {} does not use protected port {}".format(
-                destination, destination_port))
-        endpoints.append((host, neighbor["port"], source, destination, gateway, device))
-
-    def _check_route(endpoint):
-        host, port, source, destination, gateway, device = endpoint
-        route = _route_result(
-            host, port, "ip -4 route get {} from {}".format(destination, source),
-            allow_unreachable=True)
-        return (_route_value(route, "via") == gateway
-                and _route_value(route, "dev") == device
-                and _route_source(route) == source
-                and "nexthop" not in route.split())
-
-    def _remove_route(endpoint):
-        host, port, source, destination, gateway, device = endpoint
-        exact = _route_result(
-            host, port, "ip -4 route show exact {}/32".format(destination))
-        if not exact:
-            return
-        if (len(exact.splitlines()) != 1
-                or _route_value(exact, "via") != gateway
-                or _route_value(exact, "dev") != device):
-            raise AssertionError("Test-owned transit route changed before cleanup")
-        _route_result(host, port, "sudo ip -4 route del {}/32 via {} dev {}".format(
-            destination, gateway, device))
-
-    with ExitStack() as cleanup:
-        for endpoint in endpoints:
-            if _check_route(endpoint):
-                continue
-            host, port, source, destination, gateway, device = endpoint
-            exact = _route_result(
-                host, port, "ip -4 route show exact {}/32".format(destination))
-            if exact:
-                pytest.skip("Existing host route prevents pinned transit path to {}".format(destination))
-            cleanup.callback(_remove_route, endpoint)
-            _route_result(host, port, "sudo ip -4 route add {}/32 via {} dev {} src {}".format(
-                destination, gateway, device, source))
-        assert all(_check_route(endpoint) for endpoint in endpoints), (
-            "Transit route did not pin both neighbor endpoints through the DUT")
-        yield endpoints
-        assert all(_check_route(endpoint) for endpoint in endpoints), (
-            "Transit neighbor route changed during the observation")
-        assert (_dut_route_correct(selected_port, other_port)
-                and _dut_route_correct(other_port, selected_port)), (
-            "DUT transit forwarding route changed during the observation")
-
-
-def _environment_is_healthy(environment):
-    profile = environment["profile"]
-    for port in environment["links"]:
-        errors = _read_link_state(environment, port).protected_errors(
-            profile, profile["primary_ckn"])
-        if errors:
-            logger.info("DUT MKA state on %s is not ready: %s", port, errors)
-            return False
-        peer_errors = peer_adapter(environment, port).protected_errors(
-            environment["peer_profiles"][port], profile["primary_ckn"])
-        if peer_errors:
-            logger.info(
-                "Peer MKA state on %s is not ready: %s",
-                environment["links"][port]["port"],
-                peer_errors)
-            return False
-    return True
-
-
-def _start_ping(host, port, source, destination, suffix):
-    path = "/tmp/macsec_fallback_{}_{}.log".format(port, suffix)
-    host.shell("rm -f {}".format(path), module_ignore_errors=True)
-    prefix = _ping_namespace_prefix(host, port)
-    command = "{} ping -D -i 0.1 -I {} {}".format(
-        prefix, source, destination)
-    result = host.shell(
-        "nohup {} > {} 2>&1 < /dev/null & echo $!".format(command, path))
-    pid = int(result["stdout_lines"][-1])
-    assert pid > 0, "Continuous ping did not return a valid process ID"
-    return {
-        "host": host,
-        "path": path,
-        "pid": pid,
-    }
-
-
-def _ping_namespace_prefix(host, port):
+        if line.startswith("MACsec profile : "):
+            current = profiles.setdefault(line.partition(":")[2].strip(), {})
+        elif current is not None:
+            field, _, value = line.strip().partition(" ")
+            current[field] = value.strip()
+    return profiles
+
+
+def _profile_fields(host, port, name):
+    """Return the fields of SONiC profile *name* in the namespace of *port*, or None."""
+    return _profiles(host, getns_prefix(host, port)).get(name)
+
+
+def _eos_profile(host, name):
+    """Return the config lines of EOS MACsec profile *name*, or None."""
+    config = host.eos_command(commands=["show running-config section mac security"])["stdout"][0]
+    lines, inside = None, False
+    for line in config.splitlines():
+        line = line.strip()
+        if line.startswith("profile "):
+            inside = line == "profile {}".format(name)
+            if inside:
+                lines = []
+        elif inside:
+            lines.append(line)
+    return lines
+
+
+def _profile_exists(host, name):
+    """Check every ASIC namespace: the SONiC profile helpers write all of them."""
     if isinstance(host, EosHost):
-        return (
-            "sudo ip netns exec ns-{}".format(host.bgp_vrf)
-            if host.bgp_vrf else "")
+        return _eos_profile(host, name) is not None
+    namespaces = host.get_asic_namespace_list() if host.is_multi_asic else [None]
+    return any(name in _profiles(host, "-n {}".format(ns) if ns else "") for ns in namespaces)
+
+
+def _bound_profile(host, port):
+    """Return the MACsec profile bound to *port*, or None."""
+    if isinstance(host, EosHost):
+        config = host.eos_command(commands=["show running-config interfaces {}".format(port)])["stdout"][0]
+        names = re.findall(r"(?m)^\s*mac security profile\s+(\S+)\s*$", config)
+        assert len(names) <= 1, "Ambiguous MACsec binding on {} {}".format(host.hostname, port)
+        return names[0] if names else None
+    return _sa_state(host, port)["bound_profile"]
+
+
+def _configured_ckns(host, port, name):
+    if isinstance(host, EosHost):
+        return {line.split()[1].lower() for line in _eos_profile(host, name) or [] if line.startswith("key ")}
+    fields = _profile_fields(host, port, name) or {}
+    return {fields[key].lower() for key in ("primary_ckn", "fallback_ckn") if key in fields}
+
+
+def _expected_ckns(profile):
+    return {profile["primary_ckn"].lower(), profile["fallback_ckn"].lower()}
+
+
+def _sa_state(host, port):
+    """Parse `show macsec <port>`. The output contains SAKs, so it is never logged."""
+    output = host.command("show macsec {} {}".format(getns_prefix(host, port), port), verbose=False)["stdout"]
+    blocks = [(None, None, {})]
+    for line in output.splitlines():
+        header = re.search(r"MACsec (Egress|Ingress) (SC|SA) \((\S+)\)", line)
+        if header:
+            blocks.append((header.group(1, 2), header.group(3), {}))
+        else:
+            field, _, value = line.strip().partition(" ")
+            blocks[-1][2][field] = value.strip()
+    port_fields = blocks[0][2]
+    encoding_ans = {fields.get("encoding_an") for section, _, fields in blocks if section == ("Egress", "SC")}
+    return {
+        "bound_profile": port_fields.get("profile"),
+        "enabled": port_fields.get("enable") == "true",
+        "installed": any(section and section[1] == "SA" for section, _, _ in blocks),
+        "tx_saks": [fields["sak"] for section, an, fields in blocks
+                    if section == ("Egress", "SA") and an in encoding_ans and "sak" in fields],
+        "rx_saks": {fields["sak"] for section, _, fields in blocks
+                    if section == ("Ingress", "SA") and fields.get("active") == "true" and "sak" in fields},
+    }
+
+
+def _read_link(host, port):
+    """Return MKA status plus SA state for a SONiC port, or None without an MKA session."""
+    state = get_mka_status(host, port)
+    if state is not None:
+        state.update(_sa_state(host, port))
+    return state
+
+
+def _principals(state):
+    return sorted(ckn for ckn, participant in state["participants"].items() if participant["principal"])
+
+
+def _protected_errors(state, profile, principal, require_all_live=True):
+    """Return why a SONiC link is not secured by *principal* under *profile*."""
+    if state is None:
+        return ["MKA status is missing"]
+    principal = principal.lower()
+    expected = {profile["primary_ckn"].lower(): "primary", profile["fallback_ckn"].lower(): "fallback"}
+    participants = state["participants"]
+    errors = []
+    if state["query"] != "ok" or not state["fresh"]:
+        errors.append("MKA status is not fresh")
+    if state["profile"] != profile["name"]:
+        errors.append("bound to profile {}".format(state["profile"]))
+    if not state["enabled"] or state["mode"] != "secured" or state["kay"] != "active":
+        errors.append("port is not secured")
+    if state["config"] != "in-sync":
+        errors.append("config is {}".format(state["config"]))
+    if set(participants) != set(expected):
+        errors.append("participants are {}".format(sorted(participants)))
+    if _principals(state) != [principal]:
+        errors.append("principals are {}, expected {}".format(_principals(state), principal))
+    for ckn, role in expected.items():
+        participant = participants.get(ckn, {})
+        if participant.get("role") != role or not participant.get("active"):
+            errors.append("{} is not an active {} participant".format(ckn, role))
+        if (require_all_live or ckn == principal) and participant.get("live", 0) < 1:
+            errors.append("{} has no live peer".format(ckn))
+    if len(state["tx_saks"]) != 1 or state["tx_saks"][0] not in state["rx_saks"]:
+        errors.append("transmit SAK is not active for receive")
+    return errors
+
+
+def _blocked_errors(state, expected_ckns):
+    """Return why a SONiC link with mismatched keys still looks secured."""
+    if state is None:
+        return []
+    if state["query"] != "ok" or not state["fresh"]:
+        return ["MKA status is not fresh"]
+    errors = []
+    if state["mode"] == "secured":
+        errors.append("port remains secured")
+    if state["installed"]:
+        errors.append("SAs remain installed")
+    if set(state["participants"]) != {ckn.lower() for ckn in expected_ckns}:
+        errors.append("participants are {}".format(sorted(state["participants"])))
+    for ckn, participant in state["participants"].items():
+        if not participant["active"] or participant["live"] != 0:
+            errors.append("{} is not an active peerless participant".format(ckn))
+    return errors
+
+
+def _eos_field(mapping, *names):
+    """Read the first present field, ignoring case and punctuation in cEOS JSON keys."""
+    normalized = {re.sub(r"[^a-z0-9]", "", str(key).lower()): value for key, value in mapping.items()}
+    return next((normalized[name] for name in names if normalized.get(name) is not None), None)
+
+
+def _eos_true(value):
+    return str(value).lower() in ("true", "yes", "1")
+
+
+def _eos_participants(host, port):
+    """Return {ckn: {active, failed, live}} from `show mac security participants`.
+
+    See the sample in tests/common/devices/arista.py get_macsec_connection_status_details.
+    """
+    output = host.eos_command(
+        commands=["show mac security participants {} detail | json".format(port)])["stdout"][0]
+    interfaces = _eos_field(output, "interfaces") or {}
+    interface = next((value for name, value in interfaces.items() if name.lower() == port.lower()), {})
+    participants = {}
+    for ckn, participant in (_eos_field(interface, "participants") or {}).items():
+        live = _eos_field(participant, "livepeers", "livepeerlist")
+        if live is None:
+            live = _eos_field(_eos_field(participant, "details") or {}, "livepeers", "livepeerlist")
+        # Either of success/active may be published alone; at least one is required.
+        flags = [value for value in (_eos_field(participant, "success"), _eos_field(participant, "active"))
+                 if value is not None]
+        participants[ckn.lower()] = {
+            "active": bool(flags) and all(_eos_true(flag) for flag in flags),
+            "failed": _eos_true(_eos_field(participant, "failed", "failure")),
+            "live": len(live) if isinstance(live, (list, dict)) else int(live or 0),
+        }
+    return participants
+
+
+def _peer_errors(env, port, principal, require_all_live=True, profile=None):
+    """Return why the peer of DUT *port* is not secured by *principal*."""
+    profile = profile or env["profile"]
+    host, peer_port = env["links"][port]["host"], env["links"][port]["port"]
+    if not isinstance(host, EosHost):
+        return _protected_errors(_read_link(host, peer_port), profile, principal, require_all_live)
+    expected = _expected_ckns(profile)
+    participants = _eos_participants(host, peer_port)
+    errors = []
+    if not host.iface_macsec_ok(peer_port):
+        errors.append("controlled port is closed")
+    if _configured_ckns(host, peer_port, profile["name"]) != expected:
+        errors.append("configured CKNs differ")
+    if set(participants) != expected:
+        errors.append("participants are {}".format(sorted(participants)))
+    for ckn in expected:
+        participant = participants.get(ckn, {})
+        if (require_all_live or ckn == principal.lower()) and (
+                not participant.get("active") or participant.get("failed") or participant.get("live", 0) < 1):
+            errors.append("{} is not an active live participant".format(ckn))
+    return errors
+
+
+def _peer_blocked_errors(env, port, expected_ckns):
+    host, peer_port = env["links"][port]["host"], env["links"][port]["port"]
+    if not isinstance(host, EosHost):
+        return _blocked_errors(_read_link(host, peer_port), expected_ckns)
+    expected = {ckn.lower() for ckn in expected_ckns}
+    participants = _eos_participants(host, peer_port)
+    errors = []
+    if host.iface_macsec_ok(peer_port):
+        errors.append("controlled port remains open")
+    if _configured_ckns(host, peer_port, env["profile"]["name"]) != expected:
+        errors.append("configured CKNs differ")
+    if set(participants) != expected:
+        errors.append("participants are {}".format(sorted(participants)))
+    if any(participant["live"] for participant in participants.values()):
+        errors.append("a participant retains a live peer")
+    return errors
+
+
+def _dut_errors(env, port, principal, require_all_live=True, profile=None):
+    return _protected_errors(
+        _read_link(env["duthost"], port), profile or env["profile"], principal, require_all_live)
+
+
+def _link_errors(env, principal):
+    """Return DUT and peer errors for every selected link."""
+    errors = {}
+    for port in env["links"]:
+        errors.update({
+            ("dut", port): _dut_errors(env, port, principal),
+            ("peer", port): _peer_errors(env, port, principal),
+        })
+    return {key: value for key, value in errors.items() if value}
+
+
+def _wait_for(timeout, get_errors, message):
+    """Wait until get_errors() returns nothing; report its last result on timeout."""
+    last = [None]
+
+    def _done():
+        last[0] = get_errors()
+        return not last[0]
+
+    assert wait_until(timeout, 2, 0, _done), "{}: {}".format(message, last[0])
+
+
+def _wait_healthy(env):
+    _wait_for(MKA_CONVERGE_TIMEOUT, lambda: _link_errors(env, env["profile"]["primary_ckn"]),
+              "MACsec links are not secured by the primary CA")
+
+
+def _read_links(env, ports=None):
+    return {port: _read_link(env["duthost"], port) for port in ports or env["links"]}
+
+
+def _wait_dut_settled(env, before, principal, require_rekey=False, require_all_live=True):
+    """Wait until each port in *before* is secured by *principal* and stays unchanged for one hello."""
+    hello = max(math.ceil(int(state["hello"].split()[0]) / 1000.0) for state in before.values())
+    errors = {}
+
+    def _snapshot():
+        snapshot = {}
+        for port, old in before.items():
+            state = _read_link(env["duthost"], port)
+            problems = _protected_errors(state, env["profile"], principal, require_all_live)
+            if require_rekey and not problems and state["tx_saks"] == old["tx_saks"]:
+                problems.append("transmit SAK did not change")
+            if problems:
+                errors[port] = problems
+                return None
+            snapshot[port] = (state["tx_saks"], _principals(state))
+        return snapshot
+
+    def _stable():
+        errors.clear()
+        first = _snapshot()
+        if first is None:
+            return False
+        time.sleep(hello)
+        if _snapshot() != first:
+            errors.setdefault("selection", "changed within one hello interval")
+            return False
+        return True
+
+    # Allow three hellos for selection to settle before checking.
+    assert wait_until(SA_RETIRE_TIMEOUT + MKA_TIMEOUT, 1, 3 * hello, _stable), \
+        "DUT did not settle on {}: {}".format(principal, errors)
+
+
+def _observe_natural_rekey(env, port):
+    """Require a periodic SAK refresh while the configured CKNs and primary selection stay unchanged."""
+    duthost, profile = env["duthost"], env["profile"]
+    assert _configured_ckns(duthost, port, profile["name"]) == _expected_ckns(profile)
+    baseline = {}
+
+    def _protected(require_new_sak):
+        state = _read_link(duthost, port)
+        if _protected_errors(state, profile, profile["primary_ckn"]):
+            return False
+        if require_new_sak:
+            return state["tx_saks"] != baseline["sak"]
+        baseline["sak"] = state["tx_saks"]
+        return True
+
+    assert wait_until(MKA_TIMEOUT, 1, 0, _protected, False), "{} is not secured by the primary".format(port)
+    assert wait_until(MKA_CONVERGE_TIMEOUT, 1, 0, _protected, True), \
+        "No periodic SAK refresh on {} with unchanged CKNs".format(port)
+    assert _configured_ckns(duthost, port, profile["name"]) == _expected_ckns(profile)
+
+
+def _eos_key(host, name, key, fallback=False, remove=False):
+    cak, ckn = key
+    host.eos_config(
+        lines=["{}key {} 7 {}{}".format("no " if remove else "", ckn, cak, " fallback" if fallback else "")],
+        parents=["mac security", "profile {}".format(name)])
+
+
+def _restore_key(endpoints, name, role, original, replacement):
+    """Put *original* back on each (host, port) that does not have it configured."""
+    for host, port in endpoints:
+        configured = _configured_ckns(host, port, name)
+        if replacement[1].lower() in configured:
+            update_macsec_profile_key(host, name, *replacement, *original, is_fallback=role == "fallback")
+        elif isinstance(host, EosHost) and original[1].lower() not in configured:
+            # Only the cEOS key-delete stimulus leaves a key missing.
+            _eos_key(host, name, original, fallback=role == "fallback")
+
+
+def _endpoints(env):
+    """Return (host, port) for the DUT and every selected peer."""
+    port = next(iter(env["links"]))
+    return [(env["duthost"], port)] + [(nbr["host"], nbr["port"]) for nbr in env["links"].values()]
+
+
+# ---------------------------------------------------------------------------
+# Neighbor-to-neighbor transit traffic through the DUT
+# ---------------------------------------------------------------------------
+
+def _netns_prefix(host, port):
+    if isinstance(host, EosHost):
+        return "sudo ip netns exec ns-{}".format(host.bgp_vrf) if host.bgp_vrf else ""
     return get_ipnetns_prefix(host, port)
 
 
-def _parse_ping_output(output):
-    """Return successful reply sequences and the final ping summary."""
-    reply_pattern = re.compile(
-        r"^\s*(?:\[[^\]]+\]\s*)?\d+\s+bytes\s+from\b.*?"
-        r"\bicmp_seq[= ](\d+)\b",
-        re.MULTILINE,
-    )
-    summary_pattern = re.compile(
-        r"^\s*(\d+) packets transmitted, "
-        r"(\d+) (?:packets )?received,.*?"
-        r"([\d.]+)% packet loss",
-        re.MULTILINE,
-    )
-    summary = summary_pattern.search(output)
-    return {
-        "received_sequences": {
-            int(sequence)
-            for sequence in reply_pattern.findall(output)
-        },
-        "summary": (
-            {
-                "transmitted": int(summary.group(1)),
-                "received": int(summary.group(2)),
-                "loss_percent": float(summary.group(3)),
-            }
-            if summary else None
-        ),
-    }
+def _run(host, port, command, check=True):
+    """Run *command* in the data-plane namespace of *port*; return stdout."""
+    result = host.command("{} {}".format(_netns_prefix(host, port), command).strip(),
+                          module_ignore_errors=not check, verbose=False)
+    return result.get("stdout", "").strip()
 
 
-def _ping_observation_result(pre_stop_output, final_output, start_boundary=0):
-    """Measure replies after startup through the last pre-stop reply."""
-    pre_stop = _parse_ping_output(pre_stop_output)
-    final = _parse_ping_output(final_output)
-    received_before_stop = pre_stop["received_sequences"]
-    if not received_before_stop:
-        return {
-            "errors": ["no ping replies were observed before shutdown"],
-            "boundary": None,
-            "missing_sequences": [],
-            "summary": final["summary"],
-        }
-
-    boundary = max(received_before_stop)
-    received_by_exit = final["received_sequences"]
-    missing_sequences = sorted(
-        set(range(start_boundary + 1, boundary + 1)) - received_by_exit)
-    errors = []
-    if boundary - start_boundary < 10:
-        errors.append(
-            "traffic sample ended at sequence {} after starting at {}, "
-            "expected at least 10".format(boundary, start_boundary))
-    if missing_sequences:
-        errors.append(
-            "missing ping sequences within observation window")
-    return {
-        "errors": errors,
-        "boundary": boundary,
-        "missing_sequences": missing_sequences,
-        "summary": final["summary"],
-    }
+def _route_field(route, field):
+    words = route.split()
+    return words[words.index(field) + 1] if field in words[:-1] else None
 
 
-def _read_ping_output(ping, ignore_errors=False):
-    result = ping["host"].shell(
-        "cat {}".format(ping["path"]),
-        module_ignore_errors=ignore_errors,
-    )
-    return result.get("stdout", "")
+def _route_ok(host, port, source, destination, gateway, device):
+    """Check that *host* sends source->destination via *gateway* on *device* without ECMP."""
+    route = _run(host, port, "ip -4 route get {} from {}".format(destination, source), check=False)
+    return (_route_field(route, "via") == gateway and _route_field(route, "dev") == device
+            and "nexthop" not in route.split())
 
 
-def _ping_process_running(ping):
-    result = ping["host"].shell(
-        "sudo kill -0 {}".format(ping["pid"]),
-        module_ignore_errors=True,
-    )
-    return not result.get("failed")
+def _dut_route_ok(duthost, in_port, out_port, source, destination, via=None):
+    """Check that the DUT forwards source->destination from *in_port* out of *out_port* only."""
+    portchannels = get_portchannel(duthost)
+    in_dev, out_dev = ((find_portchannel_from_member(p, portchannels) or {"name": p})["name"]
+                       for p in (in_port, out_port))
+    route = _run(duthost, out_port, "ip -4 route get {} from {} iif {}".format(destination, source, in_dev),
+                 check=False)
+    return (_route_field(route, "dev") == out_dev and _route_field(route, "via") == via
+            and "nexthop" not in route.split())
 
 
-def _drain_ping_observation(ping):
-    """Wait for post-transition replies before closing the observation."""
-    initial_output = _read_ping_output(ping, ignore_errors=True)
-    initial_sequences = _parse_ping_output(
-        initial_output)["received_sequences"]
-    initial_boundary = max(initial_sequences) if initial_sequences else 0
-    target_boundary = max(10, initial_boundary + 3)
-    drained_output = [initial_output]
+def _directions(env, port):
+    other = next(p for p in env["links"] if p != port)
+    return ((port, other), (other, port))
+
+
+@contextmanager
+def _transit_path(env, port):
+    """Pin each neighbor's /32 to the other neighbor's link address through the DUT."""
+    duthost, upstream = env["duthost"], env["upstream_links"]
+    endpoints = []
+    for src_port, dst_port in _directions(env, port):
+        nbr = env["links"][src_port]
+        source = upstream[src_port]["local_ipv4_addr"]
+        destination = upstream[dst_port]["local_ipv4_addr"]
+        gateway = upstream[src_port]["peer_ipv4_addr"]
+        device = _route_field(_run(nbr["host"], nbr["port"], "ip -4 route get {} from {}".format(gateway, source)),
+                              "dev")
+        if not device or not _dut_route_ok(duthost, src_port, dst_port, source, destination):
+            pytest.skip("No direct protected DUT path from {} to {}".format(src_port, dst_port))
+        endpoints.append((nbr["host"], nbr["port"], source, destination, gateway, device))
+
+    with ExitStack() as cleanup:
+        for host, nbr_port, source, destination, gateway, device in endpoints:
+            if _route_ok(host, nbr_port, source, destination, gateway, device):
+                continue
+            if _run(host, nbr_port, "ip -4 route show exact {}/32".format(destination)):
+                pytest.skip("Existing /32 route to {} on {}".format(destination, host.hostname))
+            route = "{}/32 via {} dev {}".format(destination, gateway, device)
+            _run(host, nbr_port, "sudo ip -4 route add {} src {}".format(route, source))
+            cleanup.callback(_run, host, nbr_port, "sudo ip -4 route del {}".format(route))
+        assert all(_route_ok(*endpoint) for endpoint in endpoints), "Transit routes do not go through the DUT"
+        yield endpoints
+
+
+def _data_loopback(nbr):
+    output = _run(nbr["host"], nbr["port"], "ip -o -4 addr show")
+    addresses = {address for device, address in re.findall(r"^\d+:\s+(\S+)\s+inet\s+([\d.]+)/32\b", output, re.M)
+                 if (device in ("lo", "lo0") or device.startswith("Loopback"))
+                 and not ipaddress.ip_address(address).is_loopback}
+    if len(addresses) != 1:
+        pytest.skip("{} has no unique data-plane /32 loopback".format(nbr["host"].hostname))
+    return addresses.pop()
+
+
+@contextmanager
+def _stable_transit_path(env, port):
+    """Route between the two neighbors' data loopbacks through the DUT.
+
+    Link addresses can be withdrawn when MACsec goes down, which would turn the blocked-traffic
+    check into a local route error. Loopbacks keep it a real no-forwarding check.
+    """
+    duthost, upstream = env["duthost"], env["upstream_links"]
+    asic = duthost.get_port_asic_instance(port)
+    loopbacks = {p: _data_loopback(env["links"][p]) for p in env["links"]}
+    if len(set(loopbacks.values())) != 2:
+        pytest.skip("Neighbor data loopbacks are not distinct")
+    endpoints, dut_routes = [], []
+    for src_port, dst_port in _directions(env, port):
+        nbr = env["links"][src_port]
+        gateway = upstream[src_port]["peer_ipv4_addr"]
+        destination = loopbacks[dst_port]
+        route = _run(nbr["host"], nbr["port"], "ip -4 route get {} from {}".format(gateway, loopbacks[src_port]))
+        if _route_field(route, "via") or not _route_field(route, "dev"):
+            pytest.skip("{} loopback cannot reach its DUT gateway directly".format(nbr["host"].hostname))
+        endpoints.append((nbr["host"], nbr["port"], loopbacks[src_port], destination, gateway,
+                          _route_field(route, "dev")))
+        dut_routes.append((src_port, dst_port, "{}/32".format(destination), upstream[dst_port]["local_ipv4_addr"]))
+        if _run(duthost, port, "ip -4 route show exact {}/32".format(destination)) or _run(
+                nbr["host"], nbr["port"], "ip -4 route show exact {}/32".format(destination)):
+            pytest.skip("Existing /32 route to neighbor loopback {}".format(destination))
+
+    def _peer_route(host, nbr_port, source, destination, gateway, device, remove=False):
+        if isinstance(host, EosHost):
+            vrf = "vrf {} ".format(host.bgp_vrf) if host.bgp_vrf else ""
+            host.eos_config(lines=["{}ip route {}{}/32 {}".format("no " if remove else "", vrf, destination, gateway)])
+        else:
+            _run(host, nbr_port, "sudo ip -4 route {} {}/32 via {} dev {}{}".format(
+                "del" if remove else "add", destination, gateway, device, "" if remove else " src " + source))
+
+    with ExitStack() as cleanup:
+        for _, _, prefix, nexthop in dut_routes:
+            asic.run_vtysh("-c 'configure terminal' -c 'ip route {} {}'".format(prefix, nexthop))
+            cleanup.callback(asic.run_vtysh, "-c 'configure terminal' -c 'no ip route {} {}'".format(prefix, nexthop))
+        assert wait_until(90, 2, 0, lambda: all(
+            _dut_route_ok(duthost, in_port, out_port, loopbacks[in_port], loopbacks[out_port], via=nexthop)
+            for in_port, out_port, _, nexthop in dut_routes)), "DUT loopback routes are not programmed"
+        for endpoint in endpoints:
+            _peer_route(*endpoint)
+            cleanup.callback(_peer_route, *endpoint, remove=True)
+        assert wait_until(60, 2, 0, lambda: all(_route_ok(*endpoint) for endpoint in endpoints)), \
+            "Neighbor loopback routes do not go through the DUT"
+        yield endpoints
+
+
+def _probe(endpoint):
+    """Return whether three pings from one neighbor reach the other through the DUT."""
+    host, port, source, destination = endpoint[:4]
+    result = host.command("{} ping -c 3 -I {} {}".format(_netns_prefix(host, port), source, destination).strip(),
+                          module_ignore_errors=True, verbose=False)
+    if result["rc"] == 2 and "Network is unreachable" in result.get("stderr", ""):
+        return False
+    assert result["rc"] in (0, 1), "Transit ping did not run on {}: {}".format(host.hostname, result.get("stderr"))
+    return result["rc"] == 0
+
+
+def _replies(ping):
+    output = ping["host"].shell("cat {}".format(ping["path"]), verbose=False)["stdout"]
+    return {int(seq) for seq in PING_REPLY.findall(output)}
+
+
+def _ping_running(ping):
+    return not ping["host"].shell("sudo kill -0 {}".format(ping["pid"]), module_ignore_errors=True)["failed"]
+
+
+def _stop_ping(ping):
+    """Drain post-transition replies, stop the ping and return (missing sequences, last sequence)."""
+    assert _ping_running(ping), "Ping on {} exited during the measured window".format(ping["host"].hostname)
+    target = max(max(_replies(ping), default=0) + 3, 10)
+    seen = {}
 
     def _drained():
-        if not _ping_process_running(ping):
-            return False
-        drained_output[0] = _read_ping_output(
-            ping, ignore_errors=True)
-        sequences = _parse_ping_output(
-            drained_output[0])["received_sequences"]
-        return bool(sequences) and max(sequences) >= target_boundary
+        seen["replies"] = _replies(ping)
+        return _ping_running(ping) and max(seen["replies"], default=0) >= target
 
     drained = wait_until(15, 1, 0, _drained)
-    return {
-        "drained": drained,
-        "output": drained_output[0],
-        "initial_boundary": initial_boundary,
-        "target_boundary": target_boundary,
-    }
+    end = max(seen["replies"], default=0)
+    ping["host"].shell("sudo kill -INT {}".format(ping["pid"]))
+    ping["stopped"] = True
+    assert wait_until(15, 1, 0, lambda: not _ping_running(ping)), "Ping did not exit after SIGINT"
+    received = _replies(ping)
+    assert drained, "Ping on {} did not reach sequence {} after the transition".format(ping["host"].hostname, target)
+    return sorted(set(range(ping["start"] + 1, end + 1)) - received), end
 
 
-def _stop_ping(ping, assert_loss=True):
-    was_running = _ping_process_running(ping)
-    drain = _drain_ping_observation(ping)
-    pre_stop_output = drain["output"]
-    signal_result = ping["host"].shell(
-        "sudo kill -INT {}".format(ping["pid"]),
-        module_ignore_errors=True,
-    )
-    exited = wait_until(
-        15, 1, 0, lambda: not _ping_process_running(ping))
-    if not exited:
-        ping["host"].shell(
-            "sudo kill -TERM {}".format(ping["pid"]),
-            module_ignore_errors=True,
-        )
-    else:
-        time.sleep(0.3)
-
-    output = _read_ping_output(ping)
-    summary = _parse_ping_output(output)["summary"]
-    for _ in range(10):
-        if summary:
-            break
-        time.sleep(0.2)
-        output = _read_ping_output(ping)
-        summary = _parse_ping_output(output)["summary"]
-    assert summary, "Unable to parse ping summary:\n{}".format(output)
-    ping["host"].shell(
-        "rm -f {}".format(ping["path"]), module_ignore_errors=True)
-    assert was_running, (
-        "Continuous ping exited before the observation window closed: {}"
-    ).format(ping)
-    assert drain["drained"], (
-        "Continuous ping did not drain after the transition; "
-        "initial boundary={}, target boundary={}, ping={}"
-    ).format(
-        drain["initial_boundary"],
-        drain["target_boundary"],
-        ping,
-    )
-    assert not signal_result.get("failed"), (
-        "Unable to stop continuous ping cleanly: {}"
-    ).format(ping)
-    assert exited, "Continuous ping did not exit after SIGINT: {}".format(
-        ping)
-    start_boundary = ping.get("start_boundary", 0)
-    observation = _ping_observation_result(
-        pre_stop_output, output, start_boundary=start_boundary)
-    if assert_loss:
-        assert not observation["errors"], (
-            "Traffic loss detected during MACsec transition:\n{}\n"
-            "Observation start/end: {}/{}\nMissing ICMP sequences: {}\n"
-            "Final ping summary: {}"
-        ).format(
-            output,
-            start_boundary,
-            observation["boundary"],
-            observation["missing_sequences"][:200],
-            summary,
-        )
-    boundary = observation["boundary"]
-    return {
-        "transmitted": boundary - start_boundary if boundary is not None else 0,
-        "received": (
-            boundary - start_boundary - len(observation["missing_sequences"])
-            if boundary is not None else 0),
-        "loss_percent": (
-            0.0 if boundary and not observation["missing_sequences"]
-            else summary["loss_percent"]),
-        "summary_transmitted": summary["transmitted"],
-        "summary_received": summary["received"],
-        "summary_loss_percent": summary["loss_percent"],
-        "observation_start": start_boundary,
-        "observation_boundary": boundary,
-    }
-
-
-def _abort_partial_ping(ping):
-    """Stop an unobserved startup stream without requiring a ping summary."""
-    host = ping["host"]
-    pid = ping["pid"]
-    try:
-        signal = host.shell(
-            "sudo kill -INT {}".format(pid), module_ignore_errors=True)
-        exited = wait_until(
-            15, 1, 0, lambda: not _ping_process_running(ping))
-        if not exited:
-            term = host.shell(
-                "sudo kill -TERM {}".format(pid), module_ignore_errors=True)
-            terminated = wait_until(
-                5, 1, 0, lambda: not _ping_process_running(ping))
-            assert not term.get("failed") and terminated, (
-                "Unable to terminate partially started continuous ping")
-        assert not signal.get("failed") and exited, (
-            "Unable to stop partially started continuous ping")
-    finally:
-        host.shell("rm -f {}".format(ping["path"]),
-                   module_ignore_errors=True)
-
-
-def _probe_transit(endpoint):
-    host, port, source, destination, _, _ = endpoint
-    result = host.command(
-        "{} ping -c 3 -I {} {}".format(
-            _ping_namespace_prefix(host, port), source, destination),
-        module_ignore_errors=True, verbose=False)
-    output = "{}\n{}".format(
-        result.get("stdout", ""), result.get("stderr", ""))
-    rc = result.get("rc")
-    if rc == 2 and re.search(r"\bping:.*Network is unreachable", output):
-        return False
-    summary = _parse_ping_output(output)["summary"]
-    if (rc not in (0, 1) or not summary
-            or result.get("stderr", "").strip()
-            or (rc == 0 and result.get("failed"))
-            or summary["transmitted"] != 3
-            or not 0 <= summary["received"] <= 3
-            or (rc == 0 and summary["received"] == 0)
-            or (rc == 1 and summary["received"] == 3)):
-        raise RuntimeError("Transit ping did not return a valid ICMP verdict on {}".format(
-            host.hostname))
-    return summary["received"] > 0
-
-
-def _start_bidirectional_traffic(endpoints):
-    assert _probe_transit(endpoints[0]), "Unable to warm first neighbor-to-neighbor transit path"
-    assert _probe_transit(endpoints[1]), "Unable to warm reverse neighbor-to-neighbor transit path"
-    traffic = []
+@contextmanager
+def _transit_traffic(endpoints):
+    """Run a 10 Hz ping in each direction; yield once each has ten replies."""
+    for endpoint in endpoints:
+        assert _probe(endpoint), "Transit path from {} is not healthy".format(endpoint[0].hostname)
+    pings = []
     try:
         for index, (host, port, source, destination, _, _) in enumerate(endpoints):
-            traffic.append(_start_ping(
-                host, port, source, destination, "transit_{}".format(index)))
-
-        for ping in traffic:
-            deadline = time.monotonic() + 15
-            while time.monotonic() < deadline:
-                assert _ping_process_running(ping), (
-                    "Continuous transit ping exited before observation began")
-                received = _parse_ping_output(
-                    _read_ping_output(ping))["received_sequences"]
-                if len(received) >= 10:
-                    ping["start_boundary"] = max(received)
-                    break
-                time.sleep(0.2)
-            else:
-                raise AssertionError(
-                    "Continuous transit ping did not establish a startup baseline")
-    except Exception:
-        with ExitStack() as cleanup:
-            for ping in reversed(traffic):
-                cleanup.callback(_abort_partial_ping, ping)
-        raise
-    return traffic
+            path = "/tmp/macsec_fallback_ping_{}.log".format(index)
+            pid = host.shell("rm -f {0}; nohup {1} ping -D -i 0.1 -I {2} {3} > {0} 2>&1 < /dev/null & echo $!".format(
+                path, _netns_prefix(host, port), source, destination))["stdout_lines"][-1]
+            ping = {"host": host, "path": path, "pid": int(pid)}
+            pings.append(ping)
+            assert wait_until(15, 1, 0, lambda: _ping_running(ping) and len(_replies(ping)) >= 10), \
+                "Ping from {} did not start".format(host.hostname)
+            ping["start"] = max(_replies(ping))
+        yield pings
+    finally:
+        for ping in pings:
+            if not ping.get("stopped"):
+                ping["host"].shell("sudo kill -INT {}".format(ping["pid"]), module_ignore_errors=True)
+            ping["host"].shell("rm -f {}".format(ping["path"]), module_ignore_errors=True)
 
 
-def _wait_for_validated_state(timeout, interval, validator):
-    """Wait for no validation errors, including one final boundary check."""
-    attempts = []
-
-    def _ready():
-        errors = validator()
-        attempts.append(errors)
-        return not errors
-
-    ready = wait_until(timeout, interval, 0, _ready)
-    if not ready:
-        ready = _ready()
-    return ready, attempts[-1], attempts
+def _assert_no_loss(pings):
+    """Close the measured window: every probe sent after the start boundary must be answered."""
+    for ping in pings:
+        missing, end = _stop_ping(ping)
+        assert end - ping["start"] >= 10, "Too few probes in the measured window"
+        assert not missing, "{} lost {} probes: {}".format(ping["host"].hostname, len(missing), missing[:50])
 
 
-def _stop_traffic(traffic, assert_loss):
-    pings = traffic[:]
-    traffic.clear()
-    results = []
-    with ExitStack() as cleanup:
-        for ping in reversed(pings):
-            cleanup.callback(
-                lambda ping=ping: results.append(
-                    _stop_ping(ping, assert_loss=assert_loss)))
-    return results
+# ---------------------------------------------------------------------------
+# Fixture
+# ---------------------------------------------------------------------------
 
-
-@contextmanager
-def _traffic_window(environment, upstream_links, port):
-    with _transit_path(environment, upstream_links, port) as endpoints:
-        traffic = _start_bidirectional_traffic(endpoints)
-        try:
-            yield traffic
-        finally:
-            if traffic:
-                _stop_traffic(traffic, assert_loss=False)
-
-
-@contextmanager
-def _owned_fallback_profiles(environment):
-    """Bind only the two routed links to a test-owned shared 30-second profile."""
-    duthost = environment["duthost"]
-    profile = environment["profile"]
-    links = environment["links"]
-    assert len(links) == 2, "Fallback tests require exactly two selected links"
-    assert profile["rekey_period"] == 30, "Fallback E2E requires a 30-second rekey period"
-    expected_ckns = {
-        field: profile[field].lower() for field in ("primary_ckn", "fallback_ckn")}
-    original = dict(profile)
-    original_names = dict(environment["neighbor_profiles"])
-    original_peer_profiles = {
-        port: dict(value) for port, value in environment["peer_profiles"].items()}
-
-    def _eos_bound_profile(host, port):
-        result = host.eos_command(commands=[
-            "show running-config interfaces {}".format(port)])
-        if result.get("failed") or result.get("rc", 0) != 0:
-            raise RuntimeError("Unable to read EOS MACsec interface binding")
-        output = result.get("stdout", [])
-        if not output or not isinstance(output[0], str):
-            raise ValueError("Malformed EOS interface configuration")
-        inside = False
-        headers = 0
-        names = []
-        for line in output[0].splitlines():
-            if line.strip() == "interface {}".format(port):
-                inside = True
-                headers += 1
-                continue
-            if inside and line and not line[0].isspace():
-                inside = False
-            if inside:
-                match = re.fullmatch(r"\s*mac security profile\s+(\S+)\s*", line)
-                if match:
-                    names.append(match.group(1))
-                elif line.strip().startswith("mac security profile"):
-                    raise ValueError("Malformed EOS interface binding")
-        if headers != 1 or len(names) > 1:
-            raise ValueError("EOS interface binding is ambiguous")
-        return names[0] if names else None
-
-    def _bound_profile(host, port):
-        if isinstance(host, EosHost):
-            return _eos_bound_profile(host, port)
-        return _read_port_profile(host, port)
-
-    def _eos_profile_fields(host, name):
-        result = host.eos_command(commands=["show running-config section mac security"])
-        if result.get("failed") or result.get("rc", 0) != 0:
-            raise RuntimeError("Unable to inspect EOS MACsec profiles")
-        output = result.get("stdout", [])
-        if not output or not isinstance(output[0], str):
-            raise ValueError("Malformed EOS MACsec profile configuration")
-        if not re.search(r"(?m)^\s*profile {}\s*$".format(re.escape(name)), output[0]):
-            return None
-        return {
-            "ckns": parse_eos_profile_ckns(output[0], name),
-            "priority": parse_eos_profile_priority(output[0], name),
-            "period": parse_eos_profile_rekey_period(output[0], name),
-        }
-
-    def _priority(host, port, name):
-        if isinstance(host, EosHost):
-            fields = _eos_profile_fields(host, name or next(
-                environment["neighbor_profiles"][dut_port]
-                for dut_port, peer in links.items()
-                if peer["host"] is host and peer["port"] == port))
-            if fields is None or fields["ckns"] != set(expected_ckns.values()):
-                raise AssertionError("Original EOS CKNs differ from the known fixture")
-            value = fields["priority"]
-        else:
-            fields = get_macsec_profile_ckns(
-                host, name or original["name"], get_namespace_option(host, port),
-                include_priority=True)
-            if fields is None or any(fields.get(key) != ckn
-                                     for key, ckn in expected_ckns.items()):
-                raise AssertionError("Original SONiC CKNs differ from the known fixture")
-            value = fields.get("priority")
-        if value is None:
-            raise AssertionError("Original MACsec key-server priority unavailable")
-        return int(value)
-
-    endpoints = [(duthost, port) for port in links] + [
-        (neighbor["host"], neighbor["port"]) for neighbor in links.values()]
-    bindings = {(host.hostname, port): _bound_profile(host, port)
-                for host, port in endpoints}
-    for port, neighbor in links.items():
-        assert bindings[duthost.hostname, port] in (None, original["name"]), (
-            "DUT is bound to an unknown fallback profile")
-        assert bindings[neighbor["host"].hostname, neighbor["port"]] in (
-            None, original_names[port]), "Peer is bound to an unknown fallback profile"
-    priorities = {(host.hostname, port): _priority(
-        host, port, bindings[host.hostname, port]) for host, port in endpoints}
-    dut_priorities = {priorities[duthost.hostname, port] for port in links}
-    assert len(dut_priorities) == 1, "Selected ports do not share a key-server priority"
-
-    dut_name = _owned_profile_name(original["name"], duthost.hostname, "shared")
-    peer_names = {
-        port: _owned_profile_name(
-            original["name"], neighbor["host"].hostname, neighbor["port"])
-        for port, neighbor in links.items()
-    }
-
-    def _profile_exists(host, port, name):
-        if isinstance(host, EosHost):
-            return _eos_profile_fields(host, name) is not None
-        return get_macsec_profile_ckns(
-            host, name, get_namespace_option(host, port)) is not None
-
-    owned_profiles = [(duthost, next(iter(links)), dut_name, next(iter(dut_priorities)))]
-    owned_profiles.extend(
-        (neighbor["host"], neighbor["port"], peer_names[port],
-         priorities[neighbor["host"].hostname, neighbor["port"]])
-        for port, neighbor in links.items())
-    assert len({(host.hostname, get_namespace_option(host, port), name)
-                for host, port, name, _ in owned_profiles}) == len(owned_profiles), (
-                    "Test-owned MACsec profile names collide")
-    for host, port, name, _ in owned_profiles:
-        assert not _profile_exists(host, port, name), (
-            "Refusing to overwrite pre-existing MACsec profile on {}".format(host.hostname))
-
-    def _restore_binding(host, port, original_name):
-        try:
-            disable_macsec_port(host, port)
-        finally:
-            if original_name is not None:
-                enable_macsec_port(host, port, original_name)
-        assert wait_until(
-            30, 2, 0,
-            lambda: _bound_profile(host, port) == original_name), (
-                "Original MACsec binding not restored on {} {}".format(
-                    host.hostname, port))
-
-    def _restore_environment():
-        profile.clear()
-        profile.update(original)
-        environment["neighbor_profiles"].update(original_names)
-        environment["peer_profiles"].update(original_peer_profiles)
-
-    def _delete_owned_profile(host, port, name):
-        if any(_bound_profile(bound_host, bound_port) == name
-               for bound_host, bound_port in endpoints
-               if bound_host.hostname == host.hostname):
-            raise AssertionError("Retaining still-attached owned MACsec profile on {}".format(
-                host.hostname))
-        delete_macsec_profile(host, name, namespace_option=get_namespace_option(host, port))
-        assert not _profile_exists(host, port, name), (
-            "Owned MACsec profile remains on {}".format(host.hostname))
-
-    logger.info("MACsec owned fixture rebinding %d selected DUT/peer interfaces",
-                len(endpoints))
-    with ExitStack() as cleanup:
-        if all(name is not None for name in bindings.values()):
-            cleanup.callback(_wait_environment, environment, original["primary_ckn"])
-        cleanup.callback(_restore_environment)
-        for host, port, name, priority in owned_profiles:
-            cleanup.callback(_delete_owned_profile, host, port, name)
-            _set_profile(
-                host, name, profile, priority=priority,
-                namespace_option=get_namespace_option(host, port))
-        for port, neighbor in links.items():
-            cleanup.callback(_restore_binding, duthost, port, bindings[duthost.hostname, port])
-            disable_macsec_port(duthost, port)
-            enable_macsec_port(duthost, port, dut_name)
-            cleanup.callback(
-                _restore_binding, neighbor["host"], neighbor["port"],
-                bindings[neighbor["host"].hostname, neighbor["port"]])
-            disable_macsec_port(neighbor["host"], neighbor["port"])
-            enable_macsec_port(neighbor["host"], neighbor["port"], peer_names[port])
-            environment["neighbor_profiles"][port] = peer_names[port]
-            environment["peer_profiles"][port]["name"] = peer_names[port]
-        profile["name"] = dut_name
-        for host, port, name, priority in owned_profiles:
-            if isinstance(host, EosHost):
-                state = _eos_profile_fields(host, name)
-                assert (
-                    state is not None
-                    and state["ckns"] == set(expected_ckns.values())
-                    and state["period"] == 30 and state["priority"] == priority
-                ), "Owned EOS profile configuration differs"
-            else:
-                fields = get_macsec_profile_ckns(
-                    host, name, get_namespace_option(host, port),
-                    include_rekey_period=True, include_priority=True)
-                assert fields == dict(expected_ckns, rekey_period="30",
-                                      priority=str(priority)), (
-                    "Owned SONiC profile configuration differs")
-        yield
+def _select_pair(duthost, ctrl_links, upstream_links):
+    """Pick two same-ASIC links to distinct routed neighbors, preferring cEOS peers."""
+    portchannels = get_portchannel(duthost)
+    eligible = [port for port in ctrl_links if port in upstream_links and len(
+        (find_portchannel_from_member(port, portchannels) or {"members": [port]})["members"]) == 1]
+    eligible.sort(key=lambda port: not isinstance(ctrl_links[port]["host"], EosHost))
+    for port in eligible:
+        for other in eligible:
+            if (other != port and ctrl_links[other]["name"] != ctrl_links[port]["name"]
+                    and upstream_links[other]["local_ipv4_addr"] != upstream_links[port]["local_ipv4_addr"]
+                    and getns_prefix(duthost, other) == getns_prefix(duthost, port)):
+                return {port: ctrl_links[port], other: ctrl_links[other]}
+    pytest.skip("Need two same-ASIC MACsec links to distinct routed neighbors, each direct or a 1-member PortChannel")
 
 
 @pytest.fixture(scope="module")
-def fallback_macsec_environment(
-        macsec_duthost, ctrl_links, macsec_profile, port_profiles,
-        get_port_profile_name, upstream_links):
-    """Own one shared DUT profile on two independently routed MACsec links."""
+def fallback_env(macsec_duthost, ctrl_links, upstream_links, macsec_profile, port_profiles, tbinfo):
+    """Bind two routed links to a test-owned copy of the fallback profile with a 30s rekey period."""
+    duthost = macsec_duthost
     if port_profiles:
-        pytest.skip(
-            "Targeted rollover cases use one shared profile; the normal "
-            "fallback profile still runs in the per-interface suite sweep")
-    if not ctrl_links:
-        pytest.skip("Fallback CAK tests require a controlled MACsec link")
-    if not mka_state_cli_supported(macsec_duthost):
-        pytest.skip("SONiC image does not expose fallback CAK/MKA state CLI")
+        pytest.skip("Fallback CAK tests use one shared profile; per-interface mode is not supported")
+    result = duthost.command("show macsec --mka", module_ignore_errors=True)
+    if "no such option" in result.get("stderr", "").lower():
+        pytest.skip("Image does not support show macsec --mka")
 
-    candidate = {"duthost": macsec_duthost, "links": dict(ctrl_links)}
-    preferred = [port for port, peer in ctrl_links.items()
-                 if isinstance(peer["host"], EosHost)]
-    preferred.extend(port for port in ctrl_links if port not in preferred)
-    selected, other = _select_routed_pair(candidate, upstream_links, ports=preferred)
-    links = {port: ctrl_links[port] for port in (selected, other)}
-    neighbor_profiles = {
-        port: get_port_profile_name(port)
-        for port in links
-    }
-    profile = dict(macsec_profile)
-    base_profile_name = profile["name"]
-    environment = {
-        "duthost": macsec_duthost,
-        "links": links,
-        "profile": profile,
-        "neighbor_profiles": neighbor_profiles,
-        "peer_profiles": {
-            port: dict(profile)
-            for port in links
-        },
-        "base_profile_name": base_profile_name,
-    }
-    with _owned_fallback_profiles(environment):
-        assert wait_until(
-            MKA_CONVERGE_TIMEOUT, 5, 0,
-            _environment_is_healthy, environment,
-        ), "Dual-CA MKA operational state did not become healthy"
-        yield environment
+    links = _select_pair(duthost, ctrl_links, upstream_links)
+    profile = dict(macsec_profile, name=macsec_profile["name"] + "_TEST", rekey_period=REKEY_PERIOD)
+    hosts = [(duthost, port) for port in links] + [(nbr["host"], nbr["port"]) for nbr in links.values()]
+    for host in [duthost] + [nbr["host"] for nbr in links.values()]:
+        assert not _profile_exists(host, profile["name"]), \
+            "Refusing to overwrite existing profile {} on {}".format(profile["name"], host.hostname)
+    # macsec_setup may skip startup_macsec, so record the bindings rather than assume the base profile.
+    bindings = [(host, port, _bound_profile(host, port)) for host, port in hosts]
+
+    env = {"duthost": duthost, "links": links, "upstream_links": upstream_links,
+           "profile": profile, "base_profile_name": macsec_profile["name"]}
+    try:
+        setup_macsec_configuration(
+            duthost, links, profile["name"], profile["priority"], profile["cipher_suite"],
+            profile["primary_cak"], profile["primary_ckn"], profile["policy"], profile["send_sci"],
+            REKEY_PERIOD, tbinfo, profile["fallback_cak"], profile["fallback_ckn"])
+        _wait_healthy(env)
+        yield env
+    finally:
+        for host, port, name in bindings:
+            if name:
+                enable_macsec_port(host, port, name)
+            else:
+                disable_macsec_port(host, port)
+        for host in [duthost] + [nbr["host"] for nbr in links.values()]:
+            delete_macsec_profile(host, profile["name"])
+        assert wait_until(300, 3, 0, lambda: all(
+            host.iface_macsec_ok(port) for host, port, name in bindings if name)), \
+            "MACsec did not recover on the original profiles"
 
 
-def test_fallback_operational_state_and_config(
-        fallback_macsec_environment):
-    """Verify dual-CA profile, active principal and protected traffic."""
-    environment = fallback_macsec_environment
-    profile = environment["profile"]
-
-    for port in environment["links"]:
-        state = _read_link_state(environment, port)
-        expected = {field: profile[field].lower()
-                    for field in ("primary_ckn", "fallback_ckn")}
-        assert _profile_ckns(environment["duthost"], port, profile["name"]) == expected, (
-            "DUT profile CKNs differ on {}".format(port))
-
-        errors = state.protected_errors(profile, profile["primary_ckn"])
-        assert not errors, "DUT {} is not protected: {}".format(port, errors)
-        adapter = peer_adapter(environment, port)
-        peer_errors = adapter.protected_errors(
-            environment["peer_profiles"][port], profile["primary_ckn"])
-        assert not peer_errors, "{} peer {} is not protected: {}".format(
-            adapter.host.hostname, adapter.peer_port, peer_errors)
+@pytest.fixture
+def unattached_profile(fallback_env):
+    """Yield the name of a DUT profile that no port uses; delete it afterwards."""
+    duthost = fallback_env["duthost"]
+    name = FALLBACK_PROFILE + "_UNATTACHED"
+    assert not _profile_exists(duthost, name), "Refusing to overwrite existing profile {}".format(name)
+    yield name
+    delete_macsec_profile(duthost, name)
 
 
-def test_ceos_primary_key_delete_fails_over_hitlessly(
-        fallback_macsec_environment, upstream_links):
-    """Fail over and recover after supported cEOS primary-key deletion."""
-    environment = fallback_macsec_environment
-    profile = environment["profile"]
-    primary_pair = (profile["primary_cak"], profile["primary_ckn"])
-    port = next(iter(environment["links"]))
-    adapter = peer_adapter(environment, port)
-    if not adapter.supports_primary_delete:
-        pytest.skip(adapter.primary_delete_unsupported_reason)
+# ---------------------------------------------------------------------------
+# Tests
+# ---------------------------------------------------------------------------
 
-    with _traffic_window(environment, upstream_links, port=port) as traffic:
-        _observe_periodic_sak_during_traffic(environment, port)
-        with ExitStack() as cleanup:
-            cleanup.callback(
-                _restore_deleted_primary,
-                environment, port, adapter, primary_pair)
-            before = _read_link_state(environment, port)
-            adapter.delete_primary_if_supported(primary_pair)
-            _wait_link_protected(
-                environment, port, profile["fallback_ckn"],
-                require_all_live=False)
-            _wait_peer_primary_removed(adapter, profile)
-            _wait_rotation_settled(
-                environment, port, before, profile["fallback_ckn"], require_all_live=False)
-        _stop_traffic(traffic, assert_loss=True)
+def test_fallback_operational_state_and_config(fallback_env):
+    """Both CKNs and the 30s rekey period are configured, and the primary CA secures each link."""
+    env, profile = fallback_env, fallback_env["profile"]
+    for port, nbr in env["links"].items():
+        fields = _profile_fields(env["duthost"], port, profile["name"])
+        assert fields["rekey_period"] == str(REKEY_PERIOD)
+        assert _configured_ckns(env["duthost"], port, profile["name"]) == _expected_ckns(profile)
+        if isinstance(nbr["host"], EosHost):
+            assert "mka session rekey-period {}".format(REKEY_PERIOD) in _eos_profile(nbr["host"], profile["name"])
+        else:
+            assert _profile_fields(nbr["host"], nbr["port"], profile["name"])["rekey_period"] == str(REKEY_PERIOD)
+        assert not _dut_errors(env, port, profile["primary_ckn"])
+        assert not _peer_errors(env, port, profile["primary_ckn"])
 
 
-def test_primary_rotation_is_hitless(
-        fallback_macsec_environment, upstream_links):
-    """Measure primary replacement without loss, then verify recovery."""
-    environment = fallback_macsec_environment
-    profile = environment["profile"]
-    new_pair = generate_macsec_key_pair(profile["cipher_suite"])
-    selected_port = next(iter(environment["links"]))
-
-    with _rotation_cleanup(environment, "primary", new_pair) as (attempted, completed):
-        with _traffic_window(environment, upstream_links, port=selected_port) as traffic:
-            _observe_periodic_sak_during_traffic(environment, selected_port)
-            before = _read_link_states(environment, environment["links"])
-            before = _apply_forward_cak(
-                environment, "primary", new_pair, selected_port, before, attempted)
-
-            def _after_dut_settled():
-                _confirm_transit_rotation(environment, before, require_rekey=True)
-                completed[0] = True
-                _observe_periodic_sak_during_traffic(
-                    environment, selected_port, expected_principal=profile["primary_ckn"])
-                _stop_traffic(traffic, assert_loss=True)
-
-            _wait_rotations_settled(
-                environment, before, profile["primary_ckn"],
-                check_peers=True, on_dut_settled=_after_dut_settled)
-
-
-def test_fallback_rotation_keeps_primary_and_traffic(
-        fallback_macsec_environment, upstream_links):
-    """Rotate the fallback participant while primary carries traffic."""
-    environment = fallback_macsec_environment
-    profile = environment["profile"]
-    new_pair = generate_macsec_key_pair(profile["cipher_suite"])
-    selected_port = next(iter(environment["links"]))
-
-    with _rotation_cleanup(environment, "fallback", new_pair) as (attempted, completed):
-        with _traffic_window(environment, upstream_links, port=selected_port) as traffic:
-            _observe_periodic_sak_during_traffic(environment, selected_port)
-            before = _read_link_states(environment, environment["links"])
-            before = _apply_forward_cak(
-                environment, "fallback", new_pair, selected_port, before, attempted)
-
-            def _after_dut_settled():
-                _confirm_transit_rotation(environment, before, require_rekey=None)
-                completed[0] = True
-                _observe_periodic_sak_during_traffic(
-                    environment, selected_port, expected_principal=profile["primary_ckn"])
-                _stop_traffic(traffic, assert_loss=True)
-
-            _wait_rotations_settled(
-                environment, before, profile["primary_ckn"],
-                require_rekey=None, check_peers=True,
-                on_dut_settled=_after_dut_settled)
+def _rotate_hitless(env, role):
+    """Replace one CAK on the DUT, then on both peers, inside a zero-loss transit window."""
+    duthost, profile = env["duthost"], env["profile"]
+    port = next(iter(env["links"]))
+    original = (profile[role + "_cak"], profile[role + "_ckn"])
+    replacement = _new_key(profile["cipher_suite"])
+    try:
+        with _transit_path(env, port) as endpoints, _transit_traffic(endpoints) as pings:
+            _observe_natural_rekey(env, port)
+            before = _read_links(env)
+            update_macsec_profile_key(duthost, profile["name"], *original, *replacement,
+                                      is_fallback=role == "fallback")
+            profile[role + "_cak"], profile[role + "_ckn"] = replacement
+            if role == "primary":
+                # Peers still have the old primary, so the DUT first moves to the fallback CA.
+                _wait_dut_settled(env, before, profile["fallback_ckn"], require_all_live=False)
+                before = _read_links(env)
+            for nbr in env["links"].values():
+                update_macsec_profile_key(nbr["host"], profile["name"], *original, *replacement,
+                                          is_fallback=role == "fallback")
+            _wait_dut_settled(env, before, profile["primary_ckn"], require_rekey=role == "primary")
+            # One budget shared by all peers.
+            _wait_for(30 + 15 * len(env["links"]), lambda: [
+                (p, _peer_errors(env, p, profile["primary_ckn"])) for p in env["links"]
+                if _peer_errors(env, p, profile["primary_ckn"])], "Peers did not converge")
+            for p in env["links"]:
+                assert not _dut_errors(env, p, profile["primary_ckn"]), "DUT {} regressed".format(p)
+            _observe_natural_rekey(env, port)
+            _assert_no_loss(pings)
+    finally:
+        _restore_key(_endpoints(env), profile["name"], role, original, replacement)
+        profile[role + "_cak"], profile[role + "_ckn"] = original
+        _wait_healthy(env)
 
 
-def test_primary_mismatch_fallback_takeover_and_recovery_is_hitless(
-        fallback_macsec_environment, upstream_links):
-    """Fail over to fallback after primary mismatch without traffic loss."""
-    environment = fallback_macsec_environment
-    profile = environment["profile"]
-    port = next(iter(environment["links"]))
-    invalid_pair = generate_macsec_key_pair(
-        profile["cipher_suite"])
-
-    with _traffic_window(environment, upstream_links, port=port) as traffic:
-        _observe_periodic_sak_during_traffic(environment, port)
-        with _primary_mismatch(environment, port, invalid_pair):
-            pass
-        _stop_traffic(traffic, assert_loss=True)
+@pytest.mark.parametrize("role", ["primary", "fallback"])
+def test_cak_rotation_is_hitless(fallback_env, role):
+    """Rotating the primary or fallback CAK keeps transit traffic lossless and ends on the primary CA."""
+    _rotate_hitless(fallback_env, role)
 
 
 @pytest.mark.stress_test
-def test_back_to_back_cak_rotation_stress(
-        fallback_macsec_environment, upstream_links):
-    """Measure each forward replacement, restoring between rotations."""
-    environment = fallback_macsec_environment
-    profile = environment["profile"]
-    if environment["base_profile_name"] != FALLBACK_PROFILE:
-        pytest.skip("Rotation stress runs only on the static fallback profile")
-
-    port = next(iter(environment["links"]))
+def test_back_to_back_cak_rotation_stress(fallback_env):
+    """Alternate primary and fallback rotations, each in its own zero-loss window."""
+    if fallback_env["base_profile_name"] != FALLBACK_PROFILE:
+        pytest.skip("Rotation stress runs only on {}".format(FALLBACK_PROFILE))
     for iteration in range(STRESS_ROTATIONS):
         role = "fallback" if iteration % 2 else "primary"
-        new_pair = generate_macsec_key_pair(profile["cipher_suite"])
-        phase = "forward"
+        logger.info("Stress rotation %d/%d: %s", iteration + 1, STRESS_ROTATIONS, role)
+        _rotate_hitless(fallback_env, role)
+
+
+def test_primary_mismatch_falls_back_hitlessly(fallback_env):
+    """A peer with a wrong primary CAK fails over to the fallback CA and back without traffic loss.
+
+    cEOS peers first delete the primary key alone; SONiC can only replace it.
+    """
+    env, profile = fallback_env, fallback_env["profile"]
+    port = next(iter(env["links"]))
+    host, name = env["links"][port]["host"], profile["name"]
+    primary = (profile["primary_cak"], profile["primary_ckn"])
+    invalid = _new_key(profile["cipher_suite"])
+    mismatched = dict(profile, primary_cak=invalid[0], primary_ckn=invalid[1])
+    fallback_ckn = profile["fallback_ckn"]
+    try:
+        with _transit_path(env, port) as endpoints, _transit_traffic(endpoints) as pings:
+            _observe_natural_rekey(env, port)
+            before = _read_links(env, [port])
+            if isinstance(host, EosHost):
+                _eos_key(host, name, primary, remove=True)
+                _wait_for(MKA_TIMEOUT, lambda: _dut_errors(env, port, fallback_ckn, require_all_live=False) + (
+                    [] if _configured_ckns(host, None, name) == {fallback_ckn.lower()} else ["peer primary remains"]),
+                    "DUT did not fail over after the peer primary was deleted")
+                _eos_key(host, name, invalid)
+            else:
+                update_macsec_profile_key(host, name, *primary, *invalid)
+            _wait_dut_settled(env, before, fallback_ckn, require_all_live=False)
+            _wait_for(MKA_TIMEOUT, lambda: _peer_errors(env, port, fallback_ckn, False, mismatched),
+                      "Peer did not fail over to the fallback CA")
+
+            before = _read_links(env, [port])
+            update_macsec_profile_key(host, name, *invalid, *primary)
+            _wait_dut_settled(env, before, profile["primary_ckn"], require_rekey=True)
+            _wait_for(MKA_TIMEOUT, lambda: _peer_errors(env, port, profile["primary_ckn"]),
+                      "Peer did not return to the primary CA")
+            _assert_no_loss(pings)
+    finally:
+        _restore_key([(host, env["links"][port]["port"])], name, "primary", primary, invalid)
+        _wait_healthy(env)
+
+
+@pytest.mark.parametrize("case", ["half_cak", "half_ckn", "duplicate_ckn", "invalid_fallback_cak"])
+def test_profile_add_rejects_invalid_fallback(fallback_env, unattached_profile, case):
+    """`config macsec profile add` rejects an incomplete or invalid fallback key and creates nothing."""
+    duthost, profile = fallback_env["duthost"], fallback_env["profile"]
+    port = next(iter(fallback_env["links"]))
+    primary_cak, primary_ckn = _new_key(profile["cipher_suite"])
+    fallback_cak, fallback_ckn = _new_key(profile["cipher_suite"])
+    fallback_options = {
+        "half_cak": "--fallback_cak {}".format(fallback_cak),
+        "half_ckn": "--fallback_ckn {}".format(fallback_ckn),
+        "duplicate_ckn": "--fallback_cak {} --fallback_ckn {}".format(fallback_cak, primary_ckn),
+        "invalid_fallback_cak": "--fallback_cak 00 --fallback_ckn {}".format(fallback_ckn),
+    }[case]
+    result = duthost.command(
+        "config macsec {} profile add {} --priority {} --cipher_suite {} --primary_cak {} --primary_ckn {} "
+        "--policy {} --send_sci {}".format(
+            getns_prefix(duthost, port), unattached_profile, profile["priority"], profile["cipher_suite"],
+            primary_cak, primary_ckn, profile["policy"], fallback_options),
+        module_ignore_errors=True)
+    assert result["failed"], "Invalid fallback ({}) was accepted".format(case)
+    assert _profile_fields(duthost, port, unattached_profile) is None
+
+
+def _add_unattached(env, name, fallback=True):
+    """Create *name* on the DUT and return its (primary, fallback) keys."""
+    profile = env["profile"]
+    primary, fallback_key = _new_key(profile["cipher_suite"]), _new_key(profile["cipher_suite"])
+    set_macsec_profile(env["duthost"], name, profile["priority"], profile["cipher_suite"], *primary,
+                       profile["policy"], profile["send_sci"], REKEY_PERIOD, *(fallback_key if fallback else ()))
+    return primary, fallback_key
+
+
+def test_unattached_profile_update_replaces_primary(fallback_env, unattached_profile):
+    """`config macsec profile update` replaces the primary key of a profile no port uses."""
+    duthost, port = fallback_env["duthost"], next(iter(fallback_env["links"]))
+    primary, fallback = _add_unattached(fallback_env, unattached_profile)
+    replacement = _new_key(fallback_env["profile"]["cipher_suite"])
+    update_macsec_profile_key(duthost, unattached_profile, *primary, *replacement)
+    assert _configured_ckns(duthost, port, unattached_profile) == {replacement[1].lower(), fallback[1].lower()}
+
+
+@pytest.mark.parametrize("case", ["unchanged", "unknown_old_ckn", "fallback_collision", "invalid_cak", "invalid_ckn"])
+def test_profile_update_rejects_invalid_key(fallback_env, unattached_profile, case):
+    """`config macsec profile update` rejects an invalid replacement and leaves the profile unchanged."""
+    duthost, port = fallback_env["duthost"], next(iter(fallback_env["links"]))
+    (primary_cak, primary_ckn), (fallback_cak, fallback_ckn) = _add_unattached(fallback_env, unattached_profile)
+    new_cak, new_ckn = _new_key(fallback_env["profile"]["cipher_suite"])
+    old_ckn, cak, ckn = {
+        "unchanged": (primary_ckn, primary_cak, primary_ckn),
+        "unknown_old_ckn": ("00" * (len(primary_ckn) // 2), new_cak, new_ckn),
+        "fallback_collision": (primary_ckn, fallback_cak, fallback_ckn),
+        "invalid_cak": (primary_ckn, "00", new_ckn),
+        "invalid_ckn": (primary_ckn, new_cak, "not-hex"),
+    }[case]
+    result = duthost.command("config macsec {} profile update {} --old_ckn {} --new_ckn {} --new_cak {}".format(
+        getns_prefix(duthost, port), unattached_profile, old_ckn, ckn, cak), module_ignore_errors=True)
+    assert result["failed"], "Invalid update ({}) was accepted".format(case)
+    assert _configured_ckns(duthost, port, unattached_profile) == {primary_ckn.lower(), fallback_ckn.lower()}
+
+
+def test_primary_only_profile_update_rejected(fallback_env, unattached_profile):
+    """`config macsec profile update` is rejected for a profile without a fallback key."""
+    duthost, port = fallback_env["duthost"], next(iter(fallback_env["links"]))
+    (primary_cak, primary_ckn), _ = _add_unattached(fallback_env, unattached_profile, fallback=False)
+    new_cak, new_ckn = _new_key(fallback_env["profile"]["cipher_suite"])
+    result = duthost.command("config macsec {} profile update {} --old_ckn {} --new_ckn {} --new_cak {}".format(
+        getns_prefix(duthost, port), unattached_profile, primary_ckn, new_ckn, new_cak), module_ignore_errors=True)
+    assert result["failed"], "Primary-only profile update was accepted"
+    assert _configured_ckns(duthost, port, unattached_profile) == {primary_ckn.lower()}
+
+
+def test_unsafe_port_defers_accepted_primary_update(fallback_env):
+    """A DUT primary update applies on the safe port and is deferred where the peer lacks the fallback CA."""
+    env, profile = fallback_env, fallback_env["profile"]
+    duthost, name = env["duthost"], profile["name"]
+    unsafe, safe = env["links"]
+    unsafe_peer, safe_peer = env["links"][unsafe]["host"], env["links"][safe]["host"]
+    primary = (profile["primary_cak"], profile["primary_ckn"])
+    fallback = (profile["fallback_cak"], profile["fallback_ckn"])
+    mismatched, replacement = _new_key(profile["cipher_suite"]), _new_key(profile["cipher_suite"])
+    desired = dict(profile, primary_cak=replacement[0], primary_ckn=replacement[1])
+    old_ckn, new_ckn = primary[1].lower(), replacement[1].lower()
+
+    def _deferred_errors():
+        state = get_mka_status(duthost, unsafe)
+        if state is None:
+            return ["MKA status is missing"]
+        errors = []
+        if not state["fresh"] or state["config"] != "degraded" or state["mode"] != "secured":
+            errors.append("expected fresh, degraded and secured; got {}".format(state))
+        if _principals(state) != [old_ckn] or state["participants"].get(old_ckn, {}).get("live", 0) < 1:
+            errors.append("old primary is not the live principal")
+        if new_ckn in state["participants"]:
+            errors.append("replacement primary was applied")
+        return errors
+
+    try:
+        # 1. Remove the unsafe peer's usable fallback.
+        update_macsec_profile_key(unsafe_peer, name, *fallback, *mismatched, is_fallback=True)
+        _wait_for(MKA_CONVERGE_TIMEOUT, lambda: _dut_errors(env, unsafe, old_ckn, require_all_live=False) + (
+            [] if get_mka_status(duthost, unsafe)["participants"][fallback[1].lower()]["live"] == 0
+            else ["fallback is still live"]) + _dut_errors(env, safe, old_ckn) + _peer_errors(env, safe, old_ckn),
+            "Unsafe port has a live fallback, or safe port is not secured with both CAs")
+
+        # 2. The DUT accepts the primary update.
+        update_macsec_profile_key(duthost, name, *primary, *replacement)
+        assert _configured_ckns(duthost, unsafe, name) == _expected_ckns(desired)
+
+        # 3. Unsafe port keeps the old primary; the safe port moves to the fallback CA.
+        _wait_for(MKA_TIMEOUT, _deferred_errors, "Unsafe port did not defer the update")
+        _wait_for(MKA_CONVERGE_TIMEOUT, lambda: _dut_errors(env, safe, fallback[1], False, desired),
+                  "Safe port did not apply the desired profile")
+        assert not _deferred_errors(), "Safe port progress changed the unsafe port"
+
+        # 4. Safe peer gets the new primary.
+        update_macsec_profile_key(safe_peer, name, *primary, *replacement)
+        _wait_for(MKA_CONVERGE_TIMEOUT, lambda: _dut_errors(env, safe, new_ckn, profile=desired)
+                  + _peer_errors(env, safe, new_ckn, profile=desired), "Safe port did not use the new primary")
+
+        # 5. Unsafe peer gets its fallback back and the new primary; the deferred port reconciles.
+        update_macsec_profile_key(unsafe_peer, name, *mismatched, *fallback, is_fallback=True)
+        update_macsec_profile_key(unsafe_peer, name, *primary, *replacement)
+        _wait_for(MKA_CONVERGE_TIMEOUT, lambda: _dut_errors(env, unsafe, new_ckn, profile=desired)
+                  + _peer_errors(env, unsafe, new_ckn, profile=desired), "Unsafe port did not reconcile")
+    finally:
+        _restore_key([(unsafe_peer, env["links"][unsafe]["port"])], name, "fallback", fallback, mismatched)
+        _restore_key(_endpoints(env), name, "primary", primary, replacement)
+        _wait_healthy(env)
+
+
+def test_both_invalid_blocks_traffic_and_recovers(fallback_env):
+    """With both peer CAKs wrong, the link is blocked in both directions; matching keys restore traffic."""
+    env, profile = fallback_env, fallback_env["profile"]
+    port = next(iter(env["links"]))
+    host, peer_port, name = env["links"][port]["host"], env["links"][port]["port"], profile["name"]
+    primary = (profile["primary_cak"], profile["primary_ckn"])
+    fallback = (profile["fallback_cak"], profile["fallback_ckn"])
+    invalid_primary, invalid_fallback = _new_key(profile["cipher_suite"]), _new_key(profile["cipher_suite"])
+    is_eos = isinstance(host, EosHost)
+    if not is_eos:
+        assert not _profile_exists(host, BOTH_INVALID_PROFILE), \
+            "Refusing to overwrite existing profile {}".format(BOTH_INVALID_PROFILE)
+
+    with _stable_transit_path(env, port) as endpoints:
+        assert all(_probe(endpoint) for endpoint in endpoints), "Transit is not healthy before the change"
         try:
-            with _rotation_cleanup(environment, role, new_pair) as (attempted, completed):
-                with _traffic_window(environment, upstream_links, port=port) as traffic:
-                    _observe_periodic_sak_during_traffic(environment, port)
-                    before = _read_link_states(environment, environment["links"])
-                    before = _apply_forward_cak(
-                        environment, role, new_pair, port, before, attempted)
-
-                    def _after_dut_settled():
-                        _confirm_transit_rotation(
-                            environment, before, require_rekey=True if role == "primary" else None)
-                        completed[0] = True
-                        _observe_periodic_sak_during_traffic(
-                            environment, port, expected_principal=profile["primary_ckn"])
-                        _stop_traffic(traffic, assert_loss=True)
-
-                    _wait_rotations_settled(
-                        environment, before, profile["primary_ckn"],
-                        require_rekey=True if role == "primary" else None,
-                        check_peers=True, on_dut_settled=_after_dut_settled)
-                phase = "restoration"
-        except (AssertionError, RuntimeError, ValueError) as error:
-            raise type(error)(
-                "Stress iteration {} {} {}: {}".format(
-                    iteration + 1, role, phase, error)) from error
-
-
-def test_profile_update_validation_and_unattached_update(
-        fallback_macsec_environment):
-    """Verify paired fallback validation and unattached-profile rotation."""
-    environment = fallback_macsec_environment
-    duthost = environment["duthost"]
-    profile = environment["profile"]
-    port = next(iter(environment["links"]))
-    namespace = get_namespace_option(duthost, port)
-    temp_name = "{}_UNATTACHED".format(FALLBACK_PROFILE)
-    primary_cak, primary_ckn = generate_macsec_key_pair(
-        profile["cipher_suite"])
-    fallback_cak, fallback_ckn = generate_macsec_key_pair(
-        profile["cipher_suite"])
-    base_options = (
-        "--priority {priority} --cipher_suite {cipher_suite} "
-        "--primary_cak {primary_cak} --primary_ckn {primary_ckn} "
-        "--policy {policy} --send_sci "
-    ).format(
-        priority=profile["priority"],
-        cipher_suite=profile["cipher_suite"],
-        primary_cak=primary_cak,
-        primary_ckn=primary_ckn,
-        policy=profile["policy"],
-    )
-
-    assert get_macsec_profile_ckns(duthost, temp_name, namespace) is None, (
-        "Refusing to overwrite an unattached profile that already exists")
-    with ExitStack() as cleanup:
-        cleanup.callback(delete_macsec_profile, duthost, temp_name, namespace_option=namespace)
-        invalid_ckn_options = base_options.replace(
-            "--primary_ckn {}".format(primary_ckn),
-            "--primary_ckn not-hex",
-        )
-        invalid_ckn = duthost.command(
-            "config macsec {} profile add {} {}".format(
-                namespace, temp_name, invalid_ckn_options),
-            module_ignore_errors=True,
-        )
-        assert invalid_ckn["failed"]
-        assert not _profile_ckns(
-            duthost, port, temp_name)
-
-        for field, value in (("fallback_cak", fallback_cak), ("fallback_ckn", fallback_ckn)):
-            half_fallback = duthost.command(
-                "config macsec {} profile add {} {} --{} {}".format(
-                    namespace, temp_name, base_options, field, value),
-                module_ignore_errors=True)
-            assert half_fallback["failed"]
-            assert not _profile_ckns(duthost, port, temp_name)
-
-        duplicate_ckn = duthost.command(
-            "config macsec {} profile add {} {} "
-            "--fallback_cak {} --fallback_ckn {}".format(
-                namespace, temp_name, base_options,
-                fallback_cak, primary_ckn),
-            module_ignore_errors=True,
-        )
-        assert duplicate_ckn["failed"]
-        assert not _profile_ckns(
-            duthost, port, temp_name)
-
-        invalid_fallback_cak = duthost.command(
-            "config macsec {} profile add {} {} "
-            "--fallback_cak 00 --fallback_ckn {}".format(
-                namespace, temp_name, base_options, fallback_ckn),
-            module_ignore_errors=True,
-        )
-        assert invalid_fallback_cak["failed"]
-        assert not _profile_ckns(
-            duthost, port, temp_name)
-
-        valid_profile = dict(profile)
-        valid_profile.update({
-            "name": temp_name,
-            "primary_cak": primary_cak,
-            "primary_ckn": primary_ckn,
-            "fallback_cak": fallback_cak,
-            "fallback_ckn": fallback_ckn,
-        })
-        _set_profile(duthost, temp_name, valid_profile, namespace_option=namespace)
-        original = _profile_ckns(duthost, port, temp_name)
-        new_cak, new_ckn = generate_macsec_key_pair(
-            profile["cipher_suite"])
-        update_macsec_profile_key(
-            duthost, temp_name, primary_cak, primary_ckn, new_cak, new_ckn,
-            namespace_option=namespace)
-        config = _profile_ckns(duthost, port, temp_name)
-        expected = dict(original, primary_ckn=new_ckn.lower())
-        _assert_profile_unchanged(expected, config, "Unattached profile replacement")
-
-        before = dict(config)
-        update_macsec_profile_key(
-            duthost, temp_name, new_cak, new_ckn, new_cak, new_ckn,
-            namespace_option=namespace, expect_success=False)
-        update_macsec_profile_key(
-            duthost, temp_name, "", "00" * (len(new_ckn) // 2),
-            new_cak, primary_ckn,
-            namespace_option=namespace, expect_success=False)
-        update_macsec_profile_key(
-            duthost, temp_name, new_cak, new_ckn,
-            fallback_cak, fallback_ckn,
-            namespace_option=namespace, expect_success=False)
-        for invalid_cak, invalid_ckn in (("00", primary_ckn), (new_cak, "not-hex")):
-            update_macsec_profile_key(
-                duthost, temp_name, new_cak, new_ckn, invalid_cak, invalid_ckn,
-                namespace_option=namespace, expect_success=False)
-        _assert_profile_unchanged(
-            before,
-            _profile_ckns(duthost, port, temp_name),
-            "Rejected unattached-profile update",
-        )
-
-        delete_macsec_profile(duthost, temp_name, namespace_option=namespace)
-        primary_only = dict(valid_profile)
-        primary_only.pop("fallback_cak")
-        primary_only.pop("fallback_ckn")
-        _set_profile(duthost, temp_name, primary_only, namespace_option=namespace)
-        before = _profile_ckns(duthost, port, temp_name)
-        update_macsec_profile_key(
-            duthost, temp_name, primary_cak, primary_ckn, new_cak, new_ckn,
-            namespace_option=namespace, expect_success=False)
-        _assert_profile_unchanged(
-            before,
-            _profile_ckns(duthost, port, temp_name),
-            "Rejected primary-only profile update",
-        )
-
-
-def test_multi_port_desired_update_defers_only_unsafe_port(
-        fallback_macsec_environment):
-    """Accept desired state, isolate unsafe applied state, then reconcile."""
-    environment = fallback_macsec_environment
-    duthost = environment["duthost"]
-    profile = environment["profile"]
-    unsafe_port, safe_port = environment["links"]
-
-    old_pair = (profile["fallback_cak"], profile["fallback_ckn"])
-    mismatched_pair = generate_macsec_key_pair(
-        profile["cipher_suite"])
-    replacement_pair = generate_macsec_key_pair(profile["cipher_suite"])
-    replacement_cak, replacement_ckn = replacement_pair
-    namespace = get_namespace_option(duthost, unsafe_port)
-    adapter = peer_adapter(environment, unsafe_port)
-    safe_adapter = peer_adapter(environment, safe_port)
-    original_unsafe_peer = dict(environment["peer_profiles"][unsafe_port])
-    original_safe_peer = dict(environment["peer_profiles"][safe_port])
-    desired = dict(profile, primary_cak=replacement_cak, primary_ckn=replacement_ckn)
-    original_primary = (profile["primary_cak"], profile["primary_ckn"])
-
-    with ExitStack() as cleanup:
-        cleanup.callback(_wait_environment, environment, profile["primary_ckn"])
-        cleanup.callback(
-            _restore_peer_step, environment, unsafe_port, "fallback",
-            original_unsafe_peer, mismatched_pair)
-        adapter.rotate("fallback", old_pair, mismatched_pair)
-
-        def _precondition_errors():
-            unsafe = get_mka_status(duthost, unsafe_port)
-            safe = get_mka_status(duthost, safe_port)
-            unsafe_peer = adapter.normalized_state()
-            safe_peer = safe_adapter.normalized_state()
-            alternate = old_pair[1].lower()
-            errors = []
-            if (unsafe is None or unsafe["mode"] != "secured"
-                    or unsafe["participants"].get(alternate, {}).get("live") != 0
-                    or unsafe["participants"].get(original_primary[1].lower(), {}).get("live", 0) < 1):
-                errors.append("unsafe MKA alternate/primary precondition absent")
-            if (alternate in unsafe_peer["configured_ckns"]
-                    or alternate in unsafe_peer["participants"]):
-                errors.append("unsafe peer still has fallback configured")
-            if (safe is None or safe["participants"].get(alternate, {}).get("live", 0) < 1
-                    or alternate not in safe_peer["configured_ckns"]
-                    or alternate not in safe_peer["participants"]):
-                errors.append("safe peer fallback is not live")
-            return errors
-
-        ready, errors, attempts = _wait_for_validated_state(
-            _protocol_timeout(environment, unsafe_port, 4) + MKA_STATE_PUBLISH_TIMEOUT,
-            1,
-            _precondition_errors,
-        )
-        assert ready, (
-            "Multi-port preconditions failed after {} evaluations: "
-            "attempt_errors={}, final_errors={}, unsafe={}, safe={}"
-        ).format(
-            len(attempts),
-            attempts,
-            errors,
-            _diagnostics(environment, unsafe_port),
-            _diagnostics(environment, safe_port),
-        )
-
-        before = _read_link_state(environment, unsafe_port)
-        assert not before.protected_errors(
-            profile, profile["primary_ckn"], require_all_live=False)
-        assert before.participants[profile["primary_ckn"].lower()]["live"] > 0, \
-            "Unsafe port must retain a live primary peer, not qualify as peerless"
-        assert not _read_link_state(environment, safe_port).protected_errors(
-            profile, profile["primary_ckn"])
-        cleanup.callback(
-            restore_macsec_profile_key, duthost, profile["name"],
-            original_primary[0], original_primary[1],
-            replacement_cak, replacement_ckn,
-            namespace_options=[namespace])
-        update_macsec_profile_key(
-            duthost, profile["name"], original_primary[0], original_primary[1],
-            replacement_cak, replacement_ckn, namespace_option=namespace)
-        _assert_profile_unchanged(
-            dict(primary_ckn=replacement_ckn.lower(),
-                 fallback_ckn=profile["fallback_ckn"].lower()),
-            _profile_ckns(duthost, unsafe_port, profile["name"]),
-            "Accepted desired profile update",
-        )
-
-        def _deferred():
-            current = get_mka_status(duthost, unsafe_port)
-            return (current is not None
-                    and current["query"] == "ok"
-                    and current["fresh"]
-                    and current["config"] == "degraded"
-                    and current["mode"] == "secured"
-                    and sorted(ckn for ckn, participant in current["participants"].items()
-                               if participant["principal"]) == [original_primary[1].lower()]
-                    and current["participants"].get(
-                        original_primary[1].lower(), {}).get("live", 0) > 0
-                    and replacement_ckn.lower() not in current["participants"])
-
-        assert wait_until(
-            MKA_STATE_PUBLISH_TIMEOUT, 2, 0, _deferred), \
-            "Unsafe peer-present port lost applied primary or degraded state"
-        assert wait_until(
-            _protocol_timeout(environment, safe_port, 4) + MKA_STATE_PUBLISH_TIMEOUT,
-            2, 0,
-            lambda: not _read_link_state(environment, safe_port).protected_errors(
-                desired, profile["fallback_ckn"], require_all_live=False)), \
-            "Safe sibling did not independently apply the desired primary"
-        assert _deferred(), "Safe sibling progress changed the unsafe applied participant"
-
-        cleanup.callback(
-            _restore_peer_step, environment, safe_port, "primary",
-            original_safe_peer, replacement_pair)
-        safe_adapter.rotate("primary", original_primary, replacement_pair)
-        assert wait_until(
-            MKA_CONVERGE_TIMEOUT, 2, 0,
-            lambda: (
-                not _read_link_state(environment, safe_port).protected_errors(
-                    desired, replacement_ckn)
-                and not safe_adapter.protected_errors(
-                    environment["peer_profiles"][safe_port], replacement_ckn)
-            )), "Safe sibling did not establish the accepted primary"
-
-        _restore_peer_step(
-            environment, unsafe_port, "fallback",
-            original_unsafe_peer, mismatched_pair)
-        cleanup.callback(
-            _restore_peer_step, environment, unsafe_port, "primary",
-            original_unsafe_peer, replacement_pair)
-        adapter.rotate("primary", original_primary, replacement_pair)
-        final_errors = {}
-
-        def _reconciled():
-            final_errors["dut"] = _read_link_state(
-                environment, unsafe_port).protected_errors(desired, replacement_ckn)
-            final_errors["peer"] = adapter.protected_errors(
-                environment["peer_profiles"][unsafe_port], replacement_ckn)
-            return not any(final_errors.values())
-
-        assert wait_until(MKA_CONVERGE_TIMEOUT, 2, 0, _reconciled), (
-            "Pending unsafe port {} / peer {} did not apply accepted desired state: {}"
-        ).format(unsafe_port, adapter.peer_port, final_errors)
-        _assert_profile_unchanged(
-            dict(primary_ckn=replacement_ckn.lower(),
-                 fallback_ckn=profile["fallback_ckn"].lower()),
-            _profile_ckns(duthost, unsafe_port, profile["name"]),
-            "Desired profile during pending recovery",
-        )
-
-
-def test_disable_closes_public_macsec_session(fallback_macsec_environment):
-    """Disable a protected port and restore MACsec health afterward."""
-    environment = fallback_macsec_environment
-    duthost = environment["duthost"]
-    profile = environment["profile"]
-    selected_port = next(iter(environment["links"]))
-
-    with ExitStack() as cleanup:
-        cleanup.callback(_wait_environment, environment, profile["primary_ckn"])
-        cleanup.callback(enable_macsec_port, duthost, selected_port, profile["name"])
-        disable_macsec_port(duthost, selected_port)
-
-        def _closed():
-            status = get_mka_status(duthost, selected_port)
-            return status is None or (
-                status["query"] == "ok" and status["fresh"]
-                and status["mode"] != "secured")
-
-        assert wait_until(
-            MKA_TIMEOUT, 2, 0, _closed,
-        ), "MACsec status remained secured after explicit port disable"
-
-
-def test_both_invalid_tears_down_and_matching_profile_recovers(
-        fallback_macsec_environment, upstream_links):
-    """Lose both shared CAKs through supported peer configuration."""
-    environment = fallback_macsec_environment
-    profile = environment["profile"]
-    port = next(iter(environment["links"]))
-    adapter = peer_adapter(environment, port)
-    invalid_primary_cak, invalid_primary_ckn = generate_macsec_key_pair(
-        profile["cipher_suite"])
-    invalid_fallback_cak, invalid_fallback_ckn = generate_macsec_key_pair(
-        profile["cipher_suite"])
-    original_profile_name = environment["neighbor_profiles"][port]
-    original_peer_profile = dict(environment["peer_profiles"][port])
-    invalid_primary = (invalid_primary_cak, invalid_primary_ckn)
-    invalid_fallback = (invalid_fallback_cak, invalid_fallback_ckn)
-
-    with _transit_path(
-            environment, upstream_links, port, stable_endpoints=True) as endpoints:
-        healthy_results = tuple(_probe_transit(endpoint) for endpoint in endpoints)
-        assert all(healthy_results), (
-            "Neighbor-to-neighbor transit path was not healthy before invalidating both CAKs: "
-            "selected_to_other={}, other_to_selected={}".format(*healthy_results))
-
-        if adapter.provider == "ceos":
-            with _primary_mismatch(environment, port, invalid_primary):
-                with _ceos_fallback_mismatch(
-                        environment, port, adapter, invalid_fallback):
-                    traffic_results = tuple(
-                        _probe_transit(endpoint) for endpoint in endpoints)
-                    assert not any(traffic_results), (
-                        "Traffic still forwarded with both CAKs mismatched: "
-                        "selected_to_other={}, other_to_selected={}"
-                    ).format(*traffic_results)
-        else:
-            temp_profile_name = "MKA_BOTH_INVALID_{}".format(
-                adapter.peer_port)
-            assert _profile_ckns(adapter.host, adapter.peer_port, temp_profile_name) is None, (
-                "Refusing to replace an existing both-invalid peer profile")
-            both_invalid_profile = dict(original_peer_profile)
-            both_invalid_profile.update({
-                "name": temp_profile_name,
-                "primary_cak": invalid_primary_cak,
-                "primary_ckn": invalid_primary_ckn,
-                "fallback_cak": invalid_fallback_cak,
-                "fallback_ckn": invalid_fallback_ckn,
-            })
-
-            def _delete_temporary_profile():
-                def _bound():
-                    attachment = get_mka_status(adapter.host, adapter.peer_port)
-                    return (
-                        attachment is not None
-                        and attachment["query"] == "ok"
-                        and attachment["fresh"]
-                        and attachment["profile"] == original_profile_name
-                    )
-
-                assert wait_until(60, 2, 0, _bound), (
-                    "Peer binding was not restored; retaining temporary MACsec profile")
-                delete_macsec_profile(
-                    adapter.host, temp_profile_name,
-                    namespace_option=adapter.namespace_option)
-                assert not _profile_ckns(
-                    adapter.host, adapter.peer_port, temp_profile_name), (
-                        "Temporary MACsec profile was not removed")
-
-            with ExitStack() as cleanup:
-                cleanup.callback(_delete_temporary_profile)
-                adapter.create_profile(temp_profile_name, both_invalid_profile)
-                cleanup.callback(
-                    adapter.rebind, original_profile_name, original_peer_profile)
-                adapter.rebind(temp_profile_name, both_invalid_profile)
-
-                _wait_link_blocked(
-                    environment, port,
-                    (profile["primary_ckn"], profile["fallback_ckn"]))
-                _wait_peer_blocked(
-                    adapter, (invalid_primary_ckn, invalid_fallback_ckn))
-                traffic_results = tuple(
-                    _probe_transit(endpoint) for endpoint in endpoints)
-                assert not any(traffic_results), (
-                    "Traffic still forwarded with both CAKs mismatched: "
-                    "selected_to_other={}, other_to_selected={}"
-                ).format(*traffic_results)
-
-        _wait_link_protected(
-            environment, port, profile["primary_ckn"])
-        _wait_peer_protected(
-            adapter, original_peer_profile,
-            original_peer_profile["primary_ckn"], phase="restoration")
-        recovery_results = tuple(_probe_transit(endpoint) for endpoint in endpoints)
-        assert all(recovery_results), (
-            "Neighbor-to-neighbor transit traffic did not recover "
-            "after restoring a matching profile: "
-            "selected_to_other={}, other_to_selected={}".format(*recovery_results))
+            if is_eos:
+                update_macsec_profile_key(host, name, *primary, *invalid_primary)
+                update_macsec_profile_key(host, name, *fallback, *invalid_fallback, is_fallback=True)
+            else:
+                # SONiC defers the second unsafe in-place update, so bind a profile with both keys wrong.
+                set_macsec_profile(host, BOTH_INVALID_PROFILE, profile["priority"], profile["cipher_suite"],
+                                   *invalid_primary, profile["policy"], profile["send_sci"], REKEY_PERIOD,
+                                   *invalid_fallback)
+                enable_macsec_port(host, peer_port, BOTH_INVALID_PROFILE)
+            _wait_for(MKA_TIMEOUT, lambda: _blocked_errors(_read_link(env["duthost"], port), primary[1:] + fallback[1:])
+                      + _peer_blocked_errors(env, port, (invalid_primary[1], invalid_fallback[1])),
+                      "Link with both CAKs mismatched is not blocked")
+            results = [_probe(endpoint) for endpoint in endpoints]
+            assert not any(results), "Traffic was forwarded with both CAKs mismatched: {}".format(results)
+        finally:
+            if is_eos:
+                _restore_key([(host, peer_port)], name, "primary", primary, invalid_primary)
+                _restore_key([(host, peer_port)], name, "fallback", fallback, invalid_fallback)
+            else:
+                enable_macsec_port(host, peer_port, name)
+                delete_macsec_profile(host, BOTH_INVALID_PROFILE)
+            _wait_healthy(env)
+        results = [_probe(endpoint) for endpoint in endpoints]
+        assert all(results), "Transit traffic did not recover: {}".format(results)

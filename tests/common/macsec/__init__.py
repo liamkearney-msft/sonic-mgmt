@@ -30,10 +30,8 @@ from tests.common.utilities import wait_until
 
 logger = logging.getLogger(__name__)
 
-FALLBACK_ONLY_PROFILES = {
-    "MACSEC_PROFILE_FALLBACK",
-    "MACSEC_PROFILE_FALLBACK_INTEGRITY",
-}
+# Fallback profiles are only meaningful for tests/macsec/test_fallback_cak.py.
+FALLBACK_ONLY_PROFILES = {"MACSEC_PROFILE_FALLBACK", "MACSEC_PROFILE_FALLBACK_INTEGRITY"}
 
 
 class MacsecPlugin(object):
@@ -53,9 +51,7 @@ class MacsecPlugin(object):
     def _generate_macsec_profile(self, metafunc):
         value = metafunc.config.getoption("macsec_profile")
         if value == 'all':
-            return natsort.natsorted(
-                name for name in self.macsec_profiles
-                if name not in FALLBACK_ONLY_PROFILES)
+            return natsort.natsorted(name for name in self.macsec_profiles if name not in FALLBACK_ONLY_PROFILES)
         return [x for x in value.split(',') if x in self.macsec_profiles]
 
     def pytest_generate_tests(self, metafunc):
@@ -81,15 +77,18 @@ class MacsecPlugin(object):
         """Per-port profile mapping
 
         Returns ``None`` in single-profile mode.
-        When ``--per_interface_macsec`` is set, generate a unique primary
-        CAK/CKN profile for each controlled port.
+        When ``--per_interface_macsec`` is set, generates a unique
+        ``MACSEC_PROFILE_<port>`` for every controlled port using the same
+        cipher_suite, policy, send_sci, priority, and rekey_period as the base
+        ``--macsec_profile``, but with unique CAK/CKN per port.
         """
         if not request.config.getoption("per_interface_macsec", default=False):
             return None
         if len(ctrl_links) < 2:
             pytest.skip("Per-interface profile tests require at least 2 controlled links")
-        return {
-            dut_port: generate_macsec_profile(
+        profiles = {}
+        for dut_port in ctrl_links:
+            profiles[dut_port] = generate_macsec_profile(
                 port_name=dut_port,
                 cipher_suite=macsec_profile["cipher_suite"],
                 priority=macsec_profile["priority"],
@@ -97,33 +96,25 @@ class MacsecPlugin(object):
                 send_sci=macsec_profile["send_sci"],
                 rekey_period=macsec_profile["rekey_period"],
             )
-            for dut_port in ctrl_links
-        }
+        return profiles
 
     @pytest.fixture(scope="module")
     def start_macsec_service(self, macsec_duthost, macsec_nbrhosts):
         def __start_macsec_service():
-            return enable_macsec_feature(macsec_duthost, macsec_nbrhosts)
+            enable_macsec_feature(macsec_duthost, macsec_nbrhosts)
         return __start_macsec_service
 
     @pytest.fixture(scope="module")
     def stop_macsec_service(self, macsec_duthost, macsec_nbrhosts):
-        def __stop_macsec_service(changed_hosts=None):
-            disable_macsec_feature(
-                macsec_duthost,
-                macsec_nbrhosts,
-                changed_hosts=changed_hosts,
-            )
+        def __stop_macsec_service():
+            disable_macsec_feature(macsec_duthost, macsec_nbrhosts)
         return __stop_macsec_service
 
     @pytest.fixture(scope="module")
     def macsec_feature(self, start_macsec_service, stop_macsec_service):
-        changed_hosts = start_macsec_service()
-        try:
-            yield
-        finally:
-            if changed_hosts:
-                stop_macsec_service(changed_hosts)
+        start_macsec_service()
+        yield
+        stop_macsec_service()
 
     @pytest.fixture(scope="module")
     def startup_macsec(self, request, macsec_duthost, ctrl_links, macsec_profile, port_profiles, tbinfo):
@@ -165,12 +156,7 @@ class MacsecPlugin(object):
                                            profile['send_sci'], profile['rekey_period'], tbinfo,
                                            profile.get('fallback_cak'), profile.get('fallback_ckn'))
             logger.info(
-                "Setup MACsec configuration profile=%s ports=%s "
-                "per_interface=%s",
-                profile["name"],
-                sorted(ctrl_links),
-                bool(port_profiles),
-            )
+                "Setup MACsec configuration with arguments:\n{}".format(locals()))
 
         return __startup_macsec
 
