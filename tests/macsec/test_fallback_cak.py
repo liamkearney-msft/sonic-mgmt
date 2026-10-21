@@ -3,9 +3,8 @@ import ipaddress
 import logging
 import re
 import shlex
-import sys
 import time
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Optional
 
@@ -23,13 +22,11 @@ from tests.common.macsec.macsec_config_helper import (
     restore_macsec_profile_key,
     update_macsec_profile_key,
 )
-from tests.common.macsec.failure_safe_cleanup import FailureSafeCleanup
 from tests.common.macsec.macsec_helper import (
     get_ipnetns_prefix,
 )
 from tests.common.macsec.macsec_platform_helper import find_portchannel_from_member, get_portchannel
 from tests.common.macsec.mka_state_helper import (
-    cleanup_all,
     get_namespace_option,
     get_mka_status,
     mka_hello_timeout_seconds,
@@ -767,32 +764,14 @@ def _wait_peer_primary_removed(
 
 
 def _restore_deleted_primary(environment, port, adapter, primary_pair):
-    errors = []
-    before = None
-    try:
-        before = _read_link_state(environment, port)
-    except BaseException as error:
-        errors.append(error)
-    restores = [
-        lambda: adapter.add_primary(primary_pair),
-        lambda: _wait_link_protected(
-            environment, port, environment["profile"]["primary_ckn"]),
-        lambda: _wait_peer_protected(
-            adapter, environment["peer_profiles"][port],
-            primary_pair[1], phase="restoration"),
-    ]
-    if before is not None:
-        restores.append(lambda: _wait_rotation_settled(environment, port, before, primary_pair[1]))
-    for restore in restores:
-        try:
-            restore()
-        except BaseException as error:
-            errors.append(error)
-    if errors:
-        for error in errors[1:]:
-            logger.error("Additional cEOS primary restore failure: %r",
-                         error)
-        raise errors[0]
+    before = _read_link_state(environment, port)
+    adapter.add_primary(primary_pair)
+    _wait_link_protected(
+        environment, port, environment["profile"]["primary_ckn"])
+    _wait_peer_protected(
+        adapter, environment["peer_profiles"][port],
+        primary_pair[1], phase="restoration")
+    _wait_rotation_settled(environment, port, before, primary_pair[1])
 
 
 def _restore_rotation(
@@ -803,13 +782,9 @@ def _restore_rotation(
         original_profile["{}_cak".format(role)],
         original_profile["{}_ckn".format(role)],
     )
-    before = {}
-    errors = []
-    try:
-        before = _read_link_states(environment, environment["links"])
-    except BaseException as error:
-        errors.append(error)
-
+    before = _read_link_states(environment, environment["links"])
+    profile["{}_cak".format(role)] = old_pair[0]
+    profile["{}_ckn".format(role)] = old_pair[1]
     try:
         restore_macsec_profile_key(
             environment["duthost"], profile["name"],
@@ -818,49 +793,27 @@ def _restore_rotation(
             namespace_options=[
                 get_namespace_option(
                     environment["duthost"], next(iter(environment["links"])))])
-    except BaseException as error:
-        errors.append(error)
-
-    profile["{}_cak".format(role)] = old_pair[0]
-    profile["{}_ckn".format(role)] = old_pair[1]
-    if role == "primary" and fully_rotated[0] and not errors:
-        try:
+        if role == "primary" and fully_rotated[0]:
             _wait_rotations_settled(
                 environment, before, profile["fallback_ckn"],
                 require_all_live=False, phase="restoration")
             before = _read_link_states(environment, environment["links"])
-        except BaseException as error:
-            errors.append(error)
-
-    for port in attempted_ports:
-        restored = peer_originals[port]
-        try:
+    finally:
+        for port in attempted_ports:
             _restore_peer_step(
-                environment, port, role, restored, new_pair)
-        except BaseException as error:
-            errors.append(error)
+                environment, port, role, peer_originals[port], new_pair)
 
-    if not errors:
-        try:
-            if fully_rotated[0]:
-                _wait_rotations_settled(
-                    environment, before, original_profile["primary_ckn"],
-                    require_rekey=True if role == "primary" else (
-                        False if profile["rekey_period"] == 0 else None),
-                    check_peers=True, phase="restoration")
-            else:
-                assert wait_until(
-                    MKA_STATE_PUBLISH_TIMEOUT, 2, 0,
-                    _environment_is_healthy, environment,
-                ), "MKA did not recover after partial {} rotation".format(
-                    role)
-        except BaseException as error:
-            errors.append(error)
-    if errors:
-        for error in errors[1:]:
-            logger.error("Additional MACsec rotation cleanup failure: %r",
-                         error)
-        raise errors[0]
+    if fully_rotated[0]:
+        _wait_rotations_settled(
+            environment, before, original_profile["primary_ckn"],
+            require_rekey=True if role == "primary" else (
+                False if profile["rekey_period"] == 0 else None),
+            check_peers=True, phase="restoration")
+    else:
+        assert wait_until(
+            MKA_STATE_PUBLISH_TIMEOUT, 2, 0,
+            _environment_is_healthy, environment,
+        ), "MKA did not recover after partial {} rotation".format(role)
 
 
 def _restore_peer_step(environment, port, role, old_profile, new_pair):
@@ -919,7 +872,7 @@ def _rotation_cleanup(environment, role, new_pair):
     peer_originals = {port: dict(value) for port, value in environment["peer_profiles"].items()}
     attempted = []
     completed = [False]
-    with FailureSafeCleanup("{} rotation".format(role)) as cleanup:
+    with ExitStack() as cleanup:
         cleanup.callback(
             _restore_rotation, environment, role, original_profile,
             peer_originals, new_pair, attempted, completed)
@@ -993,24 +946,12 @@ def _diagnostics(environment, port):
     }
 
 
-def _safe_diagnostics(environment, port):
-    try:
-        return _diagnostics(environment, port)
-    except Exception as error:
-        return {"collection_error": type(error).__name__}
-
-
 def _restore_mismatch(
         environment, port, adapter, original_profile, invalid_pair, role):
     profile = environment["profile"]
     principal = profile["{}_ckn".format(role)]
     require_all_live = role == "primary"
-    before = None
-    observation_error = None
-    try:
-        before = _read_link_state(environment, port)
-    except BaseException as error:
-        observation_error = error
+    before = _read_link_state(environment, port)
     try:
         adapter.restore_key(role, original_profile, invalid_pair)
         _wait_link_protected(
@@ -1019,15 +960,8 @@ def _restore_mismatch(
         _wait_peer_protected(
             adapter, original_profile, principal,
             require_all_live=require_all_live, phase="restoration")
-        if role == "primary" and before is not None:
+        if role == "primary":
             _wait_rotation_settled(environment, port, before, principal)
-        if observation_error is not None:
-            raise observation_error
-    except BaseException as error:
-        logger.error(
-            "%s mismatch cleanup failed: %r; diagnostics=%s",
-            role, error, _safe_diagnostics(environment, port))
-        raise
     finally:
         adapter.commit_profile(original_profile)
 
@@ -1045,7 +979,7 @@ def _primary_mismatch(environment, port, invalid_pair):
         original_profile, "primary", invalid_pair)
     before = _read_link_state(environment, port)
 
-    with FailureSafeCleanup("primary mismatch") as cleanup:
+    with ExitStack() as cleanup:
         cleanup.callback(
             _restore_mismatch, environment, port, adapter,
             original_profile, invalid_pair, "primary")
@@ -1092,7 +1026,7 @@ def _ceos_fallback_mismatch(
     mismatched_profile = adapter.profile_with_pair(
         original_profile, "fallback", invalid_pair)
 
-    with FailureSafeCleanup("fallback mismatch") as cleanup:
+    with ExitStack() as cleanup:
         cleanup.callback(
             _restore_mismatch, environment, port, adapter,
             original_profile, invalid_pair, "fallback")
@@ -1342,7 +1276,7 @@ def _stable_transit_path(environment, upstream_links, selected_port, other_port)
                 "ip -4 route show exact {}/32".format(endpoint[3])):
             pytest.skip("Cannot own existing neighbor /32 route")
 
-    with FailureSafeCleanup("stable transit route restoration") as cleanup:
+    with ExitStack() as cleanup:
         for route in routes:
             port, prefix, nexthop = route
             cleanup.callback(_remove_dut_route, route)
@@ -1454,7 +1388,7 @@ def _transit_path(environment, upstream_links, selected_port, stable_endpoints=F
         _route_result(host, port, "sudo ip -4 route del {}/32 via {} dev {}".format(
             destination, gateway, device))
 
-    with FailureSafeCleanup("transit route restoration") as cleanup:
+    with ExitStack() as cleanup:
         for endpoint in endpoints:
             if _check_route(endpoint):
                 continue
@@ -1773,11 +1707,10 @@ def _start_bidirectional_traffic(endpoints):
             else:
                 raise AssertionError(
                     "Continuous transit ping did not establish a startup baseline")
-    except BaseException:
-        try:
-            cleanup_all(traffic, _abort_partial_ping)
-        except BaseException:
-            logger.exception("Partial traffic startup cleanup failed")
+    except Exception:
+        with ExitStack() as cleanup:
+            for ping in reversed(traffic):
+                cleanup.callback(_abort_partial_ping, ping)
         raise
     return traffic
 
@@ -1797,57 +1730,27 @@ def _wait_for_validated_state(timeout, interval, validator):
     return ready, attempts[-1], attempts
 
 
-class _TrafficWindow(AbstractContextManager):
-    """Guaranteed bidirectional traffic collection with exact-loss verdict."""
+def _stop_traffic(traffic, assert_loss):
+    pings = traffic[:]
+    traffic.clear()
+    results = []
+    with ExitStack() as cleanup:
+        for ping in reversed(pings):
+            cleanup.callback(
+                lambda ping=ping: results.append(
+                    _stop_ping(ping, assert_loss=assert_loss)))
+    return results
 
-    def __init__(self, environment, upstream_links, port):
-        self.environment = environment
-        self.upstream_links = upstream_links
-        self.port = port
-        self.traffic = []
-        self.results = None
-        self.routes = None
 
-    def __enter__(self):
-        self.routes = _transit_path(
-            self.environment, self.upstream_links, self.port)
-        endpoints = self.routes.__enter__()
+@contextmanager
+def _traffic_window(environment, upstream_links, port):
+    with _transit_path(environment, upstream_links, port) as endpoints:
+        traffic = _start_bidirectional_traffic(endpoints)
         try:
-            self.traffic = _start_bidirectional_traffic(endpoints)
-        except BaseException:
-            self.routes.__exit__(*sys.exc_info())
-            self.routes = None
-            raise
-        return self
-
-    def close(self, assert_loss=True):
-        if self.results is None:
-            results = []
-            try:
-                cleanup_all(
-                    self.traffic,
-                    lambda ping: results.append(_stop_ping(ping, assert_loss=assert_loss)))
-            finally:
-                self.results = results
-                self.traffic = []
-                if self.routes is not None:
-                    routes, self.routes = self.routes, None
-                    routes.__exit__(*sys.exc_info())
-        return self.results
-
-    def assert_zero_loss(self):
-        return self.close(assert_loss=True)
-
-    def __exit__(self, exc_type, exc_value, traceback):
-        if self.results is not None:
-            return False
-        try:
-            self.close(assert_loss=exc_type is None)
-        except BaseException:
-            if exc_type is None:
-                raise
-            logger.exception("Traffic cleanup failed after scenario error")
-        return False
+            yield traffic
+        finally:
+            if traffic:
+                _stop_traffic(traffic, assert_loss=False)
 
 
 @contextmanager
@@ -2003,7 +1906,7 @@ def _owned_fallback_profiles(environment):
 
     logger.info("MACsec owned fixture rebinding %d selected DUT/peer interfaces",
                 len(endpoints))
-    with FailureSafeCleanup("owned fallback profile restoration") as cleanup:
+    with ExitStack() as cleanup:
         if all(name is not None for name in bindings.values()):
             cleanup.callback(_wait_environment, environment, original["primary_ckn"])
         cleanup.callback(_restore_environment)
@@ -2120,9 +2023,9 @@ def test_ceos_primary_key_delete_fails_over_hitlessly(
     if not adapter.supports_primary_delete:
         pytest.skip(adapter.primary_delete_unsupported_reason)
 
-    with _TrafficWindow(environment, upstream_links, port=port) as traffic:
+    with _traffic_window(environment, upstream_links, port=port) as traffic:
         _observe_periodic_sak_during_traffic(environment, port)
-        with FailureSafeCleanup("cEOS primary deletion") as cleanup:
+        with ExitStack() as cleanup:
             cleanup.callback(
                 _restore_deleted_primary,
                 environment, port, adapter, primary_pair)
@@ -2134,7 +2037,7 @@ def test_ceos_primary_key_delete_fails_over_hitlessly(
             _wait_peer_primary_removed(adapter, profile)
             _wait_rotation_settled(
                 environment, port, before, profile["fallback_ckn"], require_all_live=False)
-        traffic.assert_zero_loss()
+        _stop_traffic(traffic, assert_loss=True)
 
 
 def test_primary_rotation_is_hitless(
@@ -2146,7 +2049,7 @@ def test_primary_rotation_is_hitless(
     selected_port = next(iter(environment["links"]))
 
     with _rotation_cleanup(environment, "primary", new_pair) as (attempted, completed):
-        with _TrafficWindow(environment, upstream_links, port=selected_port) as traffic:
+        with _traffic_window(environment, upstream_links, port=selected_port) as traffic:
             _observe_periodic_sak_during_traffic(environment, selected_port)
             before = _read_link_states(environment, environment["links"])
             before = _apply_forward_cak(
@@ -2157,7 +2060,7 @@ def test_primary_rotation_is_hitless(
                 completed[0] = True
                 _observe_periodic_sak_during_traffic(
                     environment, selected_port, expected_principal=profile["primary_ckn"])
-                traffic.assert_zero_loss()
+                _stop_traffic(traffic, assert_loss=True)
 
             _wait_rotations_settled(
                 environment, before, profile["primary_ckn"],
@@ -2173,7 +2076,7 @@ def test_fallback_rotation_keeps_primary_and_traffic(
     selected_port = next(iter(environment["links"]))
 
     with _rotation_cleanup(environment, "fallback", new_pair) as (attempted, completed):
-        with _TrafficWindow(environment, upstream_links, port=selected_port) as traffic:
+        with _traffic_window(environment, upstream_links, port=selected_port) as traffic:
             _observe_periodic_sak_during_traffic(environment, selected_port)
             before = _read_link_states(environment, environment["links"])
             before = _apply_forward_cak(
@@ -2184,7 +2087,7 @@ def test_fallback_rotation_keeps_primary_and_traffic(
                 completed[0] = True
                 _observe_periodic_sak_during_traffic(
                     environment, selected_port, expected_principal=profile["primary_ckn"])
-                traffic.assert_zero_loss()
+                _stop_traffic(traffic, assert_loss=True)
 
             _wait_rotations_settled(
                 environment, before, profile["primary_ckn"],
@@ -2201,11 +2104,11 @@ def test_primary_mismatch_fallback_takeover_and_recovery_is_hitless(
     invalid_pair = generate_macsec_key_pair(
         profile["cipher_suite"])
 
-    with _TrafficWindow(environment, upstream_links, port=port) as traffic:
+    with _traffic_window(environment, upstream_links, port=port) as traffic:
         _observe_periodic_sak_during_traffic(environment, port)
         with _primary_mismatch(environment, port, invalid_pair):
             pass
-        traffic.assert_zero_loss()
+        _stop_traffic(traffic, assert_loss=True)
 
 
 @pytest.mark.stress_test
@@ -2224,7 +2127,7 @@ def test_back_to_back_cak_rotation_stress(
         phase = "forward"
         try:
             with _rotation_cleanup(environment, role, new_pair) as (attempted, completed):
-                with _TrafficWindow(environment, upstream_links, port=port) as traffic:
+                with _traffic_window(environment, upstream_links, port=port) as traffic:
                     _observe_periodic_sak_during_traffic(environment, port)
                     before = _read_link_states(environment, environment["links"])
                     before = _apply_forward_cak(
@@ -2236,7 +2139,7 @@ def test_back_to_back_cak_rotation_stress(
                         completed[0] = True
                         _observe_periodic_sak_during_traffic(
                             environment, port, expected_principal=profile["primary_ckn"])
-                        traffic.assert_zero_loss()
+                        _stop_traffic(traffic, assert_loss=True)
 
                     _wait_rotations_settled(
                         environment, before, profile["primary_ckn"],
@@ -2276,7 +2179,7 @@ def test_profile_update_validation_and_unattached_update(
 
     assert get_macsec_profile_ckns(duthost, temp_name, namespace) is None, (
         "Refusing to overwrite an unattached profile that already exists")
-    with FailureSafeCleanup("unattached profile validation") as cleanup:
+    with ExitStack() as cleanup:
         cleanup.callback(delete_macsec_profile, duthost, temp_name, namespace_option=namespace)
         invalid_ckn_options = base_options.replace(
             "--primary_ckn {}".format(primary_ckn),
@@ -2398,7 +2301,7 @@ def test_multi_port_desired_update_defers_only_unsafe_port(
     desired = dict(profile, primary_cak=replacement_cak, primary_ckn=replacement_ckn)
     original_primary = (profile["primary_cak"], profile["primary_ckn"])
 
-    with FailureSafeCleanup("multi-port desired reconciliation") as cleanup:
+    with ExitStack() as cleanup:
         cleanup.callback(_wait_environment, environment, profile["primary_ckn"])
         cleanup.callback(
             _restore_peer_step, environment, unsafe_port, "fallback",
@@ -2534,7 +2437,7 @@ def test_disable_closes_public_macsec_session(fallback_macsec_environment):
     profile = environment["profile"]
     selected_port = next(iter(environment["links"]))
 
-    with FailureSafeCleanup("MACsec explicit disable") as cleanup:
+    with ExitStack() as cleanup:
         cleanup.callback(_wait_environment, environment, profile["primary_ckn"])
         cleanup.callback(enable_macsec_port, duthost, selected_port, profile["name"])
         disable_macsec_port(duthost, selected_port)
@@ -2616,7 +2519,7 @@ def test_both_invalid_tears_down_and_matching_profile_recovers(
                     adapter.host, adapter.peer_port, temp_profile_name), (
                         "Temporary MACsec profile was not removed")
 
-            with FailureSafeCleanup("both-invalid peer profile") as cleanup:
+            with ExitStack() as cleanup:
                 cleanup.callback(_delete_temporary_profile)
                 adapter.create_profile(temp_profile_name, both_invalid_profile)
                 cleanup.callback(

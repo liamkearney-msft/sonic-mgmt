@@ -1,8 +1,5 @@
 import math
 import re
-import logging
-
-logger = logging.getLogger(__name__)
 
 
 def _normalized_mapping(mapping):
@@ -287,18 +284,3 @@ def mka_hello_timeout_seconds(session, intervals, default_hello_ms=2000):
         raise ValueError(
             "Invalid mka_hello_time_ms {!r}".format(value))
     return max(1, int(math.ceil(intervals * hello_ms / 1000.0)))
-
-
-def cleanup_all(items, cleanup):
-    """Run cleanup for every item and re-raise the first failure afterward."""
-    first_error = None
-    for item in items:
-        try:
-            cleanup(item)
-        except BaseException as error:
-            if first_error is None:
-                first_error = error
-            else:
-                logger.error("Additional MACsec cleanup failure: %r", error)
-    if first_error is not None:
-        raise first_error

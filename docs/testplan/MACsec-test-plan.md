@@ -48,7 +48,7 @@
 | Check the Data plane                                                 | Completed |                                                   |
 | Refresh SAK - timer based                                            | Completed |                                                   |
 | Refresh SAK - packet number based                                    |  Ongoing  |                                                   |
-| MACsec Key rotation, Primary/Fallback CAK                            | Implemented; validation pending | Explicit 30-second fallback periodic rekey; the current two-link revision needs lab validation |
+| MACsec Key rotation, Primary/Fallback CAK                            | Implemented; validation pending | 30-second rekey; two routed links |
 | MACsec Counters                                                      |  Ongoing  |                                                   |
 | COPP                                                                 |  Ongoing  |                                                   |
 | Port channel with MACsec                                             | Completed |                                                   |
@@ -118,36 +118,19 @@ About the detail to set the testbed, please refer the doc: https://github.com/so
 ./run_tests.sh -u -n vms-kvm-t0 -d vlab-01 -c macsec/test_macsec.py -f vtestbed.csv -i veos_vtb -e "--neighbor_type=sonic"
 ```
 
-Fallback CAK/rollover tests require an explicitly selected dual-CA profile, for
-example `--macsec_profile MACSEC_PROFILE_FALLBACK` (or
-`MACSEC_PROFILE_FALLBACK_INTEGRITY`). These profiles are not included in the
-legacy `--macsec_profile all` sweep. Selecting a primary-only profile skips
-`macsec/test_fallback_cak.py` before MACsec setup; an incomplete fallback CAK/CKN
-pair is a configuration error, not a skip.
+To run `macsec/test_fallback_cak.py`:
 
-The targeted fallback module uses one shared test-owned DUT profile on two
-selected same-ASIC routed links to different neighbors. `--per_interface_macsec`
-is a separate, explicitly selected generation mode: it creates unique primary
-and fallback pairs for the normal per-interface/control-plane/deployment tests,
-and skips the shared-profile fallback module. Bounded rotation stress cases
-additionally require `--run-stress-tests`; all-link scale coverage is not part
-of this change.
-Both opt-in static fallback profiles explicitly configure a 30-second
-periodic rekey interval. The targeted module always creates one temporary
-30-second DUT profile shared by its two routed links and compatible, independently
-scoped peer profiles using the known fixture keys and the endpoints'
-key-server priorities. It checks profile readback on both sides, saves
-the actual original DUT/peer interface bindings, rebinds only those four
-endpoints, then attempts every original binding restoration before deleting
-only unattached test-owned profiles. It refuses pre-existing owned-profile
-names, leaves every other controlled port on its original profile, and never
-saves this configuration. Profile creation, rotation and restoration on
-multi-ASIC DUTs target only the selected pair's ASIC namespace. This is the
-same setup whether the original
-profile's period reads back as 0 or 30 seconds.
-Non-fallback profiles remain unchanged. The cold-reboot and bounded
-replacement stress cases run only with
-`MACSEC_PROFILE_FALLBACK`, not the integrity profile.
+- Select `--macsec_profile MACSEC_PROFILE_FALLBACK` or
+  `MACSEC_PROFILE_FALLBACK_INTEGRITY`. Both use a 30-second rekey period.
+  `--macsec_profile all` excludes them. A primary-only profile skips this module;
+  an incomplete fallback pair is an error.
+- Provide two routed MACsec links to distinct neighbors on the same ASIC.
+  The module binds one test-owned DUT profile across both links and one
+  test-owned profile per peer. Original bindings are restored on cleanup;
+  other links and profiles are unchanged.
+- `--per_interface_macsec` runs the separate per-interface suite and skips
+  this module. `--run-stress-tests` enables bounded rotation stress.
+  Stress uses `MACSEC_PROFILE_FALLBACK` only.
 
 ## Common Configuration
 
@@ -367,132 +350,55 @@ SAI_MACSEC_SA_ATTR_CONFIGURED_EGRESS_XPN            │
 
 #### MACsec Key rotation, Primary/Fallback CAK
 
-`macsec/test_fallback_cak.py` exercises supported SONiC config commands with
-SONiC or cEOS peers. Its requirements come from the
+`macsec/test_fallback_cak.py` covers the
 [fallback CAK HLD](https://github.com/sonic-net/SONiC/pull/2495) and
-[MKA state/rotation HLD](https://github.com/sonic-net/SONiC/pull/2545).
-The cases use configuration/show commands and protected traffic rather than
-private DB, process, or ASIC state.
+[MKA state/rotation HLD](https://github.com/sonic-net/SONiC/pull/2545)
+with SONiC or cEOS peers.
 
-| Scenario | Acceptance evidence |
-| --- | --- |
-| Primary and fallback healthy | `show macsec -n <asic> --profile` full CKNs, per-port `--mka` role/principal/secured state, and `show macsec -n <asic> <port>` active transmit and receive SAK agreement |
-| Primary mismatch/deletion and recovery | Primary-to-fallback-to-primary selection, continued neighbor-to-neighbor protected traffic and restored original configuration |
-| Periodic refresh and primary/fallback replacement | Observe a natural active SAK change with unchanged CAK/CKN while bidirectional traffic is measured, refresh the pre-mutation baseline, establish the new CKN/role/protected state, and require another natural SAK change under the accepted CKN before ending strict traffic and restoring original keys outside the window |
-| Unsafe alternate with safe sibling | Accepted profile update and desired CKN readback; degraded/secured old-primary state on unsafe port, safe sibling progress, and recovery after peer reconciliation |
-| Invalid profile update | Rejected malformed/duplicate CKN and CAK arguments and primary-only update; profile readback remains unchanged |
-| Both CAs invalid | Non-secured MACsec mode, failed traffic in both directions, then protected session and traffic recovery |
-| Explicit disable and bounded stress | Port disable visibly closes MACsec, re-enable restores health; repeated key replacements and restorations retain protected bidirectional traffic |
+- Healthy: check both configured CKNs, primary selection, secured port,
+  and matching transmit/receive SAKs.
+- Primary mismatch or deletion: check fallback takeover, protected traffic,
+  and primary recovery. Delete-only injection requires cEOS.
+- Primary and fallback replacement: check CKN selection, SAK change where
+  required, and uninterrupted protected traffic.
+- Unsafe/safe ports: check one accepted profile update, deferred unsafe
+  old-primary state, safe sibling progress, and reconciliation.
+- Invalid updates: reject malformed or duplicate keys/CKNs without changing
+  the profile.
+- Both CAKs invalid: block both traffic directions; restore keys and traffic.
+- Explicit disable: close the MACsec session; re-enable and restore health.
+- Bounded stress: repeat primary/fallback replacement and recovery with
+  `--run-stress-tests`.
 
-Exact-loss checks use continuous 10-Hz ICMP streams in both directions between
-two distinct controlled neighbors on the same ASIC; neither endpoint is a DUT
-address. A source-bound host route via each neighbor's DUT-facing gateway is
-installed only when needed and removed on cleanup. Both neighbor routes and
-the DUT's connected routes are checked against the selected protected ports
-(direct or single-member PortChannels), so a bypass or ECMP path is not accepted.
-Topologies without two such neighbors skip the targeted fallback module before
-it rebinds any port; the shared fixture pair also supports the unsafe/safe
-desired-state case.
-The both-invalid case uses each neighbor's existing data-VRF `/32` loopback,
-not its routed MACsec interface address (which can disappear while blocked).
-It owns temporary EOS static `/32` routes via each DUT gateway and runtime-only,
-namespace-local DUT FRR `/32` routes via the selected neighbor links. Existing
-exact routes are never replaced; no route is saved persistently. The
-test checks the namespace-local FRR running route, exact kernel route and
-selected next-hop/interface in both directions, together with live
-neighbor-to-neighbor traffic. It does not claim an independent ASIC_DB
-programming or VRF-OID proof. Both forwarding interfaces and healthy two-way
-transit are checked before changing either CAK. The same endpoints and owned routes
-remain through both
-blocked-direction probes and matching-profile recovery, after which each
-owned route is independently removed and absence verified. A blocked MACsec
-session may make a fresh gateway route lookup unreachable; this is not itself
-the traffic verdict. Zero ping replies (or an explicit ping network-unreachable
-error) establish no forwarding; bind, transport, authentication, and invalid
-ping errors fail instead. Unsupported loopback or FIB proof is not a pass.
-For primary/fallback profile rotation (including repeated replacements),
-prerequisite health, route setup and warm-up happen before the loss window.
-Both continuous transit streams establish a startup reply boundary before
-observing one naturally changed SAK with unchanged CAK/CKN; the
-pre-mutation SAK baseline is then refreshed before the first key update.
-Only replies after both startup boundaries count toward the strict zero-loss
-verdict. The window covers the first periodic refresh, all forward DUT and
-peer key changes, affected DUT CKN/SAK convergence, and a second
-natural SAK refresh after the new selection settles. The second refresh is
-observed from a fresh post-transition SAK baseline with unchanged accepted
-CKNs while both traffic streams are still active; the CAK update's initial
-SAK change cannot by itself satisfy this check. The window is drained and
-assessed before the serial selected-peer audit and original-key restoration. Those
-later steps still must pass functional state checks but are not claimed hitless.
-Other scenarios retain their existing traffic boundaries. Full CKN selection,
-controlled-port mode and transmit/receive SAK values are checked across
-rotation; an AN change alone does not prove a fresh key.
-The protocol-derived settle window is retained instead of closing the window
-as soon as a principal CKN appears. With periodic rekey active, fallback
-replacement need not leave the active transmit SAK unchanged; the
-principal and protected traffic must remain correct. These are sampled
-endpoint traffic checks, not an independent line-rate packet-generator result.
-At shutdown each ping is allowed a short post-exit log flush before its summary
-is read; only an in-flight final probe beyond the pre-stop reply boundary is
-excluded. Any missing sequence inside the measured window remains a failure.
+**Traffic checks**
 
-cEOS supports delete-only key injection; that scenario is not exposed by the
-supported SONiC configuration API. Dynamic in-place rekey-period updates,
-manager-process restart checks, inherited-SA counter continuity and
-crossed-role four-SA capability tests are not asserted by this
-integration module. The explicit-disable and ordinary replacement/recovery
-checks remain enabled.
+1. Use two distinct routed neighbors on one ASIC (direct links or
+   single-member PortChannels). Skip if no such pair exists.
+2. Pin and verify both protected paths. Reject bypass and ECMP routes.
+   Remove only test-owned routes.
+3. For both-invalid traffic, use stable neighbor data-VRF `/32` loopbacks.
+   Reject conflicting existing `/32` routes. Check both directions before
+   mutation, while blocked, and after recovery.
+4. For hitless rotation, start two 10-Hz ICMP streams before CAK mutation.
+   Observe a natural SAK refresh with unchanged CKNs. Update the CAK/CKN,
+   then require protected state and another natural SAK refresh under the
+   accepted CKN. A CAK-induced SAK change alone does not count.
+5. Require zero missing probes in the measured forward window. Verify peer
+   state and restore original keys afterward, outside that loss window.
 
-Detailed `show macsec -n <asic> --mka <port>` supplies full participant CKNs,
-roles, principal, secured mode and fresh query status; `--profile` supplies
-configured CKNs, and `show macsec -n <asic> <port>` supplies the encoding AN
-and active transmit/receive SAKs. Reads are sequential, not atomic; raw SAKs
-are not logged. cEOS participants, configuration and controlled-port status
-are read separately, without claiming EOS SAK inspection. Admin/oper up alone
-does not prove protected traffic.
-Once both selected DUT links settle within that protocol deadline, peers
-that have not yet reported the expected protected state are polled under one
-shared deadline (30 seconds plus 15 seconds per link). A failed audit reports
-the last evaluated condition, observed principal CKNs where available and peer
-host/port, rather than
-treating one early read as a final verdict. A final DUT read still checks the expected
-principal and active SAK after the peer audit. For profile
-rotation this final audit and subsequent recovery are outside the measured
-forward-rotation traffic window. Bounded stress failures identify the iteration,
-CAK role and forward or restoration phase.
-An accepted desired profile update can leave an unsafe peer-present port
-degraded while an independently safe port advances; the multi-port
-test checks configured CKN readback, secured old-primary selection and
-eventual recovery without asserting internal reconciliation state. Peerless
-owned-runtime, parser/scheduler faults, partial add/retry, and direct
-primary-only desired-state injection require component stimuli and are not
-simulated by this integration suite.
+**State checks**
 
-CP-phase injection, slow-peer confirmation, and constrained-SA peer
-interoperability also remain owning-component or specialized acceptance cases;
-the integration suite does not claim coverage from fake helpers or unit tests.
-Stable peer SCI and coherent per-CA key-server election are hitless
-prerequisites, not guarantees for unsupported combinations.
-An earlier source revision passed the primary and fallback rotation selectors on an
-Arista 7800 multi-ASIC/cEOS testbed in the
-[2026-10-12 physical run](https://elastictest.org/scheduler/testplan/6acc157e8b5a37fb72edba9f).
-Both strict bidirectional zero-loss checks passed; this run did not exercise
-the entire module. An earlier run of the same test revision had primary
-traffic loss and a fallback peer-command timeout, so one successful run does
-not establish that the scenarios are consistently hitless. A later revision passed two selected primary/fallback
-rotation cases on SONiC-peer VS with a preconfigured 30-second profile.
-A separate full-module VS run of that revision collected ten cases:
-five passed, two failed in their test bodies, and three skipped. The first
-failure was a peer protected-state assertion after DUT checks passed; the
-second was a timeout while waiting for the unsafe port and peer to reconcile.
-Neither archived failure recorded the specific condition that failed.
-The skips were cEOS-only deletion on SONiC peers, an existing BGP `/32` route
-guard, and bounded stress without `--run-stress-tests`. The owned-two-link
-fixture and more explicit test flow described above are in a newer fork revision
-and have **not** been exercised on VS or physical hardware; those previous
-runs do not validate this revision. Period-zero original profiles, cEOS and
-multi-ASIC behavior, both-invalid recovery, stress and the full module still
-require appropriate lab coverage.
+- Read full CKNs and principal/secured state with detailed
+  `show macsec -n <asic> --mka <port>`. Read desired CKNs with `--profile`;
+  read the active transmit/receive SAKs with `show macsec -n <asic> <port>`.
+- Use configuration/show commands and traffic, not private DB or process
+  state. Reads are sequential; AN changes alone do not prove new SAKs.
+- Verify cEOS participant/configuration and controlled-port status.
+  EOS-side SAK inspection is not covered.
+
+Component/specialized coverage: dynamic rekey-period updates, manager
+restarts, inherited-SA counters, crossed-role four-SA capability, CP-phase
+injection, peerless reconciliation, and constrained-SA peers.
 
 #### MACsec Counters
 
