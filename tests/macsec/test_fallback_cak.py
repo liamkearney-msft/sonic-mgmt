@@ -31,7 +31,7 @@ from tests.common.macsec.macsec_platform_helper import find_portchannel_from_mem
 from tests.common.macsec.mka_state_helper import (
     cleanup_all,
     get_namespace_option,
-    get_public_mka_status,
+    get_mka_status,
     mka_hello_timeout_seconds,
     mka_state_cli_supported,
     parse_eos_mka_participants,
@@ -65,10 +65,10 @@ def _profile_ckns(host, port, name):
 
 
 def _macsec_sa_status(host, port):
-    """Read public show output; keep SAKs in memory, never log the raw text."""
+    """Read port SAs; keep SAKs in memory, never log the raw text."""
     output = show_macsec_output(host, port, port)
     if not re.search(r"(?m)^MACsec port\({}\)".format(re.escape(port)), output):
-        raise ValueError("Public MACsec port output missing for {}".format(port))
+        raise ValueError("MACsec port output missing for {}".format(port))
     result = {"port": {}, "egress": {}, "ingress": {}}
     direction = None
     sci = None
@@ -80,18 +80,18 @@ def _macsec_sa_status(host, port):
             if match.group(2) == "SC":
                 sci = match.group(3)
                 if sci in result[direction]:
-                    raise ValueError("Duplicate public MACsec SC on {}".format(port))
+                    raise ValueError("Duplicate MACsec SC on {}".format(port))
                 result[direction][sci] = {"sc": {}, "sas": {}, "sci": sci}
                 row = result[direction][sci]["sc"]
             else:
                 if sci is None or sci not in result[direction]:
-                    raise ValueError("Public MACsec SA without SC on {}".format(port))
+                    raise ValueError("MACsec SA without SC on {}".format(port))
                 try:
                     an = int(match.group(3))
                 except ValueError as error:
-                    raise ValueError("Invalid public MACsec association number") from error
+                    raise ValueError("Invalid MACsec association number") from error
                 if an in result[direction][sci]["sas"]:
-                    raise ValueError("Duplicate public MACsec SA on {}".format(port))
+                    raise ValueError("Duplicate MACsec SA on {}".format(port))
                 row = result[direction][sci]["sas"].setdefault(an, {})
             continue
         stripped = line.strip()
@@ -110,16 +110,16 @@ def _macsec_sa_status(host, port):
 def _read_port_profile(host, port):
     output = show_macsec_output(host, port, port)
     if not re.search(r"(?m)^MACsec port\({}\)".format(re.escape(port)), output):
-        raise ValueError("Public MACsec port output missing for {}".format(port))
+        raise ValueError("MACsec port output missing for {}".format(port))
     names = re.findall(r"(?m)^\s*profile\s+(\S+)\s*$", output)
     if len(names) > 1 or len(names) != len(re.findall(
             r"(?m)^\s*profile\b.*$", output)):
-        raise ValueError("Public MACsec port binding is ambiguous on {}".format(port))
+        raise ValueError("MACsec port binding is ambiguous on {}".format(port))
     return names[0] if names else None
 
 
 @dataclass
-class PublicLinkState:
+class LinkState:
     port: str
     status: Optional[dict]
     macsec: dict
@@ -138,31 +138,33 @@ class PublicLinkState:
         status = self.status
         errors = []
         if status is None:
-            return ["public MACsec MKA status is missing"]
+            return ["MKA status is missing"]
         if status["query"] != "ok" or not status["fresh"]:
-            errors.append("public MACsec status is not a fresh successful query")
+            errors.append("MKA status is not a fresh successful query")
         if status["profile"] != profile["name"]:
-            errors.append("unexpected public MACsec profile")
+            errors.append("unexpected MACsec profile")
         if self.macsec["port"].get("enable") != "true":
-            errors.append("public MACsec port is not enabled")
+            errors.append("MACsec port is not enabled")
         if status["mode"] != "secured" or status["kay"] != "active":
-            errors.append("public MACsec port is not secured")
+            errors.append("MACsec port is not secured")
         if status["config"] != "in-sync":
-            errors.append("public MACsec configuration is not in-sync")
+            errors.append("MACsec configuration is not in-sync")
         expected = {
             profile["primary_ckn"].lower(): "primary",
             profile["fallback_ckn"].lower(): "fallback",
         }
         if set(self.participants) != set(expected):
-            errors.append("unexpected public MACsec participant CKNs")
+            errors.append("unexpected MACsec participant CKNs")
         if self.principal_ckns() != [expected_principal.lower()]:
-            errors.append("unexpected public principal CKN")
+            errors.append(
+                "principal CKN: expected {}, observed {}".format(
+                    expected_principal.lower(), self.principal_ckns()))
         for ckn, role in expected.items():
             participant = self.participants.get(ckn, {})
             if participant.get("role") != role or not participant.get("active"):
-                errors.append("{} public MACsec participant is not active as {}".format(ckn, role))
+                errors.append("{} MACsec participant is not active as {}".format(ckn, role))
             if (require_all_live or ckn == expected_principal.lower()) and participant.get("live", 0) < 1:
-                errors.append("{} public MACsec participant has no live peer".format(ckn))
+                errors.append("{} MACsec participant has no live peer".format(ckn))
         transmitting = []
         for tx in self.macsec["egress"].values():
             try:
@@ -173,12 +175,12 @@ class PublicLinkState:
             if sak:
                 transmitting.append(sak)
         if len(transmitting) != 1:
-            errors.append("expected one public encoding transmit SAK")
+            errors.append("expected one encoding transmit SAK")
         if not any(
                 sa.get("active") == "true" and sa.get("sak") in transmitting
                 for sc in self.macsec["ingress"].values()
                 for sa in sc["sas"].values()):
-            errors.append("public receive SAK does not match active transmit SAK")
+            errors.append("receive SAK does not match active transmit SAK")
         return errors
 
     def blocked_errors(self, expected_ckns):
@@ -186,12 +188,12 @@ class PublicLinkState:
         if self.status is None:
             return errors
         if self.status["query"] != "ok" or not self.status["fresh"]:
-            return ["public MACsec status is not a fresh successful query"]
+            return ["MKA status is not a fresh successful query"]
         if self.status["mode"] == "secured":
-            errors.append("public MACsec controlled port remains secured")
+            errors.append("MACsec controlled port remains secured")
         if any(sc["sas"] for sc in self.macsec["egress"].values()) or any(
                 sc["sas"] for sc in self.macsec["ingress"].values()):
-            errors.append("public MACsec SAs remain installed")
+            errors.append("MACsec SAs remain installed")
         if set(self.participants) != {ckn.lower() for ckn in expected_ckns}:
             errors.append("participant CKN set does not match")
         for ckn, participant in self.participants.items():
@@ -215,24 +217,24 @@ class PublicLinkState:
         previous = before.active_key_identity()
         errors = []
         if current is None:
-            errors.append("public active transmit SAK is missing")
+            errors.append("active transmit SAK is missing")
         if require_rekey is True and current == previous:
-            errors.append("public transmit SAK did not change")
+            errors.append("transmit SAK did not change")
         if require_rekey is False and current != previous:
-            errors.append("public standby rotation changed transmit SAK")
+            errors.append("standby rotation changed transmit SAK")
         if current is not None and not any(
                 sa.get("active") == "true" and sa.get("sak") == current
                 for sc in self.macsec["ingress"].values()
                 for sa in sc["sas"].values()):
-            errors.append("public active receive SAK does not match transmit SAK")
+            errors.append("active receive SAK does not match transmit SAK")
         return errors
 
 
-def read_public_link_state(duthost, port):
-    status = get_public_mka_status(duthost, port)
+def read_link_state(duthost, port):
+    status = get_mka_status(duthost, port)
     macsec = _macsec_sa_status(duthost, port) if status is not None else {
         "port": {}, "egress": {}, "ingress": {}}
-    return PublicLinkState(port=port, status=status, macsec=macsec)
+    return LinkState(port=port, status=status, macsec=macsec)
 
 
 class PeerAdapter:
@@ -331,13 +333,13 @@ class PeerAdapter:
         return self.snapshot().blocked_errors(expected_ckns)
 
     def snapshot(self):
-        return read_public_link_state(self.host, self.peer_port)
+        return read_link_state(self.host, self.peer_port)
 
     def normalized_state(self):
         snapshot = self.snapshot()
         configured = _profile_ckns(self.host, self.peer_port, self.profile_name)
         if configured is None:
-            raise AssertionError("Peer public MACsec profile is missing")
+            raise AssertionError("Peer MACsec profile is missing")
         return {
             "participants": snapshot.participants,
             "configured_ckns": set(configured.values()),
@@ -473,6 +475,12 @@ class EosPeerAdapter(PeerAdapter):
         errors.extend(validate_eos_mka_participants(
             snapshot["participants"], profile, snapshot["controlled_port"],
             expected_principal.lower(), require_all_live))
+        if errors:
+            principals = sorted(
+                ckn for ckn, participant in snapshot["participants"].items()
+                if participant.get("is_principal"))
+            errors.append("principal CKNs: expected {}, observed {}".format(
+                expected_principal.lower(), principals))
         return errors
 
     def blocked_errors(self, expected_ckns):
@@ -543,17 +551,17 @@ def _set_profile(host, name, profile, priority=None, namespace_option=None):
 
 def _hello_timeout(status, port, intervals):
     if status is None or not re.fullmatch(r"\d+ ms", status["hello"]):
-        raise ValueError("Public MACsec hello interval unavailable on {}".format(port))
+        raise ValueError("MACsec hello interval unavailable on {}".format(port))
     return mka_hello_timeout_seconds({"mka_hello_time_ms": status["hello"].split()[0]}, intervals)
 
 
 def _protocol_timeout(environment, port, intervals):
     return _hello_timeout(
-        get_public_mka_status(environment["duthost"], port), port, intervals)
+        get_mka_status(environment["duthost"], port), port, intervals)
 
 
 def _read_link_state(environment, port):
-    return read_public_link_state(environment["duthost"], port)
+    return read_link_state(environment["duthost"], port)
 
 
 def _read_link_states(environment, ports):
@@ -611,8 +619,8 @@ def _wait_rotation_settled(
 def _wait_rotations_settled(
         environment, before, principal_ckn, require_rekey=True,
         require_all_live=True, check_peers=False,
-        on_dut_settled=None):
-    """Settle publicly reported MKA selection and protected peer traffic."""
+        on_dut_settled=None, phase="forward"):
+    """Settle MKA selection and protected peer traffic."""
     settle = {
         port: _hello_timeout(snapshot.status, port, 3)
         for port, snapshot in before.items()
@@ -659,12 +667,12 @@ def _wait_rotations_settled(
             if settled:
                 ready += 1
             else:
-                errors[port] = ["public MKA selection settle interval pending"]
+                errors[port] = ["MKA selection settle interval pending"]
         if ready == len(before) and time.monotonic() < deadline:
             dut_settled = True
             break
         time.sleep(min(1, max(0, deadline - time.monotonic())))
-    assert dut_settled, "Public DUT MKA selection did not settle on {}: {}".format(
+    assert dut_settled, "DUT MKA selection did not settle on {}: {}".format(
         sorted(errors), errors)
 
     if on_dut_settled is not None:
@@ -672,24 +680,36 @@ def _wait_rotations_settled(
 
     if check_peers:
         peer_deadline = time.monotonic() + 30 + 15 * len(before)
+        pending = set(before)
+        adapters = {port: peer_adapter(environment, port) for port in before}
         peer_errors = {}
-        for port in before:
-            if time.monotonic() >= peer_deadline:
-                peer_errors[port] = ["peer inspection deadline elapsed"]
-                break
-            adapter = peer_adapter(environment, port)
-            problems = adapter.protected_errors(
-                environment["peer_profiles"][port], principal_ckn,
-                require_all_live=require_all_live)
-            if problems:
-                peer_errors[port] = problems
-            if time.monotonic() >= peer_deadline:
-                peer_errors[port] = peer_errors.get(port, []) + [
-                    "peer inspection deadline elapsed"]
-                break
-        assert not peer_errors, (
-            "Peer confirmation failed on {}: {}"
-        ).format(sorted(peer_errors), peer_errors)
+        while pending and time.monotonic() < peer_deadline:
+            for port in before:
+                if port not in pending or time.monotonic() >= peer_deadline:
+                    continue
+                adapter = adapters[port]
+                problems = adapter.protected_errors(
+                    environment["peer_profiles"][port], principal_ckn,
+                    require_all_live=require_all_live)
+                if problems:
+                    peer_errors[port] = problems
+                if not problems and time.monotonic() < peer_deadline:
+                    pending.remove(port)
+                    peer_errors.pop(port, None)
+            if pending:
+                time.sleep(min(2, max(0, peer_deadline - time.monotonic())))
+        remaining = {
+            port: {
+                "host": adapters[port].host.hostname,
+                "port": adapters[port].peer_port,
+                "errors": peer_errors.get(port, ["not observed within shared deadline"]),
+            }
+            for port in pending
+        }
+        assert not pending, (
+            "{} peer confirmation timed out; expected principal {}, "
+            "pending {}: {}"
+        ).format(phase, principal_ckn.lower(), sorted(pending), remaining)
 
     final = _read_link_states(environment, before)
     final_errors = {}
@@ -702,7 +722,7 @@ def _wait_rotations_settled(
             unchanged_selection = (
                 snapshot.active_key_identity(), tuple(snapshot.principal_ckns())) == stable[port][0]
         if not unchanged_selection:
-            problems.append("public transmit SAK or principal CKN changed during peer inspection")
+            problems.append("transmit SAK or principal CKN changed during peer inspection")
         if problems:
             final_errors[port] = problems
     assert not final_errors, "DUT regressed after peer confirmation: {}".format(
@@ -711,7 +731,8 @@ def _wait_rotations_settled(
 
 def _wait_peer_protected(
         adapter, profile, principal_ckn,
-        timeout=MKA_STATE_PUBLISH_TIMEOUT, require_all_live=True):
+        timeout=MKA_STATE_PUBLISH_TIMEOUT, require_all_live=True,
+        phase="forward"):
     errors = [None]
 
     def _ready():
@@ -721,12 +742,14 @@ def _wait_peer_protected(
         return not errors[0]
 
     assert wait_until(timeout, 2, 0, _ready), (
-        "{} peer did not become protected by {}: {}; diagnostics={}"
+        "{} {} peer {}:{} did not become protected by {}: {}"
     ).format(
+        phase,
         adapter.provider,
+        adapter.host.hostname,
+        adapter.peer_port,
         principal_ckn,
         errors[0],
-        adapter.diagnostics(),
     )
 
 
@@ -756,7 +779,7 @@ def _restore_deleted_primary(environment, port, adapter, primary_pair):
             environment, port, environment["profile"]["primary_ckn"]),
         lambda: _wait_peer_protected(
             adapter, environment["peer_profiles"][port],
-            primary_pair[1]),
+            primary_pair[1], phase="restoration"),
     ]
     if before is not None:
         restores.append(lambda: _wait_rotation_settled(environment, port, before, primary_pair[1]))
@@ -804,7 +827,7 @@ def _restore_rotation(
         try:
             _wait_rotations_settled(
                 environment, before, profile["fallback_ckn"],
-                require_all_live=False)
+                require_all_live=False, phase="restoration")
             before = _read_link_states(environment, environment["links"])
         except BaseException as error:
             errors.append(error)
@@ -824,7 +847,7 @@ def _restore_rotation(
                     environment, before, original_profile["primary_ckn"],
                     require_rekey=True if role == "primary" else (
                         False if profile["rekey_period"] == 0 else None),
-                    check_peers=True)
+                    check_peers=True, phase="restoration")
             else:
                 assert wait_until(
                     MKA_STATE_PUBLISH_TIMEOUT, 2, 0,
@@ -849,7 +872,7 @@ def _restore_peer_step(environment, port, role, old_profile, new_pair):
 
 
 def _observe_periodic_sak_during_traffic(environment, selected_port, expected_principal=None):
-    """Require a public SAK change without any test-driven CAK/CKN mutation."""
+    """Require a natural SAK change without test-driven CAK/CKN mutation."""
     profile = environment["profile"]
     if profile["rekey_period"] <= 0:
         raise AssertionError("Fallback E2E coverage requires periodic rekey")
@@ -861,7 +884,7 @@ def _observe_periodic_sak_during_traffic(environment, selected_port, expected_pr
         return _profile_ckns(
             environment["duthost"], selected_port, profile["name"]) == expected_ckns
 
-    assert _known_profile(), "Public fallback profile CKNs differ before periodic observation"
+    assert _known_profile(), "Fallback profile CKNs differ before periodic observation"
     baseline = [None]
 
     def _baseline_ready():
@@ -873,7 +896,7 @@ def _observe_periodic_sak_during_traffic(environment, selected_port, expected_pr
         return False
 
     assert wait_until(MKA_STATE_PUBLISH_TIMEOUT, 1, 0, _baseline_ready), (
-        "Protected public SAK unavailable before periodic observation")
+        "Protected SAK unavailable before periodic observation")
 
     def _changed():
         current = _read_link_state(environment, selected_port)
@@ -883,9 +906,9 @@ def _observe_periodic_sak_during_traffic(environment, selected_port, expected_pr
         )
 
     assert wait_until(MKA_CONVERGE_TIMEOUT, 1, 0, _changed), (
-        "No natural public SAK change observed with unchanged CAK/CKN "
+        "No natural SAK change observed with unchanged CAK/CKN "
         "during protected bidirectional traffic")
-    assert _known_profile(), "Public fallback profile CKNs changed during periodic observation"
+    assert _known_profile(), "Fallback profile CKNs changed during periodic observation"
 
 
 @contextmanager
@@ -965,7 +988,7 @@ def _wait_peer_blocked(
 
 def _diagnostics(environment, port):
     return {
-        "dut": get_public_mka_status(environment["duthost"], port),
+        "dut": get_mka_status(environment["duthost"], port),
         "peer": peer_adapter(environment, port).diagnostics(),
     }
 
@@ -995,7 +1018,7 @@ def _restore_mismatch(
             require_all_live=require_all_live)
         _wait_peer_protected(
             adapter, original_profile, principal,
-            require_all_live=require_all_live)
+            require_all_live=require_all_live, phase="restoration")
         if role == "primary" and before is not None:
             _wait_rotation_settled(environment, port, before, principal)
         if observation_error is not None:
@@ -1846,10 +1869,10 @@ def _owned_fallback_profiles(environment):
         result = host.eos_command(commands=[
             "show running-config interfaces {}".format(port)])
         if result.get("failed") or result.get("rc", 0) != 0:
-            raise RuntimeError("Unable to read public EOS MACsec interface binding")
+            raise RuntimeError("Unable to read EOS MACsec interface binding")
         output = result.get("stdout", [])
         if not output or not isinstance(output[0], str):
-            raise ValueError("Malformed public EOS interface configuration")
+            raise ValueError("Malformed EOS interface configuration")
         inside = False
         headers = 0
         names = []
@@ -1865,9 +1888,9 @@ def _owned_fallback_profiles(environment):
                 if match:
                     names.append(match.group(1))
                 elif line.strip().startswith("mac security profile"):
-                    raise ValueError("Malformed public EOS interface binding")
+                    raise ValueError("Malformed EOS interface binding")
         if headers != 1 or len(names) > 1:
-            raise ValueError("Public EOS interface binding is ambiguous")
+            raise ValueError("EOS interface binding is ambiguous")
         return names[0] if names else None
 
     def _bound_profile(host, port):
@@ -1878,10 +1901,10 @@ def _owned_fallback_profiles(environment):
     def _eos_profile_fields(host, name):
         result = host.eos_command(commands=["show running-config section mac security"])
         if result.get("failed") or result.get("rc", 0) != 0:
-            raise RuntimeError("Unable to inspect public EOS MACsec profiles")
+            raise RuntimeError("Unable to inspect EOS MACsec profiles")
         output = result.get("stdout", [])
         if not output or not isinstance(output[0], str):
-            raise ValueError("Malformed public EOS MACsec profile configuration")
+            raise ValueError("Malformed EOS MACsec profile configuration")
         if not re.search(r"(?m)^\s*profile {}\s*$".format(re.escape(name)), output[0]):
             return None
         return {
@@ -1908,7 +1931,7 @@ def _owned_fallback_profiles(environment):
                 raise AssertionError("Original SONiC CKNs differ from the known fixture")
             value = fields.get("priority")
         if value is None:
-            raise AssertionError("Original public MACsec key-server priority unavailable")
+            raise AssertionError("Original MACsec key-server priority unavailable")
         return int(value)
 
     endpoints = [(duthost, port) for port in links] + [
@@ -1959,7 +1982,7 @@ def _owned_fallback_profiles(environment):
         assert wait_until(
             30, 2, 0,
             lambda: _bound_profile(host, port) == original_name), (
-                "Original public MACsec binding not restored on {} {}".format(
+                "Original MACsec binding not restored on {} {}".format(
                     host.hostname, port))
 
     def _restore_environment():
@@ -2008,14 +2031,14 @@ def _owned_fallback_profiles(environment):
                     state is not None
                     and state["ckns"] == set(expected_ckns.values())
                     and state["period"] == 30 and state["priority"] == priority
-                ), "Owned EOS profile public configuration differs"
+                ), "Owned EOS profile configuration differs"
             else:
                 fields = get_macsec_profile_ckns(
                     host, name, get_namespace_option(host, port),
                     include_rekey_period=True, include_priority=True)
                 assert fields == dict(expected_ckns, rekey_period="30",
                                       priority=str(priority)), (
-                    "Owned SONiC profile public configuration differs")
+                    "Owned SONiC profile configuration differs")
         yield
 
 
@@ -2066,7 +2089,7 @@ def fallback_macsec_environment(
 
 def test_fallback_operational_state_and_config(
         fallback_macsec_environment):
-    """Verify public dual-CA profile, active principal and protected traffic."""
+    """Verify dual-CA profile, active principal and protected traffic."""
     environment = fallback_macsec_environment
     profile = environment["profile"]
 
@@ -2075,7 +2098,7 @@ def test_fallback_operational_state_and_config(
         expected = {field: profile[field].lower()
                     for field in ("primary_ckn", "fallback_ckn")}
         assert _profile_ckns(environment["duthost"], port, profile["name"]) == expected, (
-            "DUT public profile CKNs differ on {}".format(port))
+            "DUT profile CKNs differ on {}".format(port))
 
         errors = state.protected_errors(profile, profile["primary_ckn"])
         assert not errors, "DUT {} is not protected: {}".format(port, errors)
@@ -2198,25 +2221,32 @@ def test_back_to_back_cak_rotation_stress(
     for iteration in range(STRESS_ROTATIONS):
         role = "fallback" if iteration % 2 else "primary"
         new_pair = generate_macsec_key_pair(profile["cipher_suite"])
-        with _rotation_cleanup(environment, role, new_pair) as (attempted, completed):
-            with _TrafficWindow(environment, upstream_links, port=port) as traffic:
-                _observe_periodic_sak_during_traffic(environment, port)
-                before = _read_link_states(environment, environment["links"])
-                before = _apply_forward_cak(
-                    environment, role, new_pair, port, before, attempted)
+        phase = "forward"
+        try:
+            with _rotation_cleanup(environment, role, new_pair) as (attempted, completed):
+                with _TrafficWindow(environment, upstream_links, port=port) as traffic:
+                    _observe_periodic_sak_during_traffic(environment, port)
+                    before = _read_link_states(environment, environment["links"])
+                    before = _apply_forward_cak(
+                        environment, role, new_pair, port, before, attempted)
 
-                def _after_dut_settled():
-                    _confirm_transit_rotation(
-                        environment, before, require_rekey=True if role == "primary" else None)
-                    completed[0] = True
-                    _observe_periodic_sak_during_traffic(
-                        environment, port, expected_principal=profile["primary_ckn"])
-                    traffic.assert_zero_loss()
+                    def _after_dut_settled():
+                        _confirm_transit_rotation(
+                            environment, before, require_rekey=True if role == "primary" else None)
+                        completed[0] = True
+                        _observe_periodic_sak_during_traffic(
+                            environment, port, expected_principal=profile["primary_ckn"])
+                        traffic.assert_zero_loss()
 
-                _wait_rotations_settled(
-                    environment, before, profile["primary_ckn"],
-                    require_rekey=True if role == "primary" else None,
-                    check_peers=True, on_dut_settled=_after_dut_settled)
+                    _wait_rotations_settled(
+                        environment, before, profile["primary_ckn"],
+                        require_rekey=True if role == "primary" else None,
+                        check_peers=True, on_dut_settled=_after_dut_settled)
+                phase = "restoration"
+        except (AssertionError, RuntimeError, ValueError) as error:
+            raise type(error)(
+                "Stress iteration {} {} {}: {}".format(
+                    iteration + 1, role, phase, error)) from error
 
 
 def test_profile_update_validation_and_unattached_update(
@@ -2376,8 +2406,8 @@ def test_multi_port_desired_update_defers_only_unsafe_port(
         adapter.rotate("fallback", old_pair, mismatched_pair)
 
         def _precondition_errors():
-            unsafe = get_public_mka_status(duthost, unsafe_port)
-            safe = get_public_mka_status(duthost, safe_port)
+            unsafe = get_mka_status(duthost, unsafe_port)
+            safe = get_mka_status(duthost, safe_port)
             unsafe_peer = adapter.normalized_state()
             safe_peer = safe_adapter.normalized_state()
             alternate = old_pair[1].lower()
@@ -2385,7 +2415,7 @@ def test_multi_port_desired_update_defers_only_unsafe_port(
             if (unsafe is None or unsafe["mode"] != "secured"
                     or unsafe["participants"].get(alternate, {}).get("live") != 0
                     or unsafe["participants"].get(original_primary[1].lower(), {}).get("live", 0) < 1):
-                errors.append("unsafe public MKA alternate/primary precondition absent")
+                errors.append("unsafe MKA alternate/primary precondition absent")
             if (alternate in unsafe_peer["configured_ckns"]
                     or alternate in unsafe_peer["participants"]):
                 errors.append("unsafe peer still has fallback configured")
@@ -2434,7 +2464,7 @@ def test_multi_port_desired_update_defers_only_unsafe_port(
         )
 
         def _deferred():
-            current = get_public_mka_status(duthost, unsafe_port)
+            current = get_mka_status(duthost, unsafe_port)
             return (current is not None
                     and current["query"] == "ok"
                     and current["fresh"]
@@ -2498,7 +2528,7 @@ def test_multi_port_desired_update_defers_only_unsafe_port(
 
 
 def test_disable_closes_public_macsec_session(fallback_macsec_environment):
-    """Disable a protected port and restore public MACsec health afterward."""
+    """Disable a protected port and restore MACsec health afterward."""
     environment = fallback_macsec_environment
     duthost = environment["duthost"]
     profile = environment["profile"]
@@ -2510,14 +2540,14 @@ def test_disable_closes_public_macsec_session(fallback_macsec_environment):
         disable_macsec_port(duthost, selected_port)
 
         def _closed():
-            status = get_public_mka_status(duthost, selected_port)
+            status = get_mka_status(duthost, selected_port)
             return status is None or (
                 status["query"] == "ok" and status["fresh"]
                 and status["mode"] != "secured")
 
         assert wait_until(
             MKA_TIMEOUT, 2, 0, _closed,
-        ), "Public MACsec status remained secured after explicit port disable"
+        ), "MACsec status remained secured after explicit port disable"
 
 
 def test_both_invalid_tears_down_and_matching_profile_recovers(
@@ -2569,7 +2599,7 @@ def test_both_invalid_tears_down_and_matching_profile_recovers(
 
             def _delete_temporary_profile():
                 def _bound():
-                    attachment = get_public_mka_status(adapter.host, adapter.peer_port)
+                    attachment = get_mka_status(adapter.host, adapter.peer_port)
                     return (
                         attachment is not None
                         and attachment["query"] == "ok"
@@ -2609,7 +2639,7 @@ def test_both_invalid_tears_down_and_matching_profile_recovers(
             environment, port, profile["primary_ckn"])
         _wait_peer_protected(
             adapter, original_peer_profile,
-            original_peer_profile["primary_ckn"])
+            original_peer_profile["primary_ckn"], phase="restoration")
         recovery_results = tuple(_probe_transit(endpoint) for endpoint in endpoints)
         assert all(recovery_results), (
             "Neighbor-to-neighbor transit traffic did not recover "

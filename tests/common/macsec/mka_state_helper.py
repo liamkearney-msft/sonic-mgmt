@@ -138,7 +138,7 @@ def parse_eos_profile_ckns(output, profile_name):
 
 
 def parse_eos_profile_rekey_period(output, profile_name):
-    """Read one EOS public profile's configured rekey period, if present."""
+    """Read one EOS profile's configured rekey period, if present."""
     in_profile = False
     for line in output.splitlines():
         stripped = line.strip()
@@ -148,13 +148,13 @@ def parse_eos_profile_rekey_period(output, profile_name):
         if in_profile and stripped.startswith("mka session rekey-period "):
             value = stripped.rsplit(None, 1)[-1]
             if not value.isdigit() or int(value) <= 0:
-                raise ValueError("Invalid public EOS periodic rekey interval")
+                raise ValueError("Invalid EOS periodic rekey interval")
             return int(value)
     return None
 
 
 def parse_eos_profile_priority(output, profile_name):
-    """Read one EOS public profile's key-server priority."""
+    """Read one EOS profile's key-server priority."""
     in_profile = False
     for line in output.splitlines():
         stripped = line.strip()
@@ -164,7 +164,7 @@ def parse_eos_profile_priority(output, profile_name):
         if in_profile and stripped.startswith("mka key-server priority "):
             value = stripped.rsplit(None, 1)[-1]
             if not value.isdigit() or not 0 <= int(value) <= 255:
-                raise ValueError("Invalid public EOS key-server priority")
+                raise ValueError("Invalid EOS key-server priority")
             return int(value)
     return None
 
@@ -202,8 +202,8 @@ def show_macsec_output(host, port, *options):
     return result.get("stdout", "")
 
 
-def get_public_mka_status(host, port):
-    """Read only public per-port MKA status, not a DB or compact CKN summary."""
+def get_mka_status(host, port):
+    """Read detailed per-port MKA status."""
     output = show_macsec_output(host, port, "--mka", port)
     if output.strip() == "MACsec MKA session state for {} is missing".format(port):
         return None
@@ -225,7 +225,7 @@ def get_public_mka_status(host, port):
             status[labels[key.strip()]] = value.strip()
     if (status.get("interface") != port
             or set(status) != set(labels.values())):
-        raise ValueError("Incomplete public MKA status for {}".format(port))
+        raise ValueError("Incomplete MKA status for {}".format(port))
     status["fresh"] = "retained" not in output.lower()
     header = next(
         (index for index, line in enumerate(lines) if line.split()[:4] ==
@@ -233,10 +233,10 @@ def get_public_mka_status(host, port):
     participants = {}
     if header is not None:
         if header + 1 >= len(lines) or not re.fullmatch(r"[- ]+", lines[header + 1]):
-            raise ValueError("Invalid public MKA participant table on {}".format(port))
+            raise ValueError("Invalid MKA participant table on {}".format(port))
         spans = [match.span() for match in re.finditer(r"-+", lines[header + 1])]
         if len(spans) < 5:
-            raise ValueError("Incomplete public MKA participant columns on {}".format(port))
+            raise ValueError("Incomplete MKA participant columns on {}".format(port))
         for line in lines[header + 2:]:
             if not line.strip():
                 break
@@ -250,7 +250,7 @@ def get_public_mka_status(host, port):
                     or active not in ("true", "false")
                     or not live.isdigit()
                     or ckn.lower() in participants):
-                raise ValueError("Malformed public MKA participant on {}".format(port))
+                raise ValueError("Malformed MKA participant on {}".format(port))
             participants[ckn.lower()] = {
                 "role": role,
                 "principal": principal == "true",
@@ -258,13 +258,13 @@ def get_public_mka_status(host, port):
                 "live": int(live),
             }
     elif "No MACsec MKA participant state found" not in output:
-        raise ValueError("Missing public MKA participant table on {}".format(port))
+        raise ValueError("Missing MKA participant table on {}".format(port))
     status["participants"] = participants
     return status
 
 
 def get_namespace_option(host, interface):
-    """Return the namespace option for interface-scoped public commands."""
+    """Return the namespace option for interface-scoped MACsec commands."""
     if not host.is_multi_asic:
         return ""
     asic = host.get_port_asic_instance(interface)

@@ -14,7 +14,7 @@ from tests.common.macsec.failure_safe_cleanup import (
     preserve_config_db_files,
 )
 from tests.common.macsec.mka_state_helper import (
-    get_public_mka_status,
+    get_mka_status,
     mka_state_cli_supported,
 )
 from time import sleep
@@ -32,7 +32,7 @@ def _mka_operational_state_ok(
         "Previously supported MKA CLI disappeared after the transition"
     for port in ctrl_links:
         profile = port_profiles[port] if port_profiles else macsec_profile
-        status = get_public_mka_status(duthost, port)
+        status = get_mka_status(duthost, port)
         if status is None or status["mode"] != "secured" or status["config"] != "in-sync":
             return False
         if status["query"] != "ok" or not status["fresh"] or status["profile"] != profile["name"]:
@@ -82,7 +82,7 @@ class TestDeployment():
             assert wait_until(
                 300, 5, 0, _mka_operational_state_ok,
                 duthost, ctrl_links, macsec_profile, port_profiles,
-            ), "Public MACsec status did not recover after config reload"
+            ), "MACsec status did not recover after config reload"
         assert wait_until(
             120, 5, 0,
             _routed_traffic_ok, duthost, ctrl_links, upstream_links,
@@ -108,7 +108,7 @@ class TestDeployment():
         assert wait_until(
             300, 5, 0, _mka_operational_state_ok,
             duthost, ctrl_links, macsec_profile, port_profiles,
-        ), "Public dual-CA MACsec status did not recover after reboot"
+        ), "Dual-CA MACsec status did not recover after reboot"
         assert wait_until(
             120, 5, 0,
             _routed_traffic_ok, duthost, ctrl_links, upstream_links,
