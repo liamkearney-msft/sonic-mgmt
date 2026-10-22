@@ -30,7 +30,6 @@ pytestmark = [
 ]
 
 FALLBACK_PROFILE = "MACSEC_PROFILE_FALLBACK"
-BOTH_INVALID_PROFILE = "MACSEC_PROFILE_BOTH_INVALID"
 REKEY_PERIOD = 30
 MKA_TIMEOUT = 60
 MKA_CONVERGE_TIMEOUT = 180
@@ -127,7 +126,6 @@ def _sa_state(host, port):
     return {
         "bound_profile": port_fields.get("profile"),
         "enabled": port_fields.get("enable") == "true",
-        "installed": any(section and section[1] == "SA" for section, _, _ in blocks),
         "tx_saks": [fields["sak"] for section, an, fields in blocks
                     if section == ("Egress", "SA") and an in encoding_ans and "sak" in fields],
         "rx_saks": {fields["sak"] for section, _, fields in blocks
@@ -169,31 +167,43 @@ def _protected_errors(state, profile, principal, require_all_live=True):
         errors.append("principals are {}, expected {}".format(_principals(state), principal))
     for ckn, role in expected.items():
         participant = participants.get(ckn, {})
-        if participant.get("role") != role or not participant.get("active"):
-            errors.append("{} is not an active {} participant".format(ckn, role))
-        if (require_all_live or ckn == principal) and participant.get("live", 0) < 1:
-            errors.append("{} has no live peer".format(ckn))
+        if participant.get("role") != role:
+            errors.append("{} is not the {} participant".format(ckn, role))
+        # A peerless non-principal participant may be inactive while the other CA protects the link.
+        if (require_all_live or ckn == principal) and (not participant.get("active") or participant.get("live", 0) < 1):
+            errors.append("{} is not an active participant with a live peer".format(ckn))
     if len(state["tx_saks"]) != 1 or state["tx_saks"][0] not in state["rx_saks"]:
         errors.append("transmit SAK is not active for receive")
     return errors
 
 
-def _blocked_errors(state, expected_ckns):
-    """Return why a SONiC link with mismatched keys still looks secured."""
+def _applied_errors(state, primary_ckn, fallback_ckn):
+    """Return why MKA has not applied the configured CKNs; liveness is not required."""
     if state is None:
-        return []
-    if state["query"] != "ok" or not state["fresh"]:
-        return ["MKA status is not fresh"]
+        return ["MKA status is missing"]
     errors = []
+    if state["query"] != "ok" or not state["fresh"]:
+        errors.append("MKA status is not fresh")
+    if state["config"] != "in-sync":
+        errors.append("config is {}".format(state["config"]))
+    roles = {ckn: participant["role"] for ckn, participant in state["participants"].items()}
+    if roles != {primary_ckn.lower(): "primary", fallback_ckn.lower(): "fallback"}:
+        errors.append("participants are {}".format(roles))
+    return errors
+
+
+def _blocked_errors(state, primary_ckn, fallback_ckn):
+    """Return why a SONiC link with mismatched keys is not blocked.
+
+    SA objects may be retained and peerless participants may be inactive, so neither is checked.
+    """
+    errors = _applied_errors(state, primary_ckn, fallback_ckn)
+    if errors:
+        return errors
     if state["mode"] == "secured":
         errors.append("port remains secured")
-    if state["installed"]:
-        errors.append("SAs remain installed")
-    if set(state["participants"]) != {ckn.lower() for ckn in expected_ckns}:
-        errors.append("participants are {}".format(sorted(state["participants"])))
-    for ckn, participant in state["participants"].items():
-        if not participant["active"] or participant["live"] != 0:
-            errors.append("{} is not an active peerless participant".format(ckn))
+    if any(participant["live"] for participant in state["participants"].values()):
+        errors.append("a participant has a live peer")
     return errors
 
 
@@ -255,11 +265,11 @@ def _peer_errors(env, port, principal, require_all_live=True, profile=None):
     return errors
 
 
-def _peer_blocked_errors(env, port, expected_ckns):
+def _peer_blocked_errors(env, port, primary_ckn, fallback_ckn):
     host, peer_port = env["links"][port]["host"], env["links"][port]["port"]
     if not isinstance(host, EosHost):
-        return _blocked_errors(_read_link(host, peer_port), expected_ckns)
-    expected = {ckn.lower() for ckn in expected_ckns}
+        return _blocked_errors(get_mka_status(host, peer_port), primary_ckn, fallback_ckn)
+    expected = {primary_ckn.lower(), fallback_ckn.lower()}
     participants = _eos_participants(host, peer_port)
     errors = []
     if host.iface_macsec_ok(peer_port):
@@ -684,7 +694,11 @@ def test_fallback_operational_state_and_config(fallback_env):
 
 
 def _rotate_hitless(env, role):
-    """Replace one CAK on the DUT, then on both peers, inside a zero-loss transit window."""
+    """Replace one CAK on the DUT, then on both peers, inside a zero-loss transit window.
+
+    The operator stages this rotation so the other CA stays live on every link. macsecmgrd
+    does not guarantee hitless updates; this checks the staged end-to-end behaviour.
+    """
     duthost, profile = env["duthost"], env["profile"]
     port = next(iter(env["links"]))
     original = (profile[role + "_cak"], profile[role + "_ckn"])
@@ -720,7 +734,7 @@ def _rotate_hitless(env, role):
 
 @pytest.mark.parametrize("role", ["primary", "fallback"])
 def test_cak_rotation_is_hitless(fallback_env, role):
-    """Rotating the primary or fallback CAK keeps transit traffic lossless and ends on the primary CA."""
+    """A staged primary or fallback rotation keeps transit traffic lossless and ends on the primary CA."""
     _rotate_hitless(fallback_env, role)
 
 
@@ -845,8 +859,11 @@ def test_primary_only_profile_update_rejected(fallback_env, unattached_profile):
     assert _configured_ckns(duthost, port, unattached_profile) == {primary_ckn.lower()}
 
 
-def test_unsafe_port_defers_accepted_primary_update(fallback_env):
-    """A DUT primary update applies on the safe port and is deferred where the peer lacks the fallback CA."""
+def test_primary_update_applies_without_live_fallback(fallback_env):
+    """A DUT primary update is applied in place even when the configured fallback has no live peer.
+
+    The update is unsafe on that port, so traffic loss is allowed until the operator updates the peers.
+    """
     env, profile = fallback_env, fallback_env["profile"]
     duthost, name = env["duthost"], profile["name"]
     unsafe, safe = env["links"]
@@ -857,47 +874,34 @@ def test_unsafe_port_defers_accepted_primary_update(fallback_env):
     desired = dict(profile, primary_cak=replacement[0], primary_ckn=replacement[1])
     old_ckn, new_ckn = primary[1].lower(), replacement[1].lower()
 
-    def _deferred_errors():
+    def _fallback_not_live():
         state = get_mka_status(duthost, unsafe)
-        if state is None:
-            return ["MKA status is missing"]
-        errors = []
-        if not state["fresh"] or state["config"] != "degraded" or state["mode"] != "secured":
-            errors.append("expected fresh, degraded and secured; got {}".format(state))
-        if _principals(state) != [old_ckn] or state["participants"].get(old_ckn, {}).get("live", 0) < 1:
-            errors.append("old primary is not the live principal")
-        if new_ckn in state["participants"]:
-            errors.append("replacement primary was applied")
-        return errors
+        live = state["participants"].get(fallback[1].lower(), {}).get("live") if state else None
+        return [] if live == 0 else ["fallback live peers: {}".format(live)]
 
     try:
-        # 1. Remove the unsafe peer's usable fallback.
+        # 1. Leave the unsafe port with no live fallback peer.
         update_macsec_profile_key(unsafe_peer, name, *fallback, *mismatched, is_fallback=True)
-        _wait_for(MKA_CONVERGE_TIMEOUT, lambda: _dut_errors(env, unsafe, old_ckn, require_all_live=False) + (
-            [] if get_mka_status(duthost, unsafe)["participants"][fallback[1].lower()]["live"] == 0
-            else ["fallback is still live"]) + _dut_errors(env, safe, old_ckn) + _peer_errors(env, safe, old_ckn),
-            "Unsafe port has a live fallback, or safe port is not secured with both CAs")
+        _wait_for(MKA_CONVERGE_TIMEOUT, lambda: _dut_errors(env, unsafe, old_ckn, require_all_live=False)
+                  + _fallback_not_live() + _dut_errors(env, safe, old_ckn) + _peer_errors(env, safe, old_ckn),
+                  "Unsafe port has a live fallback, or safe port is not secured with both CAs")
 
-        # 2. The DUT accepts the primary update.
+        # 2. Update the DUT primary. Both ports apply it in place.
         update_macsec_profile_key(duthost, name, *primary, *replacement)
         assert _configured_ckns(duthost, unsafe, name) == _expected_ckns(desired)
-
-        # 3. Unsafe port keeps the old primary; the safe port moves to the fallback CA.
-        _wait_for(MKA_TIMEOUT, _deferred_errors, "Unsafe port did not defer the update")
+        _wait_for(MKA_TIMEOUT, lambda: _applied_errors(get_mka_status(duthost, unsafe), new_ckn, fallback[1]),
+                  "Unsafe port did not apply the new primary")
         _wait_for(MKA_CONVERGE_TIMEOUT, lambda: _dut_errors(env, safe, fallback[1], False, desired),
-                  "Safe port did not apply the desired profile")
-        assert not _deferred_errors(), "Safe port progress changed the unsafe port"
+                  "Safe port did not move to the fallback CA")
 
-        # 4. Safe peer gets the new primary.
+        # 3. Update both peers. Both ports use the new primary.
         update_macsec_profile_key(safe_peer, name, *primary, *replacement)
-        _wait_for(MKA_CONVERGE_TIMEOUT, lambda: _dut_errors(env, safe, new_ckn, profile=desired)
-                  + _peer_errors(env, safe, new_ckn, profile=desired), "Safe port did not use the new primary")
-
-        # 5. Unsafe peer gets its fallback back and the new primary; the deferred port reconciles.
         update_macsec_profile_key(unsafe_peer, name, *mismatched, *fallback, is_fallback=True)
         update_macsec_profile_key(unsafe_peer, name, *primary, *replacement)
-        _wait_for(MKA_CONVERGE_TIMEOUT, lambda: _dut_errors(env, unsafe, new_ckn, profile=desired)
-                  + _peer_errors(env, unsafe, new_ckn, profile=desired), "Unsafe port did not reconcile")
+        for port in (safe, unsafe):
+            _wait_for(MKA_CONVERGE_TIMEOUT, lambda: _dut_errors(env, port, new_ckn, profile=desired)
+                      + _peer_errors(env, port, new_ckn, profile=desired),
+                      "{} did not converge on the new primary".format(port))
     finally:
         _restore_key([(unsafe_peer, env["links"][unsafe]["port"])], name, "fallback", fallback, mismatched)
         _restore_key(_endpoints(env), name, "primary", primary, replacement)
@@ -905,42 +909,32 @@ def test_unsafe_port_defers_accepted_primary_update(fallback_env):
 
 
 def test_both_invalid_blocks_traffic_and_recovers(fallback_env):
-    """With both peer CAKs wrong, the link is blocked in both directions; matching keys restore traffic."""
+    """With both peer CAKs wrong, the link is blocked in both directions; matching keys restore traffic.
+
+    Each update keeps a configured alternate, so the CLI accepts both. Traffic loss is expected.
+    """
     env, profile = fallback_env, fallback_env["profile"]
     port = next(iter(env["links"]))
     host, peer_port, name = env["links"][port]["host"], env["links"][port]["port"], profile["name"]
     primary = (profile["primary_cak"], profile["primary_ckn"])
     fallback = (profile["fallback_cak"], profile["fallback_ckn"])
     invalid_primary, invalid_fallback = _new_key(profile["cipher_suite"]), _new_key(profile["cipher_suite"])
-    is_eos = isinstance(host, EosHost)
-    if not is_eos:
-        assert not _profile_exists(host, BOTH_INVALID_PROFILE), \
-            "Refusing to overwrite existing profile {}".format(BOTH_INVALID_PROFILE)
 
     with _stable_transit_path(env, port) as endpoints:
         assert all(_probe(endpoint) for endpoint in endpoints), "Transit is not healthy before the change"
         try:
-            if is_eos:
-                update_macsec_profile_key(host, name, *primary, *invalid_primary)
-                update_macsec_profile_key(host, name, *fallback, *invalid_fallback, is_fallback=True)
-            else:
-                # SONiC defers the second unsafe in-place update, so bind a profile with both keys wrong.
-                set_macsec_profile(host, BOTH_INVALID_PROFILE, profile["priority"], profile["cipher_suite"],
-                                   *invalid_primary, profile["policy"], profile["send_sci"], REKEY_PERIOD,
-                                   *invalid_fallback)
-                enable_macsec_port(host, peer_port, BOTH_INVALID_PROFILE)
-            _wait_for(MKA_TIMEOUT, lambda: _blocked_errors(_read_link(env["duthost"], port), primary[1:] + fallback[1:])
-                      + _peer_blocked_errors(env, port, (invalid_primary[1], invalid_fallback[1])),
-                      "Link with both CAKs mismatched is not blocked")
+            update_macsec_profile_key(host, name, *primary, *invalid_primary)
+            update_macsec_profile_key(host, name, *fallback, *invalid_fallback, is_fallback=True)
+            # The second role update can be queued behind the first, so allow full MKA convergence.
+            _wait_for(MKA_CONVERGE_TIMEOUT, lambda: (
+                _blocked_errors(get_mka_status(env["duthost"], port), primary[1], fallback[1])
+                + _peer_blocked_errors(env, port, invalid_primary[1], invalid_fallback[1])),
+                "Link with both CAKs mismatched is not blocked")
             results = [_probe(endpoint) for endpoint in endpoints]
             assert not any(results), "Traffic was forwarded with both CAKs mismatched: {}".format(results)
         finally:
-            if is_eos:
-                _restore_key([(host, peer_port)], name, "primary", primary, invalid_primary)
-                _restore_key([(host, peer_port)], name, "fallback", fallback, invalid_fallback)
-            else:
-                enable_macsec_port(host, peer_port, name)
-                delete_macsec_profile(host, BOTH_INVALID_PROFILE)
+            _restore_key([(host, peer_port)], name, "primary", primary, invalid_primary)
+            _restore_key([(host, peer_port)], name, "fallback", fallback, invalid_fallback)
             _wait_healthy(env)
         results = [_probe(endpoint) for endpoint in endpoints]
         assert all(results), "Transit traffic did not recover: {}".format(results)

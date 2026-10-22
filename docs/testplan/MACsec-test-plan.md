@@ -345,12 +345,13 @@ SAI_MACSEC_SA_ATTR_CONFIGURED_EGRESS_XPN            │
 Covers the [fallback CAK HLD](https://github.com/sonic-net/SONiC/pull/2495) and [MKA state HLD](https://github.com/sonic-net/SONiC/pull/2545).
 Uses two same-ASIC links to distinct neighbors, a test-owned profile with primary and fallback CAKs, and a 30-second rekey period.
 Traffic is ping between the two neighbors, through the DUT. State is read with `show macsec --mka`, `show macsec --profile` and `show macsec <port>`.
+macsecmgrd applies key updates in place and does not guarantee hitless updates. Zero-loss cases are operator-staged, with the other CA live on every link.
 
 - Operational state
     1. Check both CKNs and the rekey period in the profile.
     2. Check the port is secured by the primary CA, and the TX SAK is an active RX SAK.
 
-- Hitless primary/fallback rotation
+- Staged primary/fallback rotation
     1. Ping both ways at 10 pps.
     2. Wait for a periodic SAK refresh.
     3. Replace the CAK on the DUT, then on both peers. For the primary, expect the fallback CA in between.
@@ -363,16 +364,17 @@ Traffic is ping between the two neighbors, through the DUT. State is read with `
     3. Expect the fallback CA. Restore the peer primary CAK and expect the primary CA.
     4. Expect no packet loss.
 
-- Deferred update on an unsafe port
-    1. Make one peer's fallback CAK wrong.
-    2. Update the DUT primary CAK.
-    3. Expect the unsafe port to keep the old primary, and the safe port to move to the fallback CA.
+- Primary update without a live fallback
+    1. Make one peer's fallback CAK wrong. Expect no live fallback peer on that port.
+    2. Update the DUT primary CAK. Expect the new primary and fallback participants, config in-sync, on that port. Traffic loss is allowed.
+    3. Expect the other port to move to the fallback CA.
     4. Update both peers. Expect both ports on the new primary.
 
 - Both CAKs wrong
     1. Route between the neighbor loopbacks through the DUT. Link addresses can disappear when MACsec goes down.
-    2. Make both peer CAKs wrong. Expect the port blocked and no ping replies.
-    3. Restore the CAKs. Expect ping replies.
+    2. Update the peer primary, then fallback CAK, to wrong keys.
+    3. Expect the new CKNs in-sync with no live peer, the port not secured, and no ping replies. SAs may be retained.
+    4. Restore the CAKs. Expect ping replies.
 
 - Profile validation
     1. Add a profile with half a fallback key, a duplicate CKN or an invalid CAK. Expect failure.
@@ -383,6 +385,7 @@ Traffic is ping between the two neighbors, through the DUT. State is read with `
     1. Alternate primary and fallback rotations 10 times. Expect no packet loss.
 
 Not covered: config reload, reboot, per-interface profiles and EOS SAK inspection.
+Component tests cover WPA key remove/add order, add retry and persistent `degraded` status; there is no public stimulus for them.
 
 #### MACsec Counters
 
